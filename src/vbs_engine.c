@@ -96,20 +96,47 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     size_t n_kv_h = e->model_profile->n_kv_heads ? e->model_profile->n_kv_heads : 8;
     size_t head_d = e->model_profile->head_dim ? e->model_profile->head_dim : 128;
 
-    // KV cache capacity: sizing for the model's full context length would
-    // need ~7 GiB per cache on a 28-layer / 131k-context model -- more than
-    // the card holds next to the weights. Cap positions by what fits: at
-    // most half the VRAM left after the model, never more than 16384.
-    // Kernels must use e->kv_ctx_capacity as the cache stride.
-    size_t kv_pos_bytes = n_layers * n_kv_h * head_d * sizeof(uint16_t); // per position, per cache
-    size_t kv_cap = max_ctx < 16384 ? max_ctx : 16384;
-    uint64_t total_vram = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].total_vram_bytes : 0;
-    uint64_t model_bytes = e->model_profile->total_model_bytes;
-    if (total_vram > model_bytes && kv_pos_bytes > 0) {
-        size_t fit = (size_t)((total_vram - model_bytes) / 2 / (2 * kv_pos_bytes));
-        if (fit < kv_cap) kv_cap = fit;
+    // Scratch sizes first: the KV budget below must account for them.
+    // (Q/K/V, attention out, FFN gate/up/hidden, normed activation.)
+    size_t q_dim = (e->model_profile->n_heads && head_d) ? (size_t)e->model_profile->n_heads * head_d : embed_dim;
+    size_t kv_dim = n_kv_h * head_d;
+    size_t ffn_dim = embed_dim;
+    for (size_t i = 0; i < model->n_tensors; i++) {
+        if (strstr(model->tensors[i].name, "ffn_gate") && model->tensors[i].rows > ffn_dim) {
+            ffn_dim = model->tensors[i].rows;
+        }
     }
-    if (kv_cap == 0) kv_cap = 1;
+    size_t scratch_sizes[VBS_SCRATCH_COUNT] = {
+        q_dim, kv_dim, kv_dim, q_dim, ffn_dim, ffn_dim, ffn_dim, embed_dim
+    };
+    size_t scratch_bytes = 0;
+    for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) scratch_bytes += scratch_sizes[i] * sizeof(float);
+
+    // KV cache capacity, computed from the two profiles -- no fixed caps.
+    // Ceiling: the model's own context length. Budget: the GPU's measured
+    // free VRAM (profiled before the weights are resident, so the model
+    // bytes are subtracted; falls back to total VRAM) minus the other
+    // runtime buffers this function allocates, all sized from the model's
+    // dimensions. Positions = budget / bytes per position across both
+    // caches. Kernels must use e->kv_ctx_capacity as the cache stride.
+    size_t kv_pos_bytes = n_layers * n_kv_h * head_d * sizeof(uint16_t); // per position, per cache
+    uint64_t total_vram = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].total_vram_bytes : 0;
+    uint64_t free_vram  = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].free_vram_bytes : 0;
+    uint64_t base_vram  = free_vram ? free_vram : total_vram;
+    uint64_t model_bytes = e->model_profile->total_model_bytes;
+    uint64_t runtime_bytes = (uint64_t)(2 * embed_dim * sizeof(float)) + (uint64_t)(vocab_size * sizeof(float)) + (uint64_t)scratch_bytes;
+    size_t kv_cap = 0;
+    if (kv_pos_bytes > 0 && base_vram > model_bytes + runtime_bytes) {
+        size_t fit = (size_t)((base_vram - model_bytes - runtime_bytes) / (2 * (uint64_t)kv_pos_bytes));
+        kv_cap = fit < max_ctx ? fit : max_ctx;
+    }
+    if (kv_cap == 0) {
+        snprintf(err, err_cap, "No VRAM budget for a KV cache: free/total %llu B, model %llu B, runtime buffers %llu B, %zu B per position",
+                 (unsigned long long)base_vram, (unsigned long long)model_bytes,
+                 (unsigned long long)runtime_bytes, kv_pos_bytes);
+        vbs_engine_destroy(e);
+        return NULL;
+    }
     e->kv_ctx_capacity = kv_cap;
     e->model_profile->kv_ctx_capacity = (uint32_t)kv_cap;
 
@@ -128,19 +155,6 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         return NULL;
     }
 
-    // Scratch buffers the generated forward pass routes through by name
-    // (Q/K/V, attention out, FFN gate/up/hidden, normed activation).
-    size_t q_dim = (e->model_profile->n_heads && head_d) ? (size_t)e->model_profile->n_heads * head_d : embed_dim;
-    size_t kv_dim = n_kv_h * head_d;
-    size_t ffn_dim = embed_dim;
-    for (size_t i = 0; i < model->n_tensors; i++) {
-        if (strstr(model->tensors[i].name, "ffn_gate") && model->tensors[i].rows > ffn_dim) {
-            ffn_dim = model->tensors[i].rows;
-        }
-    }
-    size_t scratch_sizes[VBS_SCRATCH_COUNT] = {
-        q_dim, kv_dim, kv_dim, q_dim, ffn_dim, ffn_dim, ffn_dim, embed_dim
-    };
     for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) {
         e->scratch[i] = backend->alloc_buffer(primary_dev, scratch_sizes[i] * sizeof(float), false);
         if (!e->scratch[i]) {
