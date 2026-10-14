@@ -142,11 +142,18 @@ static bool cuda_copy_to_host(void *dst, const vbs_buffer_t *src, size_t bytes) 
 static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
     vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
     CUfunction fn = NULL;
-    const char *kname = "matvec_f32";
-    if (type == VBS_GGML_TYPE_Q8_0) kname = "matvec_q8_0";
-    else if (type == VBS_GGML_TYPE_Q4_0) kname = "matvec_q4_0";
-    else if (type == VBS_GGML_TYPE_Q4_1) kname = "matvec_q4_1";
-    else if (type == VBS_GGML_TYPE_F16) kname = "matvec_f16";
+    const char *kname = NULL;
+    switch (type) {
+        case VBS_GGML_TYPE_F32:  kname = "matvec_f32";  break;
+        case VBS_GGML_TYPE_F16:  kname = "matvec_f16";  break;
+        case VBS_GGML_TYPE_Q8_0: kname = "matvec_q8_0"; break;
+        case VBS_GGML_TYPE_Q4_0: kname = "matvec_q4_0"; break;
+        case VBS_GGML_TYPE_Q4_1: kname = "matvec_q4_1"; break;
+        case VBS_GGML_TYPE_Q6_K: kname = "matvec_q6_k"; break;
+        default:
+            snprintf(err_buf, err_cap, "CUDA linear pipeline refusal: no kernel for weight type %d", (int)type);
+            return NULL;
+    }
 
     if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
         snprintf(err_buf, err_cap, "CUDA kernel %s not found in PTX", kname);
@@ -165,8 +172,9 @@ static void *cuda_compile_embed_pipeline(vbs_device_t *dev, vbs_ggml_type_t type
         case VBS_GGML_TYPE_Q8_0: kname = "embedding_lookup_q8_0"; break;
         case VBS_GGML_TYPE_Q4_0: kname = "embedding_lookup_q4_0"; break;
         case VBS_GGML_TYPE_Q4_1: kname = "embedding_lookup_q4_1"; break;
+        case VBS_GGML_TYPE_Q6_K: kname = "embedding_lookup_q6_k"; break;
         default:
-            snprintf(err_buf, err_cap, "CUDA has no embedding kernel for type %d yet", (int)type);
+            snprintf(err_buf, err_cap, "CUDA embedding pipeline refusal: no kernel for type %d", (int)type);
             return NULL;
     }
     if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
