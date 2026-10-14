@@ -250,16 +250,19 @@ bool vbs_specializer_compile(
     char cmd[2048];
     double t0 = now_sec();
 
+    // Auto-detect compiler at runtime: use clang if present, otherwise gcc
+    const char *compiler = (system("command -v clang >/dev/null 2>&1") == 0) ? "clang" : "gcc";
+
     const char *simd_flags = "";
     if (sys->cpu.has_avx512) simd_flags = "-mavx512f -mavx512dq -mavx512bw -mavx2 -mfma";
     else if (sys->cpu.has_avx2) simd_flags = "-mavx2 -mfma";
     else if (sys->cpu.has_neon) simd_flags = "-march=armv8-a+simd";
 
     snprintf(cmd, sizeof(cmd),
-        "clang -O3 -march=native -ffast-math -funroll-loops "
+        "%s -O3 -march=native -ffast-math -funroll-loops "
         "-fomit-frame-pointer -flto %s "
         "-shared -fPIC -o %s %s 2>&1",
-        simd_flags, bin_path, src_path);
+        compiler, simd_flags, bin_path, src_path);
 
     int rc = system(cmd);
     *out_sec = now_sec() - t0;
