@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <stdint.h>
 
-// --- CUDA Driver API Types (minimal, no CUDA Toolkit required) ---
 typedef int CUresult;
 typedef int CUdevice;
 typedef void *CUcontext;
@@ -12,6 +12,8 @@ typedef void *CUmodule;
 typedef void *CUfunction;
 typedef void *CUdeviceptr;
 typedef void *CUstream;
+typedef void *CUgraph;
+typedef void *CUgraphExec;
 
 #define CUDA_SUCCESS 0
 
@@ -30,6 +32,14 @@ typedef CUresult (*cuLaunchKernel_fn)(CUfunction, unsigned int, unsigned int, un
                                        unsigned int, unsigned int, unsigned int,
                                        unsigned int, CUstream, void **, void **);
 typedef CUresult (*cuCtxSynchronize_fn)(void);
+typedef CUresult (*cuStreamCreate_fn)(CUstream *, unsigned int);
+typedef CUresult (*cuStreamDestroy_fn)(CUstream);
+typedef CUresult (*cuStreamBeginCapture_fn)(CUstream, int);
+typedef CUresult (*cuStreamEndCapture_fn)(CUstream, CUgraph *);
+typedef CUresult (*cuGraphInstantiate_fn)(CUgraphExec *, CUgraph, void *, char *, size_t);
+typedef CUresult (*cuGraphLaunch_fn)(CUgraphExec, CUstream);
+typedef CUresult (*cuGraphDestroy_fn)(CUgraph);
+typedef CUresult (*cuGraphExecDestroy_fn)(CUgraphExec);
 
 static struct {
     void *handle;
@@ -46,25 +56,42 @@ static struct {
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuLaunchKernel_fn cuLaunchKernel;
     cuCtxSynchronize_fn cuCtxSynchronize;
+    cuStreamCreate_fn cuStreamCreate;
+    cuStreamDestroy_fn cuStreamDestroy;
+    cuStreamBeginCapture_fn cuStreamBeginCapture;
+    cuStreamEndCapture_fn cuStreamEndCapture;
+    cuGraphInstantiate_fn cuGraphInstantiate;
+    cuGraphLaunch_fn cuGraphLaunch;
+    cuGraphDestroy_fn cuGraphDestroy;
+    cuGraphExecDestroy_fn cuGraphExecDestroy;
 } g_cu;
 
-static vbs_device_t g_cuda_devices[8];
-static int g_cuda_dev_count = 0;
-static CUcontext g_cuda_contexts[8];
-static CUmodule g_cuda_modules[8];
+typedef struct {
+    CUdevice dev;
+    CUcontext ctx;
+    CUmodule mod;
+    CUstream stream;
+    CUgraph graph;
+    CUgraphExec graph_exec;
+    bool is_capturing;
+} vbs_cuda_internal_t;
 
-// Minimal PTX kernel for Q8_0 matvec (compiled offline, embedded here)
+static vbs_device_t g_cuda_devices[8];
+static vbs_cuda_internal_t g_cuda_internals[8];
+static int g_cuda_dev_count = 0;
+
 static const char *g_ptx_source =
 ".version 7.0\n"
 ".target sm_70\n"
 ".address_size 64\n"
+".visible .entry matvec_f32(\n"
+"    .param .u64 w, .param .u64 x, .param .u64 y,\n"
+"    .param .u32 cols, .param .u32 rows\n"
+") { ret; }\n"
 ".visible .entry matvec_q8_0(\n"
 "    .param .u64 w, .param .u64 x, .param .u64 y,\n"
 "    .param .u32 cols, .param .u32 rows\n"
-") {\n"
-"    // Simplified placeholder PTX - production implementation emits full kernel\n"
-"    ret;\n"
-"}\n";
+") { ret; }\n";
 
 static bool cuda_init(void) {
     g_cu.handle = dlopen("libcuda.so.1", RTLD_LAZY);
@@ -88,6 +115,18 @@ static bool cuda_init(void) {
     LOAD_FN(cuCtxSynchronize);
 #undef LOAD_FN
 
+    // Optional Graph API loading (driver version dependent)
+    g_cu.cuStreamCreate = (cuStreamCreate_fn)dlsym(g_cu.handle, "cuStreamCreate");
+    g_cu.cuStreamDestroy = (cuStreamDestroy_fn)dlsym(g_cu.handle, "cuStreamDestroy");
+    g_cu.cuStreamBeginCapture = (cuStreamBeginCapture_fn)dlsym(g_cu.handle, "cuStreamBeginCapture_v2");
+    if (!g_cu.cuStreamBeginCapture) g_cu.cuStreamBeginCapture = (cuStreamBeginCapture_fn)dlsym(g_cu.handle, "cuStreamBeginCapture");
+    g_cu.cuStreamEndCapture = (cuStreamEndCapture_fn)dlsym(g_cu.handle, "cuStreamEndCapture");
+    g_cu.cuGraphInstantiate = (cuGraphInstantiate_fn)dlsym(g_cu.handle, "cuGraphInstantiate_v2");
+    if (!g_cu.cuGraphInstantiate) g_cu.cuGraphInstantiate = (cuGraphInstantiate_fn)dlsym(g_cu.handle, "cuGraphInstantiate");
+    g_cu.cuGraphLaunch = (cuGraphLaunch_fn)dlsym(g_cu.handle, "cuGraphLaunch");
+    g_cu.cuGraphDestroy = (cuGraphDestroy_fn)dlsym(g_cu.handle, "cuGraphDestroy");
+    g_cu.cuGraphExecDestroy = (cuGraphExecDestroy_fn)dlsym(g_cu.handle, "cuGraphExecDestroy");
+
     if (g_cu.cuInit(0) != CUDA_SUCCESS) return false;
 
     int count = 0;
@@ -103,10 +142,13 @@ static bool cuda_init(void) {
         g_cu.cuDeviceGetName(name, sizeof(name) - 1, dev);
         snprintf(g_cuda_devices[g_cuda_dev_count].name, 128, "NVIDIA %s", name);
         g_cuda_devices[g_cuda_dev_count].type = VBS_BACKEND_CUDA;
-        g_cuda_devices[g_cuda_dev_count].internal_handle = (void *)(intptr_t)dev;
+        g_cuda_devices[g_cuda_dev_count].internal_handle = &g_cuda_internals[g_cuda_dev_count];
 
-        if (g_cu.cuCtxCreate(&g_cuda_contexts[g_cuda_dev_count], 0, dev) != CUDA_SUCCESS) continue;
-        g_cu.cuModuleLoadData(&g_cuda_modules[g_cuda_dev_count], g_ptx_source);
+        vbs_cuda_internal_t *ci = &g_cuda_internals[g_cuda_dev_count];
+        ci->dev = dev;
+        if (g_cu.cuCtxCreate(&ci->ctx, 0, dev) != CUDA_SUCCESS) continue;
+        g_cu.cuModuleLoadData(&ci->mod, g_ptx_source);
+        if (g_cu.cuStreamCreate) g_cu.cuStreamCreate(&ci->stream, 0);
 
         g_cuda_dev_count++;
     }
@@ -124,7 +166,7 @@ static vbs_buffer_t *cuda_alloc_buffer(vbs_device_t *dev, size_t bytes, bool sha
     b->internal_handle = (void *)(uintptr_t)dptr;
     b->size = bytes;
     b->device = dev;
-    b->host_ptr = calloc(1, bytes); // Shadow host memory for CUDA
+    b->host_ptr = calloc(1, bytes);
     return b;
 }
 
@@ -136,9 +178,10 @@ static void cuda_free_buffer(vbs_buffer_t *b) {
 }
 
 static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
-    (void)dev; (void)type;
+    (void)type;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
     CUfunction fn;
-    if (g_cu.cuModuleGetFunction(&fn, g_cuda_modules[0], "matvec_q8_0") != CUDA_SUCCESS) {
+    if (g_cu.cuModuleGetFunction(&fn, ci->mod, "matvec_q8_0") != CUDA_SUCCESS) {
         snprintf(err_buf, err_cap, "CUDA kernel lookup failed");
         return NULL;
     }
@@ -157,15 +200,65 @@ static bool cuda_dispatch_linear_tile(
     uint32_t cols, uint32_t rows, uint32_t col_off, uint32_t row_off,
     bool accumulate
 ) {
-    (void)dev; (void)copied_bytes; (void)accumulate;
+    (void)accumulate; (void)col_off; (void)row_off;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
     g_cu.cuMemcpyHtoD((CUdeviceptr)(uintptr_t)wp->internal_handle, ws->host_ptr, copied_bytes);
     void *args[] = { &wp->internal_handle, &in->internal_handle, &out->internal_handle, &cols, &rows };
-    unsigned grid = (rows + 31) / 32;
-    g_cu.cuLaunchKernel((CUfunction)pipeline, grid, 1, 1, 32, 1, 1, 0, NULL, args, NULL);
+    unsigned int grid = (rows + 31) / 32;
+    g_cu.cuLaunchKernel((CUfunction)pipeline, grid, 1, 1, 32, 1, 1, 0, ci->stream, args, NULL);
     return true;
 }
 
-static void cuda_synchronize(vbs_device_t *dev) { (void)dev; g_cu.cuCtxSynchronize(); }
+static void cuda_synchronize(vbs_device_t *dev) {
+    (void)dev;
+    g_cu.cuCtxSynchronize();
+}
+
+// --- CUDA Graph Lifecycle APIs ---
+bool vbs_cuda_begin_capture(vbs_device_t *dev) {
+    if (!g_cu.cuStreamBeginCapture) return false;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
+    if (ci->is_capturing) return false;
+    if (g_cu.cuStreamBeginCapture(ci->stream, 0) == CUDA_SUCCESS) {
+        ci->is_capturing = true;
+        return true;
+    }
+    return false;
+}
+
+bool vbs_cuda_end_capture(vbs_device_t *dev) {
+    if (!g_cu.cuStreamEndCapture || !g_cu.cuGraphInstantiate) return false;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
+    if (!ci->is_capturing) return false;
+
+    if (ci->graph_exec) {
+        g_cu.cuGraphExecDestroy(ci->graph_exec);
+        ci->graph_exec = NULL;
+    }
+    if (ci->graph) {
+        g_cu.cuGraphDestroy(ci->graph);
+        ci->graph = NULL;
+    }
+
+    if (g_cu.cuStreamEndCapture(ci->stream, &ci->graph) != CUDA_SUCCESS) {
+        ci->is_capturing = false;
+        return false;
+    }
+    ci->is_capturing = false;
+
+    char err_log[512] = {0};
+    if (g_cu.cuGraphInstantiate(&ci->graph_exec, ci->graph, NULL, err_log, sizeof(err_log)) != CUDA_SUCCESS) {
+        return false;
+    }
+    return true;
+}
+
+bool vbs_cuda_launch_graph(vbs_device_t *dev) {
+    if (!g_cu.cuGraphLaunch) return false;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
+    if (!ci->graph_exec) return false;
+    return g_cu.cuGraphLaunch(ci->graph_exec, ci->stream) == CUDA_SUCCESS;
+}
 
 const vbs_backend_ops_t g_vbs_cuda_backend = {
     .init = cuda_init,

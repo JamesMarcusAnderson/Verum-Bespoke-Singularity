@@ -452,3 +452,114 @@ vbs_matvec_fn_t vbs_get_matvec_kernel(vbs_ggml_type_t type) {
         default: return NULL;
     }
 }
+
+// =====================================================================
+// FP8 (E4M3) Conversions
+// =====================================================================
+uint8_t vbs_float_to_fp8_e4m3(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 31) & 1;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 7;
+    uint32_t mant = (x >> 20) & 0x7;
+
+    if (exp <= 0) return 0;
+    if (exp > 15) return (uint8_t)((sign << 7) | 0x7E);
+    return (uint8_t)((sign << 7) | ((uint32_t)exp << 3) | mant);
+}
+
+float vbs_fp8_e4m3_to_float(uint8_t b) {
+    uint32_t sign = (b >> 7) & 1;
+    uint32_t exp  = (b >> 3) & 0xF;
+    uint32_t mant = b & 0x7;
+    if (exp == 0 && mant == 0) return 0.0f;
+    uint32_t f = (sign << 31) | ((exp - 7 + 127) << 23) | (mant << 20);
+    float out;
+    memcpy(&out, &f, 4);
+    return out;
+}
+
+uint16_t vbs_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (x >> 13) & 0x03FF;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+// =====================================================================
+// Fused Normalization + Matvec Implementations
+// =====================================================================
+void vbs_fused_rmsnorm_matvec_q8_0(
+    const float *x, const float *norm_w, const block_q8_0_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+) {
+    float ss = 0.0f;
+    for (size_t i = 0; i < cols; i++) ss += x[i] * x[i];
+    float inv_scale = 1.0f / sqrtf(ss / (float)cols + eps);
+
+    size_t blocks_per_row = cols / 32;
+    for (size_t r = 0; r < rows; r++) {
+        float sum = 0.0f;
+        for (size_t bb = 0; bb < blocks_per_row; bb++) {
+            const block_q8_0_t *b = &mat_w[r * blocks_per_row + bb];
+            float d = vbs_f16_to_f32(b->d);
+            int32_t acc = 0;
+            for (size_t i = 0; i < 32; i++) {
+                float norm_x = x[bb * 32 + i] * inv_scale * norm_w[bb * 32 + i];
+                acc += (int32_t)b->qs[i] * (int32_t)(norm_x * 127.0f);
+            }
+            sum += d * (float)acc / 127.0f;
+        }
+        y[r] = sum;
+    }
+}
+
+void vbs_fused_rmsnorm_matvec_q4_0(
+    const float *x, const float *norm_w, const block_q4_0_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+) {
+    float ss = 0.0f;
+    for (size_t i = 0; i < cols; i++) ss += x[i] * x[i];
+    float inv_scale = 1.0f / sqrtf(ss / (float)cols + eps);
+
+    size_t blocks_per_row = cols / 32;
+    for (size_t r = 0; r < rows; r++) {
+        float sum = 0.0f;
+        for (size_t bb = 0; bb < blocks_per_row; bb++) {
+            const block_q4_0_t *b = &mat_w[r * blocks_per_row + bb];
+            float d = vbs_f16_to_f32(b->d);
+            float acc = 0.0f;
+            for (size_t i = 0; i < 16; i++) {
+                int q0 = (b->qs[i] & 0x0F) - 8;
+                int q1 = (b->qs[i] >> 4)   - 8;
+                float nx0 = x[bb * 32 + i] * inv_scale * norm_w[bb * 32 + i];
+                float nx1 = x[bb * 32 + i + 16] * inv_scale * norm_w[bb * 32 + i + 16];
+                acc += (float)q0 * nx0 + (float)q1 * nx1;
+            }
+            sum += d * acc;
+        }
+        y[r] = sum;
+    }
+}
+
+void vbs_fused_rmsnorm_matvec_f16(
+    const float *x, const float *norm_w, const uint16_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+) {
+    float ss = 0.0f;
+    for (size_t i = 0; i < cols; i++) ss += x[i] * x[i];
+    float inv_scale = 1.0f / sqrtf(ss / (float)cols + eps);
+
+    for (size_t r = 0; r < rows; r++) {
+        float sum = 0.0f;
+        for (size_t i = 0; i < cols; i++) {
+            float norm_x = x[i] * inv_scale * norm_w[i];
+            sum += vbs_f16_to_f32(mat_w[r * cols + i]) * norm_x;
+        }
+        y[r] = sum;
+    }
+}

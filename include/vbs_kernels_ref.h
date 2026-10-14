@@ -4,12 +4,12 @@
 #include "vbs_gguf.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// --- GGML Block Type Definitions ---
 #pragma pack(push, 1)
 typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0_t;
 typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0_t;
@@ -23,7 +23,14 @@ typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qh[32]; 
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_K_t;
 #pragma pack(pop)
 
-// --- Matrix-Vector Multiplication (Dequantize + Multiply + Accumulate) ---
+// --- Conversion Helpers ---
+float    vbs_f16_to_f32(uint16_t h);
+uint16_t vbs_f32_to_f16(float f);
+float    vbs_bf16_to_f32(uint16_t h);
+uint8_t  vbs_float_to_fp8_e4m3(float f);
+float    vbs_fp8_e4m3_to_float(uint8_t b);
+
+// --- Standard Matvec ---
 void vbs_cpu_matvec_f32(const float *w, const float *x, float *y, size_t cols, size_t rows);
 void vbs_cpu_matvec_f16(const uint16_t *w, const float *x, float *y, size_t cols, size_t rows);
 void vbs_cpu_matvec_q4_0(const block_q4_0_t *w, const float *x, float *y, size_t cols, size_t rows);
@@ -37,7 +44,21 @@ void vbs_cpu_matvec_q4_K(const block_q4_K_t *w, const float *x, float *y, size_t
 void vbs_cpu_matvec_q5_K(const block_q5_K_t *w, const float *x, float *y, size_t cols, size_t rows);
 void vbs_cpu_matvec_q6_K(const block_q6_K_t *w, const float *x, float *y, size_t cols, size_t rows);
 
-// --- Primitive Operations ---
+// --- Fused Normalization + Matvec ---
+void vbs_fused_rmsnorm_matvec_q8_0(
+    const float *x, const float *norm_w, const block_q8_0_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+);
+void vbs_fused_rmsnorm_matvec_q4_0(
+    const float *x, const float *norm_w, const block_q4_0_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+);
+void vbs_fused_rmsnorm_matvec_f16(
+    const float *x, const float *norm_w, const uint16_t *mat_w,
+    float *y, size_t cols, size_t rows, float eps
+);
+
+// --- Primitives ---
 void vbs_cpu_rms_norm(const float *x, const float *w, float *y, size_t n, float eps);
 void vbs_cpu_silu_mul(const float *gate, const float *up, float *out, size_t n);
 void vbs_cpu_rope(float *x, size_t pos, size_t head_dim, size_t n_heads, float theta);
@@ -51,17 +72,11 @@ void vbs_cpu_sample_min_p(float *logits, uint32_t *out_token, size_t vocab_size,
 void vbs_cpu_embedding(const float *w, float *y, uint32_t token, size_t dim);
 void vbs_cpu_elementwise_add(float *out, const float *a, const float *b, size_t n);
 
-// --- Dispatch Table ---
 typedef void (*vbs_matvec_fn_t)(const void *w, const float *x, float *y, size_t cols, size_t rows);
 vbs_matvec_fn_t vbs_get_matvec_kernel(vbs_ggml_type_t type);
-
-// --- F16/BF16 Conversion Helpers ---
-float vbs_f16_to_f32(uint16_t h);
-uint16_t vbs_f32_to_f16(float f);
-float vbs_bf16_to_f32(uint16_t h);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif // VBS_KERNELS_REF_H
