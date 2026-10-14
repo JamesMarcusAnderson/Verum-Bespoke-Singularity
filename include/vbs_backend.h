@@ -71,6 +71,7 @@ typedef struct vbs_backend_ops {
     bool (*copy_to_host)(void *dst, const vbs_buffer_t *src, size_t bytes);
 
     void *(*compile_linear_pipeline)(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap);
+    void *(*compile_embed_pipeline)(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap);
     void *(*compile_primitive_pipeline)(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap);
 
     bool (*dispatch_linear_tile)(

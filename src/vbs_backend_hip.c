@@ -89,6 +89,11 @@ static void *hip_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t type
     (void)dev; (void)type; (void)err_buf; (void)err_cap;
     return (void *)0x1;
 }
+static void *hip_compile_embed_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
+    (void)dev; (void)type;
+    snprintf(err_buf, err_cap, "HIP backend is a stub: no embedding kernels");
+    return NULL;
+}
 static void *hip_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
     (void)dev; (void)kind; (void)err_buf; (void)err_cap;
     return (void *)0x1;
@@ -114,6 +119,7 @@ const vbs_backend_ops_t g_vbs_hip_backend = {
     .alloc_buffer = hip_alloc_buffer,
     .free_buffer = hip_free_buffer,
     .compile_linear_pipeline = hip_compile_linear_pipeline,
+    .compile_embed_pipeline = hip_compile_embed_pipeline,
     .compile_primitive_pipeline = hip_compile_primitive_pipeline,
     .dispatch_linear_tile = hip_dispatch_linear_tile,
     .synchronize_device = hip_synchronize

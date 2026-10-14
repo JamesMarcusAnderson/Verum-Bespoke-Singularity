@@ -155,6 +155,31 @@ static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t typ
     return (void *)fn;
 }
 
+static void *cuda_compile_embed_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
+    CUfunction fn = NULL;
+    const char *kname = NULL;
+    switch (type) {
+        case VBS_GGML_TYPE_F32:  kname = "embedding_lookup";      break;
+        case VBS_GGML_TYPE_F16:  kname = "embedding_lookup_f16";  break;
+        case VBS_GGML_TYPE_Q8_0: kname = "embedding_lookup_q8_0"; break;
+        case VBS_GGML_TYPE_Q4_0: kname = "embedding_lookup_q4_0"; break;
+        case VBS_GGML_TYPE_Q4_1: kname = "embedding_lookup_q4_1"; break;
+        default:
+            snprintf(err_buf, err_cap, "CUDA has no embedding kernel for type %d yet", (int)type);
+            return NULL;
+    }
+    if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
+        snprintf(err_buf, err_cap, "CUDA embedding kernel %s not found", kname);
+        return NULL;
+    }
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)malloc(sizeof(vbs_prim_pipeline_t));
+    if (!pp) return NULL;
+    pp->native = (void *)fn;
+    pp->kind = VBS_OP_EMBEDDING;
+    return pp;
+}
+
 static void *cuda_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
     vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
     CUfunction fn = NULL;
@@ -260,6 +285,7 @@ const vbs_backend_ops_t g_vbs_cuda_backend = {
     .copy_to_device = cuda_copy_to_device,
     .copy_to_host = cuda_copy_to_host,
     .compile_linear_pipeline = cuda_compile_linear_pipeline,
+    .compile_embed_pipeline = cuda_compile_embed_pipeline,
     .compile_primitive_pipeline = cuda_compile_primitive_pipeline,
     .dispatch_linear_tile = cuda_dispatch_linear_tile,
     .dispatch_primitive = cuda_dispatch_primitive,

@@ -51,6 +51,12 @@ void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c)
 //   silu:  B gate, B up, B out, S n(u32)
 //   add:   B a, B b, B out, S n(u32)
 void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_f32(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_f16(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_q8_0(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_q4_0(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_q4_1(void *w, uint32_t token, void *out, size_t dim);
+void vbs_gpu_dispatch_embed_q6_k(void *w, uint32_t token, void *out, size_t dim);
 void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps);
 void vbs_gpu_dispatch_rope(void *in, uint32_t pos, size_t hdim, size_t nh, float theta);
 void vbs_gpu_dispatch_cache(void *k, void *v, void *kc, void *vc, uint32_t pos, uint32_t layer, uint32_t max_ctx, size_t kv_dim);

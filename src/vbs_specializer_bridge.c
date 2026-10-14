@@ -113,13 +113,33 @@ void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c)
     dispatch_linear(VBS_GGML_TYPE_F32, w, in, out, r, c);
 }
 
-void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim) {
-    void *fn = prim_pipeline(VBS_OP_EMBEDDING);
+static void *embed_pipeline(vbs_ggml_type_t type) {
+    static void *cache[16];
+    if ((unsigned)type >= 16 || !g_backend || !g_backend->compile_embed_pipeline) return NULL;
+    if (!cache[type]) {
+        char err[256];
+        cache[type] = g_backend->compile_embed_pipeline(g_dev, type, err, sizeof(err));
+    }
+    return cache[type];
+}
+
+static void dispatch_embed_typed(vbs_ggml_type_t type, void *w, uint32_t token, void *out, size_t dim) {
+    void *fn = embed_pipeline(type);
     if (!fn || !g_backend->dispatch_primitive) return;
     uint32_t tok = token, d = (uint32_t)dim;
     vbs_arg_t args[] = { arg_buf(w), arg_u32(&tok), arg_buf(out), arg_u32(&d) };
     g_backend->dispatch_primitive(g_dev, fn, args, 4, (dim + 255) / 256, 256);
 }
+
+void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim) {
+    dispatch_embed_typed(VBS_GGML_TYPE_F32, w, token, out, dim);
+}
+void vbs_gpu_dispatch_embed_f32(void *w, uint32_t token, void *out, size_t dim)  { dispatch_embed_typed(VBS_GGML_TYPE_F32, w, token, out, dim); }
+void vbs_gpu_dispatch_embed_f16(void *w, uint32_t token, void *out, size_t dim)  { dispatch_embed_typed(VBS_GGML_TYPE_F16, w, token, out, dim); }
+void vbs_gpu_dispatch_embed_q8_0(void *w, uint32_t token, void *out, size_t dim) { dispatch_embed_typed(VBS_GGML_TYPE_Q8_0, w, token, out, dim); }
+void vbs_gpu_dispatch_embed_q4_0(void *w, uint32_t token, void *out, size_t dim) { dispatch_embed_typed(VBS_GGML_TYPE_Q4_0, w, token, out, dim); }
+void vbs_gpu_dispatch_embed_q4_1(void *w, uint32_t token, void *out, size_t dim) { dispatch_embed_typed(VBS_GGML_TYPE_Q4_1, w, token, out, dim); }
+void vbs_gpu_dispatch_embed_q6_k(void *w, uint32_t token, void *out, size_t dim) { dispatch_embed_typed(VBS_GGML_TYPE_Q6_K, w, token, out, dim); }
 
 void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps) {
     void *fn = prim_pipeline(VBS_OP_NORMALIZE);

@@ -142,7 +142,7 @@ bool vbs_specializer_emit_source(
             free(roles); free(layers);
             return false;
         }
-        if ((n->kind == VBS_OP_LINEAR || n->kind == VBS_OP_PROJECTION) && !ggml_type_has_dispatch(n->weight->type)) {
+        if ((n->kind == VBS_OP_LINEAR || n->kind == VBS_OP_PROJECTION || n->kind == VBS_OP_EMBEDDING) && !ggml_type_has_dispatch(n->weight->type)) {
             fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
                     ggml_type_name(n->weight->type), n->weight->name);
             free(roles); free(layers);
@@ -205,7 +205,12 @@ bool vbs_specializer_emit_source(
         "extern void *vbs_gpu_get_kv_v(void);\n"
         "extern void *vbs_gpu_get_logits(void);\n"
         "extern void *vbs_gpu_get_scratch(size_t index);\n"
-        "extern void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_f32(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_f16(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_q8_0(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_q4_0(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_q4_1(void *w, uint32_t token, void *out, size_t dim);\n"
+        "extern void vbs_gpu_dispatch_embed_q6_k(void *w, uint32_t token, void *out, size_t dim);\n"
         "extern void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps);\n"
         "extern void vbs_gpu_dispatch_rope(void *in, uint32_t pos, size_t hdim, size_t nh, float theta);\n"
         "extern void vbs_gpu_dispatch_cache(void *k, void *v, void *kc, void *vc, uint32_t pos, uint32_t layer, uint32_t max_ctx, size_t kv_dim);\n"
@@ -249,7 +254,8 @@ bool vbs_specializer_emit_source(
         int L = layers[i];
         switch (roles[i]) {
             case SEQ_EMBED:
-                fprintf(f, "    vbs_gpu_dispatch_embed(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n", i);
+                fprintf(f, "    vbs_gpu_dispatch_embed_%s(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n",
+                        ggml_type_name(n->weight->type), i);
                 break;
             case SEQ_ATTN_NORM:
             case SEQ_FFN_NORM:

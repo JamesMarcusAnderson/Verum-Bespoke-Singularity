@@ -67,6 +67,11 @@ static const char *g_metal_shader_source =
 "kernel void matvec_f16(device const half*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;for(uint i=0;i<cols;i++)a+=float(w[r*cols+i])*x[i];y[r]=a;}\n"
 "kernel void matvec_f32(device const float*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;for(uint i=0;i<cols;i++)a+=w[r*cols+i]*x[i];y[r]=a;}\n"
 "kernel void embedding_lookup(device const float*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i<dim)out[i]=w[ulong(tok)*dim+i];}\n"
+"kernel void embedding_lookup_f16(device const half*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i<dim)out[i]=float(w[ulong(tok)*dim+i]);}\n"
+"kernel void embedding_lookup_q8_0(device const q80*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i>=dim)return;uint nb=dim/32;device const q80&b=w[ulong(tok)*nb+(i/32)];out[i]=float(b.d)*float(b.q[i%32]);}\n"
+"kernel void embedding_lookup_q4_0(device const q40*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i>=dim)return;uint nb=dim/32;device const q40&b=w[ulong(tok)*nb+(i/32)];uint ib=i%32;uchar q=b.q[ib&15];float qv=float((ib<16)?(q&15):(q>>4));out[i]=float(b.d)*(qv-8.0f);}\n"
+"kernel void embedding_lookup_q4_1(device const q41*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i>=dim)return;uint nb=dim/32;device const q41&b=w[ulong(tok)*nb+(i/32)];uint ib=i%32;uchar q=b.q[ib&15];float qv=float((ib<16)?(q&15):(q>>4));out[i]=float(b.d)*qv+float(b.m);}\n"
+"kernel void embedding_lookup_q6_k(device const q6k*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i>=dim)return;uint nb=dim/256;device const q6k&blk=w[ulong(tok)*nb+(i/256)];uint n=i%256;uint h=n/128,q=(n%128)/32,l=n%32;uint qi=(q<2)?(h*64+q*32+l):(h*64+(q-2)*32+l);uint qs=(q<2)?0:4;uint lo=(uint(blk.ql[qi])>>qs)&15;uint hi=(uint(blk.qh[h*32+l])>>(q*2))&3;float sc=float(blk.s[h*8+q*2+l/16]);out[i]=float(blk.d)*sc*float(int(lo|(hi<<4))-32);}\n"
 "kernel void rms_norm(device const float*x[[buffer(0)]],device const float*w[[buffer(1)]],device float*y[[buffer(2)]],constant uint&n[[buffer(3)]],constant float&eps[[buffer(4)]],uint i[[thread_position_in_grid]]){if(i>=n)return;float ss=0;for(uint j=0;j<n;j++)ss+=x[j]*x[j];y[i]=x[i]*rsqrt(ss/float(n)+eps)*w[i];}\n"
 "kernel void rope(device float*x[[buffer(0)]],constant uint&pos[[buffer(1)]],constant uint&head_dim[[buffer(2)]],constant uint&n_heads[[buffer(3)]],constant float&theta[[buffer(4)]],uint i[[thread_position_in_grid]]){uint total_pairs=n_heads*(head_dim/2);if(i>=total_pairs)return;uint h=i/(head_dim/2),p=i%(head_dim/2),i0=h*head_dim+p*2,i1=i0+1;float freq=pow(theta,-(float)(p*2)/(float)head_dim),ang=float(pos)*freq,c=cos(ang),s=sin(ang),v0=x[i0],v1=x[i1];x[i0]=v0*c-v1*s;x[i1]=v1*c+v0*s;}\n"
 "kernel void kv_cache_store(device const float*k[[buffer(0)]],device const float*v[[buffer(1)]],device half*kc[[buffer(2)]],device half*vc[[buffer(3)]],constant uint&pos[[buffer(4)]],constant uint&l[[buffer(5)]],constant uint&max_ctx[[buffer(6)]],constant uint&kv_dim[[buffer(7)]],uint i[[thread_position_in_grid]]){if(i<kv_dim){ulong off=(ulong(l)*max_ctx+pos)*kv_dim+i;kc[off]=half(k[i]);vc[off]=half(v[i]);}}\n"
@@ -208,6 +213,38 @@ static void *metal_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t ty
     return pso;
 }
 
+static void *metal_compile_embed_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
+    (void)dev;
+    const char *fn_name = "embedding_lookup";
+    if (type == VBS_GGML_TYPE_F16)  fn_name = "embedding_lookup_f16";
+    else if (type == VBS_GGML_TYPE_Q8_0) fn_name = "embedding_lookup_q8_0";
+    else if (type == VBS_GGML_TYPE_Q4_0) fn_name = "embedding_lookup_q4_0";
+    else if (type == VBS_GGML_TYPE_Q4_1) fn_name = "embedding_lookup_q4_1";
+    else if (type == VBS_GGML_TYPE_Q6_K) fn_name = "embedding_lookup_q6_k";
+    else if (type != VBS_GGML_TYPE_F32) {
+        snprintf(err_buf, err_cap, "Metal has no embedding kernel for type %d", (int)type);
+        return NULL;
+    }
+    Class ns_string_cls = objc_getClass("NSString");
+    id ns_fn = ((id (*)(id, SEL, const char *))objc_msgSend)((id)ns_string_cls, sel_registerName("stringWithUTF8String:"), fn_name);
+    id fn = ((id (*)(id, SEL, id))objc_msgSend)(g_mtl_library, sel_registerName("newFunctionWithName:"), ns_fn);
+    if (!fn) {
+        snprintf(err_buf, err_cap, "Metal embedding function %s not found", fn_name);
+        return NULL;
+    }
+    id err = nil;
+    id pso = ((id (*)(id, SEL, id, id *))objc_msgSend)(
+        g_mtl_device_handle, sel_registerName("newComputePipelineStateWithFunction:error:"), fn, &err
+    );
+    ((void (*)(id, SEL))objc_msgSend)(fn, sel_registerName("release"));
+    if (!pso) return NULL;
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)malloc(sizeof(vbs_prim_pipeline_t));
+    if (!pp) return NULL;
+    pp->native = pso;
+    pp->kind = VBS_OP_EMBEDDING;
+    return pp;
+}
+
 static void *metal_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
     (void)dev;
     const char *fn_name = "rms_norm";
@@ -314,6 +351,7 @@ const vbs_backend_ops_t g_vbs_metal_backend = {
     .copy_to_device = metal_copy_to_device,
     .copy_to_host = metal_copy_to_host,
     .compile_linear_pipeline = metal_compile_linear_pipeline,
+    .compile_embed_pipeline = metal_compile_embed_pipeline,
     .compile_primitive_pipeline = metal_compile_primitive_pipeline,
     .dispatch_linear_tile = metal_dispatch_linear_tile,
     .dispatch_primitive = metal_dispatch_primitive,
