@@ -13,12 +13,12 @@ extern "C" {
 typedef enum {
     VBS_BACKEND_METAL,
     VBS_BACKEND_CUDA,
+    VBS_BACKEND_HIP,
     VBS_BACKEND_CPU
 } vbs_backend_type_t;
 
 typedef struct vbs_device vbs_device_t;
 typedef struct vbs_buffer vbs_buffer_t;
-typedef struct vbs_pipeline vbs_pipeline_t;
 
 struct vbs_device {
     char name[128];
@@ -30,7 +30,7 @@ struct vbs_device {
 
 struct vbs_buffer {
     void *internal_handle;
-    void *host_ptr; // Shared CPU pointer if applicable
+    void *host_ptr; // Shared CPU pointer if accessible
     size_t size;
     vbs_device_t *device;
 };
@@ -56,7 +56,12 @@ typedef struct vbs_backend_ops {
     void (*synchronize_device)(vbs_device_t *dev);
 } vbs_backend_ops_t;
 
+extern const vbs_backend_ops_t g_vbs_cpu_backend;
+extern const vbs_backend_ops_t g_vbs_cuda_backend;
+extern const vbs_backend_ops_t g_vbs_hip_backend;
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
 extern const vbs_backend_ops_t g_vbs_metal_backend;
+#endif
 
 #ifdef __cplusplus
 }

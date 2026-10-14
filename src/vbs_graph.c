@@ -1,9 +1,9 @@
 #include "vbs_graph.h"
+#include "vbs_sha256.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <CommonCrypto/CommonDigest.h>
 
 typedef enum {
     ROLE_UNKNOWN, ROLE_EMBED, ROLE_NORM, ROLE_QUERY, ROLE_KEY, ROLE_VALUE,
@@ -33,20 +33,22 @@ static tensor_role_t role_for_name(const char *name) {
 }
 
 static void compute_fingerprint(vbs_graph_t *g) {
-    CC_SHA256_CTX ctx;
-    CC_SHA256_Init(&ctx);
+    vbs_sha256_ctx_t ctx;
+    vbs_sha256_init(&ctx);
     for (size_t i = 0; i < g->n_nodes; i++) {
         char buf[256];
         int l = snprintf(buf, sizeof(buf), "%u:%s:%llu,%llu;",
                          g->nodes[i].kind, g->nodes[i].id,
-                         g->nodes[i].rows, g->nodes[i].columns);
-        CC_SHA256_Update(&ctx, buf, (CC_LONG)l);
+                         (unsigned long long)g->nodes[i].rows,
+                         (unsigned long long)g->nodes[i].columns);
+        vbs_sha256_update(&ctx, buf, (size_t)l);
     }
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_Final(digest, &ctx);
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+    uint8_t digest[32];
+    vbs_sha256_final(&ctx, digest);
+    for (int i = 0; i < 32; i++) {
         sprintf(g->fingerprint + (i * 2), "%02x", digest[i]);
     }
+    g->fingerprint[64] = '\0';
 }
 
 vbs_graph_t *vbs_graph_compile(const vbs_gguf_model_t *model, char *err_buf, size_t err_cap) {
