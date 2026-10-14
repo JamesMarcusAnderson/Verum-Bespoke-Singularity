@@ -5,7 +5,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -14,14 +13,16 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <mach/mach_types.h>
+#include <mach/mach_init.h>
+#include <mach/mach_host.h>
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
 #endif
 
-extern const vbs_backend_ops_t g_vbs_cpu_backend;
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
 extern const vbs_backend_ops_t g_vbs_hip_backend;
-#if VBS_ENABLE_METAL
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
 extern const vbs_backend_ops_t g_vbs_metal_backend;
 #endif
 
@@ -33,25 +34,38 @@ static void detect_cpu(vbs_cpu_profile_t *c) {
     size_t sz = sizeof(uint64_t);
     sysctlbyname("hw.memsize", &c->total_ram_bytes, &sz, NULL, 0);
     sysctlbyname("hw.l3cachesize", &c->l3_cache_bytes, &sz, NULL, 0);
-    int phys;
+    int phys = 0;
     sz = sizeof(phys);
     sysctlbyname("hw.physicalcpu", &phys, &sz, NULL, 0);
     c->physical_cores = (uint32_t)phys;
+
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vmstat;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vmstat, &count) == KERN_SUCCESS) {
+        c->free_ram_bytes = (uint64_t)(vmstat.free_count + vmstat.inactive_count) * (uint64_t)sysconf(_SC_PAGESIZE);
+    } else {
+        c->free_ram_bytes = c->total_ram_bytes / 2;
+    }
     c->ram_bandwidth_gbps = 200.0;
 #elif defined(__linux__)
     struct sysinfo si;
-    sysinfo(&si);
-    c->total_ram_bytes = (uint64_t)si.totalram * si.mem_unit;
-    c->free_ram_bytes = (uint64_t)si.freeram * si.mem_unit;
-    c->total_swap_bytes = (uint64_t)si.totalswap * si.mem_unit;
+    if (sysinfo(&si) == 0) {
+        c->total_ram_bytes = (uint64_t)si.totalram * si.mem_unit;
+        c->free_ram_bytes = (uint64_t)si.freeram * si.mem_unit;
+        c->total_swap_bytes = (uint64_t)si.totalswap * si.mem_unit;
+    }
     c->ram_bandwidth_gbps = 50.0;
     c->l3_cache_bytes = 32 * 1024 * 1024;
+#else
+    c->total_ram_bytes = 16ULL * 1024 * 1024 * 1024;
+    c->free_ram_bytes = 8ULL * 1024 * 1024 * 1024;
+    c->ram_bandwidth_gbps = 40.0;
 #endif
 
-#if VBS_HAVE_AVX2
+#if defined(VBS_HAVE_AVX2) && VBS_HAVE_AVX2
     c->has_avx2 = true;
 #endif
-#if VBS_HAVE_NEON
+#if defined(VBS_HAVE_NEON) && VBS_HAVE_NEON
     c->has_neon = true;
 #endif
 }
@@ -71,7 +85,7 @@ static double benchmark_memcpy_bandwidth(size_t bytes) {
     double gb = (double)(bytes * 4) / 1e9;
 
     free(src); free(dst);
-    return gb / elapsed;
+    return (elapsed > 0.0) ? (gb / elapsed) : 0.0;
 }
 
 static void detect_gpus(vbs_system_profile_t *sys) {
@@ -96,7 +110,7 @@ static void detect_gpus(vbs_system_profile_t *sys) {
         }
     }
 
-#if VBS_ENABLE_METAL
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
     if (g_vbs_metal_backend.init()) {
         size_t n = g_vbs_metal_backend.get_device_count();
         for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
@@ -159,7 +173,6 @@ vbs_system_profile_t *vbs_profiler_scan_system(void) {
     detect_storage(sys);
 
     sys->cpu.ram_bandwidth_gbps = benchmark_memcpy_bandwidth(64 * 1024 * 1024);
-
     sys->total_ram_bytes = sys->cpu.total_ram_bytes;
     sys->total_vram_bytes = 0;
     for (size_t i = 0; i < sys->n_gpus; i++) sys->total_vram_bytes += sys->gpus[i].total_vram_bytes;
@@ -184,8 +197,7 @@ void vbs_profiler_print_system(const vbs_system_profile_t *p) {
 
     for (size_t i = 0; i < p->n_gpus; i++) {
         const vbs_gpu_profile_t *g = &p->gpus[i];
-        printf("GPU[%zu]: %s | VRAM %.1f GiB free / %.1f GiB total | "
-               "mem %.0f GB/s | PCIe %.0f GB/s%s\n",
+        printf("GPU[%zu]: %s | VRAM %.1f GiB free / %.1f GiB total | mem %.0f GB/s | PCIe %.0f GB/s%s\n",
                i, g->name,
                g->free_vram_bytes / (1024.0 * 1024 * 1024),
                g->total_vram_bytes / (1024.0 * 1024 * 1024),
@@ -235,7 +247,6 @@ vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
             tp->access_frequency = 10;
             cold += tp->bytes;
         }
-
         tp->estimated_compute_cost = (double)tp->bytes * 2.0;
     }
 

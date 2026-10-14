@@ -2,15 +2,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <dlfcn.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
 
-// Direct msgSend casting prototypes for ABI safety
+#ifndef NSUInteger
+typedef unsigned long NSUInteger;
+#endif
+
 typedef id (*msg_id_fn)(id, SEL);
 typedef id (*msg_id_id_fn)(id, SEL, id);
 typedef id (*msg_id_ptr_fn)(id, SEL, const void *);
 typedef id (*msg_id_ulong_ulong_fn)(id, SEL, unsigned long, unsigned long);
-typedef unsigned long (*msg_ulong_fn)(id, SEL);
+typedef unsigned long long (*msg_ull_fn)(id, SEL);
 typedef const char *(*msg_cstr_fn)(id, SEL);
 
 #define OBJC_MSG(ret_type, target, sel_name, ...) \
@@ -21,10 +26,6 @@ static id g_mtl_device_handle = nil;
 static id g_mtl_queue_handle = nil;
 
 static bool metal_init(void) {
-    Class mtl_cls = objc_getClass("MTLDevice");
-    (void)mtl_cls;
-
-    // id dev = MTLCreateSystemDefaultDevice();
     typedef id (*MTLCreateSystemDefaultDeviceFn)(void);
     void *sym = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
     if (!sym) return false;
@@ -49,8 +50,8 @@ static size_t metal_get_device_count(void) { return g_mtl_device_handle ? 1 : 0;
 static vbs_device_t *metal_get_device(size_t i) { (void)i; return &g_metal_device; }
 
 static vbs_buffer_t *metal_alloc_buffer(vbs_device_t *dev, size_t bytes, bool shared) {
-    NSUInteger options = shared ? (0x0000) /* MTLResourceStorageModeShared */
-                                : (0x0020); /* MTLResourceStorageModePrivate */
+    NSUInteger options = shared ? (0x0000UL) /* MTLResourceStorageModeShared */
+                                : (0x0020UL); /* MTLResourceStorageModePrivate */
     id buf_handle = OBJC_MSG(id, dev->internal_handle, "newBufferWithLength:options:", (NSUInteger)bytes, options);
     if (!buf_handle) return NULL;
 
@@ -74,7 +75,6 @@ static void metal_free_buffer(vbs_buffer_t *buf) {
 
 static void *metal_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
     (void)type; (void)err_buf; (void)err_cap;
-    // In production, loads pre-compiled metallib or runtime-compiles generated MSL string
     return dev->internal_handle;
 }
 
@@ -92,7 +92,6 @@ static bool metal_dispatch_linear_tile(
 ) {
     (void)dev; (void)pipeline; (void)wp; (void)ws; (void)copied;
     (void)in; (void)out; (void)cols; (void)rows; (void)col_off; (void)row_off; (void)acc;
-    // Dispatches blit and compute encoders using pure C objc runtime sends
     return true;
 }
 
