@@ -145,6 +145,7 @@ static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t typ
     const char *kname = "matvec_f32";
     if (type == VBS_GGML_TYPE_Q8_0) kname = "matvec_q8_0";
     else if (type == VBS_GGML_TYPE_Q4_0) kname = "matvec_q4_0";
+    else if (type == VBS_GGML_TYPE_Q4_1) kname = "matvec_q4_1";
 
     if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
         snprintf(err_buf, err_cap, "CUDA kernel %s not found in PTX", kname);

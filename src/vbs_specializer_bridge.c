@@ -97,6 +97,10 @@ void vbs_gpu_dispatch_vram_q4_0(void *w, void *in, void *out, size_t r, size_t c
     dispatch_linear(VBS_GGML_TYPE_Q4_0, w, in, out, r, c);
 }
 
+void vbs_gpu_dispatch_vram_q4_1(void *w, void *in, void *out, size_t r, size_t c) {
+    dispatch_linear(VBS_GGML_TYPE_Q4_1, w, in, out, r, c);
+}
+
 void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c) {
     dispatch_linear(VBS_GGML_TYPE_F32, w, in, out, r, c);
 }
