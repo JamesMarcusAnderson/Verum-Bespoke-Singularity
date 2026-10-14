@@ -51,6 +51,12 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     e->model = model;
     e->sys_profile = sys;
     e->model_profile = vbs_profiler_scan_model(model);
+    if (!e->model_profile) {
+        snprintf(err, err_cap, "Model profile refused (see profiler message above)");
+        free(e);
+        vbs_gguf_close(model);
+        return NULL;
+    }
     e->backend = backend;
 
     const char *swap_path = getenv("VBS_SWAP_PATH");
@@ -89,12 +95,14 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     }
 
     // Allocate runtime activation and KV-cache buffers
-    size_t embed_dim = e->model_profile->embedding_dim ? e->model_profile->embedding_dim : 4096;
-    size_t vocab_size = e->model_profile->vocab_size ? e->model_profile->vocab_size : 32000;
-    size_t max_ctx = e->model_profile->context_length ? e->model_profile->context_length : 2048;
-    size_t n_layers = e->model_profile->n_layers ? e->model_profile->n_layers : 32;
-    size_t n_kv_h = e->model_profile->n_kv_heads ? e->model_profile->n_kv_heads : 8;
-    size_t head_d = e->model_profile->head_dim ? e->model_profile->head_dim : 128;
+    // The profiler refuses incomplete models, so these are all proven
+    // nonzero here -- no fallback shapes.
+    size_t embed_dim = e->model_profile->embedding_dim;
+    size_t vocab_size = e->model_profile->vocab_size;
+    size_t max_ctx = e->model_profile->context_length;
+    size_t n_layers = e->model_profile->n_layers;
+    size_t n_kv_h = e->model_profile->n_kv_heads;
+    size_t head_d = e->model_profile->head_dim;
 
     // Scratch sizes first: the KV budget below must account for them.
     // (Q/K/V, attention out, FFN gate/up/hidden, normed activation.)

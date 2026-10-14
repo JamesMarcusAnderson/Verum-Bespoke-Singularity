@@ -115,7 +115,9 @@ vbs_execution_plan_t *vbs_planner_build(
 
         // Allocate a tile-sized VRAM budget for streaming kernels
         uint64_t tile_budget = plan->vram_budget_per_device / (uint64_t)graph->n_nodes;
-        if (tile_budget < 64 * 1024 * 1024) tile_budget = 64 * 1024 * 1024;
+        // No floor: tile size derives from the VRAM budget and the
+        // tensor row geometry alone (choose_tile_dims fits whole
+        // quant-aligned rows into whatever budget exists).
         choose_tile_dims(n->weight, tile_budget, &p->tile_rows, &p->tile_cols);
 
         p->prefetch_depth = is_hot ? 0 : 2;
