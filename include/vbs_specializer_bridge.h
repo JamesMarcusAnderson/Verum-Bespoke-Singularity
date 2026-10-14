@@ -10,13 +10,13 @@
 extern "C" {
 #endif
 
-// Bridge setup
 void vbs_bridge_bind_runtime(vbs_device_t *dev, const vbs_backend_ops_t *backend, vbs_fabric_t *fabric);
 void vbs_bridge_set_activations(vbs_buffer_t *a, vbs_buffer_t *b, vbs_buffer_t *kv_k, vbs_buffer_t *kv_v, vbs_buffer_t *logits);
 
-// Symbols dynamically invoked by the JIT .so module
 void *vbs_gpu_get_act_buffer_a(void);
 void *vbs_gpu_get_act_buffer_b(void);
+void *vbs_gpu_get_kv_k(void);
+void *vbs_gpu_get_kv_v(void);
 void *vbs_bridge_get_block_dptr(size_t index);
 
 void vbs_gpu_dispatch_vram_q8_0(void *w, void *in, void *out, size_t r, size_t c);

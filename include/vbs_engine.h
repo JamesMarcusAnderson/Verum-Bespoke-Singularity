@@ -25,8 +25,13 @@ typedef struct vbs_engine {
     vbs_fabric_t *fabric;
     vbs_execution_plan_t *plan;
 
-    // The JIT-compiled zero-interpretation binary
     vbs_specialized_binary_t *specialized;
+
+    vbs_buffer_t *act_a;
+    vbs_buffer_t *act_b;
+    vbs_buffer_t *logits;
+    vbs_buffer_t *kv_cache_k;
+    vbs_buffer_t *kv_cache_v;
 
     size_t n_devices;
     vbs_device_t **devices;

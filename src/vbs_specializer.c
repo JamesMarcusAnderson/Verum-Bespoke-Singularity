@@ -95,6 +95,8 @@ bool vbs_specializer_emit_source(
         "extern void *vbs_bridge_get_block_dptr(size_t index);\n"
         "extern void *vbs_gpu_get_act_buffer_a(void);\n"
         "extern void *vbs_gpu_get_act_buffer_b(void);\n"
+        "extern void *vbs_gpu_get_kv_k(void);\n"
+        "extern void *vbs_gpu_get_kv_v(void);\n"
         "extern void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim);\n"
         "extern void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps);\n"
         "extern void vbs_gpu_dispatch_rope(void *in, uint32_t pos, size_t hdim, size_t nh, float theta);\n"
@@ -106,13 +108,13 @@ bool vbs_specializer_emit_source(
         "extern void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c);\n"
         "extern void vbs_gpu_readback_logits(void *d_src, float *h_dst, size_t n);\n\n",
         mp->n_layers, mp->n_heads, mp->n_kv_heads, mp->head_dim,
-        mp->embedding_dim, mp->context_length, mp->vocab_size ? mp->vocab_size : 32000,
+        mp->embedding_dim, mp->context_length, mp->vocab_size,
         graph->n_nodes
     );
 
     for (size_t i = 0; i < plan->n_plans; i++) {
         const vbs_node_t *n = plan->plans[i].node;
-        fprintf(f, "static inline void op_%zu(uint32_t tok, void *in_dptr, void *out_dptr) {\n", i);
+        fprintf(f, "static inline void op_%zu(uint32_t tok, void *in_dptr, void *out_dptr, void *k_cache, void *v_cache) {\n", i);
 
         switch (n->kind) {
             case VBS_OP_EMBEDDING:
@@ -125,7 +127,7 @@ bool vbs_specializer_emit_source(
                 fprintf(f, "    vbs_gpu_dispatch_rope(in_dptr, (uint32_t)g_current_pos, HEAD_DIM, N_HEADS, 10000.0f);\n");
                 break;
             case VBS_OP_ATTENTION:
-                fprintf(f, "    vbs_gpu_dispatch_attn(in_dptr, NULL, NULL, out_dptr, (uint32_t)g_current_pos, N_HEADS, N_KV_HEADS, HEAD_DIM);\n");
+                fprintf(f, "    vbs_gpu_dispatch_attn(in_dptr, k_cache, v_cache, out_dptr, (uint32_t)g_current_pos, N_HEADS, N_KV_HEADS, HEAD_DIM);\n");
                 break;
             case VBS_OP_ACTIVATION:
                 fprintf(f, "    vbs_gpu_dispatch_silu(in_dptr, out_dptr, out_dptr, EMBED_DIM);\n");
@@ -150,12 +152,14 @@ bool vbs_specializer_emit_source(
         "void verum_forward(const uint32_t *tokens, size_t n_tokens, float *logits_out) {\n"
         "    void *d_in = vbs_gpu_get_act_buffer_a();\n"
         "    void *d_out = vbs_gpu_get_act_buffer_b();\n"
+        "    void *k_cache = vbs_gpu_get_kv_k();\n"
+        "    void *v_cache = vbs_gpu_get_kv_v();\n"
         "    for (size_t t = 0; t < n_tokens; t++) {\n"
         "        uint32_t tok = tokens[t];\n"
     );
 
     for (size_t i = 0; i < plan->n_plans; i++) {
-        fprintf(f, "        op_%zu(tok, d_in, d_out);\n", i);
+        fprintf(f, "        op_%zu(tok, d_in, d_out, k_cache, v_cache);\n", i);
         fprintf(f, "        { void *tmp = d_in; d_in = d_out; d_out = tmp; }\n");
     }
 

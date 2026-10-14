@@ -55,6 +55,13 @@ typedef struct vbs_backend_ops {
         uint32_t cols, uint32_t rows, uint32_t col_offset, uint32_t row_offset,
         bool accumulate
     );
+
+    bool (*dispatch_primitive)(
+        vbs_device_t *dev, void *pipeline,
+        void **args, size_t n_args,
+        size_t grid_x, size_t block_x
+    );
+
     void (*synchronize_device)(vbs_device_t *dev);
 } vbs_backend_ops_t;
 

@@ -29,6 +29,8 @@ void vbs_bridge_set_activations(vbs_buffer_t *a, vbs_buffer_t *b, vbs_buffer_t *
 
 void *vbs_gpu_get_act_buffer_a(void) { return g_act_a ? g_act_a->internal_handle : NULL; }
 void *vbs_gpu_get_act_buffer_b(void) { return g_act_b ? g_act_b->internal_handle : NULL; }
+void *vbs_gpu_get_kv_k(void) { return g_kv_k ? g_kv_k->internal_handle : NULL; }
+void *vbs_gpu_get_kv_v(void) { return g_kv_v ? g_kv_v->internal_handle : NULL; }
 
 void *vbs_bridge_get_block_dptr(size_t index) {
     if (!g_fabric || index >= g_fabric->n_blocks) return NULL;
@@ -71,27 +73,59 @@ void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c)
 }
 
 void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim) {
-    (void)w; (void)token; (void)out; (void)dim;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_EMBEDDING, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t d = (uint32_t)dim;
+    void *args[] = { &w, &token, &out, &d };
+    g_backend->dispatch_primitive(g_dev, fn, args, 4, (dim + 255) / 256, 256);
 }
 
 void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps) {
-    (void)w; (void)in; (void)out; (void)dim; (void)eps;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_NORMALIZE, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t d = (uint32_t)dim;
+    void *args[] = { &in, &w, &out, &d, &eps };
+    g_backend->dispatch_primitive(g_dev, fn, args, 5, (dim + 255) / 256, 256);
 }
 
 void vbs_gpu_dispatch_rope(void *in, uint32_t pos, size_t hdim, size_t nh, float theta) {
-    (void)in; (void)pos; (void)hdim; (void)nh; (void)theta;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_ROTARY, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t hd = (uint32_t)hdim, nheads = (uint32_t)nh;
+    void *args[] = { &in, &pos, &hd, &nheads, &theta };
+    size_t total_pairs = (hdim / 2) * nh;
+    g_backend->dispatch_primitive(g_dev, fn, args, 5, (total_pairs + 255) / 256, 256);
 }
 
 void vbs_gpu_dispatch_attn(void *q, void *k_cache, void *v_cache, void *out, uint32_t pos, size_t nqh, size_t nkh, size_t hd) {
-    (void)q; (void)k_cache; (void)v_cache; (void)out; (void)pos; (void)nqh; (void)nkh; (void)hd;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_ATTENTION, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t sl = pos + 1, qh = (uint32_t)nqh, kvh = (uint32_t)nkh, hdim = (uint32_t)hd;
+    float scale = 1.0f / sqrtf((float)hd);
+    void *args[] = { &q, &k_cache, &v_cache, &out, &sl, &qh, &kvh, &hdim, &scale };
+    g_backend->dispatch_primitive(g_dev, fn, args, 9, nqh, hd > 32 ? hd : 32);
 }
 
 void vbs_gpu_dispatch_silu(void *gate, void *up, void *out, size_t n) {
-    (void)gate; (void)up; (void)out; (void)n;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_ACTIVATION, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t len = (uint32_t)n;
+    void *args[] = { &gate, &up, &out, &len };
+    g_backend->dispatch_primitive(g_dev, fn, args, 4, (n + 255) / 256, 256);
 }
 
 void vbs_gpu_dispatch_add(void *a, void *b, void *out, size_t n) {
-    (void)a; (void)b; (void)out; (void)n;
+    char err[256];
+    void *fn = g_backend->compile_primitive_pipeline(g_dev, VBS_OP_ELEMENTWISE, err, sizeof(err));
+    if (!fn || !g_backend->dispatch_primitive) return;
+    uint32_t len = (uint32_t)n;
+    void *args[] = { &a, &b, &out, &len };
+    g_backend->dispatch_primitive(g_dev, fn, args, 4, (n + 255) / 256, 256);
 }
 
 void vbs_gpu_readback_logits(void *d_src, float *h_dst, size_t n) {

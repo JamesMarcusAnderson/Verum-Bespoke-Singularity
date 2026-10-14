@@ -1,5 +1,6 @@
 #include "vbs_engine.h"
 #include "vbs_specializer.h"
+#include "vbs_specializer_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +29,7 @@ static const vbs_backend_ops_t *select_gpu_backend(const vbs_system_profile_t *s
 #endif
         if (sys->gpus[i].type == VBS_BACKEND_HIP && g_vbs_hip_backend.init())   return &g_vbs_hip_backend;
     }
-    return NULL; // Zero CPU fallback
+    return NULL;
 }
 
 vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, size_t err_cap) {
@@ -40,7 +41,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
 
     const vbs_backend_ops_t *backend = select_gpu_backend(sys);
     if (!backend) {
-        snprintf(err, err_cap, "Fatal: No supported GPU device detected (CUDA, HIP, or Metal). CPU execution is disabled.");
+        snprintf(err, err_cap, "Fatal: No supported GPU device detected (CUDA, HIP, or Metal).");
         vbs_profiler_free_system(sys);
         vbs_gguf_close(model);
         return NULL;
@@ -59,10 +60,18 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
 
     e->fabric = vbs_fabric_create(
         e->sys_profile, e->backend,
-        512, // 512 MiB DMA pinned pool
+        512,
         swap_gib,
         swap_path ? swap_path : "/tmp/verum_swap.bin"
     );
+
+    // Register all tensors into the fabric
+    vbs_device_t *primary_dev = e->backend->get_device(0);
+    for (size_t i = 0; i < model->n_tensors; i++) {
+        const vbs_tensor_t *t = &model->tensors[i];
+        const void *src_ptr = (const uint8_t *)model->map + t->data_offset;
+        vbs_fabric_register_tensor(e->fabric, t, src_ptr, VBS_TIER_VRAM, primary_dev);
+    }
 
     e->window_bytes = (window_mib ? window_mib : 256) * 1024 * 1024;
     e->n_devices = e->sys_profile->n_gpus ? e->sys_profile->n_gpus : 1;
@@ -78,6 +87,27 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
             return NULL;
         }
     }
+
+    // Allocate runtime activation and KV-cache buffers
+    size_t embed_dim = e->model_profile->embedding_dim ? e->model_profile->embedding_dim : 4096;
+    size_t vocab_size = e->model_profile->vocab_size ? e->model_profile->vocab_size : 32000;
+    size_t max_ctx = e->model_profile->context_length ? e->model_profile->context_length : 2048;
+    size_t n_layers = e->model_profile->n_layers ? e->model_profile->n_layers : 32;
+    size_t n_kv_h = e->model_profile->n_kv_heads ? e->model_profile->n_kv_heads : 8;
+    size_t head_d = e->model_profile->head_dim ? e->model_profile->head_dim : 128;
+
+    e->act_a  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
+    e->act_b  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
+    e->logits = backend->alloc_buffer(primary_dev, vocab_size * sizeof(float), false);
+
+    size_t kv_bytes = n_layers * max_ctx * n_kv_h * head_d * sizeof(uint16_t);
+    e->kv_cache_k = backend->alloc_buffer(primary_dev, kv_bytes, false);
+    e->kv_cache_v = backend->alloc_buffer(primary_dev, kv_bytes, false);
+
+    // Bind bridge pointers
+    vbs_bridge_bind_runtime(primary_dev, e->backend, e->fabric);
+    vbs_bridge_set_activations(e->act_a, e->act_b, e->kv_cache_k, e->kv_cache_v, e->logits);
+
     return e;
 }
 
@@ -141,6 +171,11 @@ void vbs_engine_destroy(vbs_engine_t *e) {
     if (!e) return;
     if (e->specialized) vbs_specializer_free(e->specialized);
     if (e->plan) vbs_planner_free(e->plan);
+    if (e->act_a) e->backend->free_buffer(e->act_a);
+    if (e->act_b) e->backend->free_buffer(e->act_b);
+    if (e->logits) e->backend->free_buffer(e->logits);
+    if (e->kv_cache_k) e->backend->free_buffer(e->kv_cache_k);
+    if (e->kv_cache_v) e->backend->free_buffer(e->kv_cache_v);
     if (e->fabric) vbs_fabric_free(e->fabric);
     if (e->graph) vbs_graph_free(e->graph);
     for (size_t i = 0; i < e->n_devices; i++) {

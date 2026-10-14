@@ -236,10 +236,13 @@ vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
         total += tp->bytes;
 
         const char *n = model->tensors[i].name;
-        if (strstr(n, "embed") || strstr(n, "output") || strstr(n, "norm")) {
+        if (strstr(n, "token_embd") || strstr(n, "output") || strstr(n, "norm")) {
             tp->is_hot_path = true;
             tp->access_frequency = 100;
             hot += tp->bytes;
+            if (strstr(n, "token_embd.weight") || strstr(n, "output.weight")) {
+                mp->vocab_size = (uint32_t)model->tensors[i].rows;
+            }
         } else if (strstr(n, "attn") || strstr(n, ".q.") || strstr(n, ".k.") || strstr(n, ".v.")) {
             tp->access_frequency = 50;
             warm += tp->bytes;
@@ -262,6 +265,7 @@ vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
     if (vbs_gguf_get_uint32_metadata(model, "llama.embedding_length", &v)) mp->embedding_dim = v;
     if (vbs_gguf_get_uint32_metadata(model, "llama.context_length", &v)) mp->context_length = v;
     if (mp->n_heads && mp->embedding_dim) mp->head_dim = mp->embedding_dim / mp->n_heads;
+    if (mp->vocab_size == 0) mp->vocab_size = 32000;
 
     return mp;
 }
