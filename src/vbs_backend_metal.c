@@ -26,6 +26,33 @@ static id g_mtl_device_handle = nil;
 static id g_mtl_queue_handle = nil;
 static id g_mtl_library = nil;
 
+// Single command-stream state (James): one command buffer + one compute
+// encoder stay open across a whole forward pass; dispatches encode into it
+// with no CPU stall, and the stream is committed + waited exactly once --
+// at synchronize_device or before any host copy. This replaces the old
+// per-dispatch command buffer + waitUntilCompleted (thousands of
+// synchronous round-trips per token).
+static id g_active_cmd_buffer = nil;
+static id g_active_encoder = nil;
+
+static id metal_active_encoder(void) {
+    if (g_active_encoder == nil) {
+        g_active_cmd_buffer = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
+        g_active_encoder = ((id (*)(id, SEL))objc_msgSend)(g_active_cmd_buffer, sel_registerName("computeCommandEncoder"));
+    }
+    return g_active_encoder;
+}
+
+static void metal_flush_stream(void) {
+    if (g_active_encoder != nil) {
+        ((void (*)(id, SEL))objc_msgSend)(g_active_encoder, sel_registerName("endEncoding"));
+        ((void (*)(id, SEL))objc_msgSend)(g_active_cmd_buffer, sel_registerName("commit"));
+        ((void (*)(id, SEL))objc_msgSend)(g_active_cmd_buffer, sel_registerName("waitUntilCompleted"));
+        g_active_encoder = nil;
+        g_active_cmd_buffer = nil;
+    }
+}
+
 static const char *g_metal_shader_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -103,6 +130,7 @@ static void metal_free_buffer(vbs_buffer_t *buf) {
 }
 
 static bool metal_copy_to_device(vbs_buffer_t *dst, const void *src, size_t bytes) {
+    metal_flush_stream();
     if (dst->host_ptr) {
         memcpy(dst->host_ptr, src, bytes);
         return true;
@@ -127,6 +155,9 @@ static bool metal_copy_to_device(vbs_buffer_t *dst, const void *src, size_t byte
 }
 
 static bool metal_copy_to_host(void *dst, const vbs_buffer_t *src, size_t bytes) {
+    // Reading back commits and waits on the open stream exactly once --
+    // this is the single synchronization point at the end of a token.
+    metal_flush_stream();
     if (src->host_ptr) {
         memcpy(dst, src->host_ptr, bytes);
         return true;
@@ -215,8 +246,7 @@ static bool metal_dispatch_linear_tile(
     bool acc
 ) {
     (void)dev; (void)ws; (void)copied; (void)col_off; (void)row_off; (void)acc;
-    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
-    id enc = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("computeCommandEncoder"));
+    id enc = metal_active_encoder();
 
     ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pipeline);
     ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBuffer:offset:atIndex:"), wp->internal_handle, (NSUInteger)0, (NSUInteger)0);
@@ -231,10 +261,6 @@ static bool metal_dispatch_linear_tile(
     ((void (*)(id, SEL, MTLSize, MTLSize))objc_msgSend)(
         enc, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), gridSize, tgSize
     );
-
-    ((void (*)(id, SEL))objc_msgSend)(enc, sel_registerName("endEncoding"));
-    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
-    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
     return true;
 }
 
@@ -246,8 +272,7 @@ static bool metal_dispatch_primitive(
     (void)dev;
     vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)pipeline;
     if (!pp || !pp->native) return false;
-    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
-    id enc = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("computeCommandEncoder"));
+    id enc = metal_active_encoder();
 
     ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pp->native);
     for (size_t i = 0; i < n_args; i++) {
@@ -272,15 +297,12 @@ static bool metal_dispatch_primitive(
     ((void (*)(id, SEL, MTLSize, MTLSize))objc_msgSend)(
         enc, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), gridSize, tgSize
     );
-
-    ((void (*)(id, SEL))objc_msgSend)(enc, sel_registerName("endEncoding"));
-    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
-    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
     return true;
 }
 
 static void metal_synchronize(vbs_device_t *dev) {
     (void)dev;
+    metal_flush_stream();
 }
 
 const vbs_backend_ops_t g_vbs_metal_backend = {
