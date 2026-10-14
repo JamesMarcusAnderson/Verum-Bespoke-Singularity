@@ -52,7 +52,9 @@ static vbs_device_t *metal_get_device(size_t i) { (void)i; return &g_metal_devic
 static vbs_buffer_t *metal_alloc_buffer(vbs_device_t *dev, size_t bytes, bool shared) {
     NSUInteger options = shared ? (0x0000UL) /* MTLResourceStorageModeShared */
                                 : (0x0020UL); /* MTLResourceStorageModePrivate */
-    id buf_handle = OBJC_MSG(id, dev->internal_handle, "newBufferWithLength:options:", (NSUInteger)bytes, options);
+    id buf_handle = ((id (*)(id, SEL, NSUInteger, NSUInteger))objc_msgSend)(
+        (id)dev->internal_handle, sel_registerName("newBufferWithLength:options:"),
+        (NSUInteger)bytes, options);
     if (!buf_handle) return NULL;
 
     vbs_buffer_t *buf = (vbs_buffer_t *)calloc(1, sizeof(vbs_buffer_t));
