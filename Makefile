@@ -5,7 +5,6 @@ LDFLAGS := -ldl -lm -lpthread
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# 100% GPU-only core sources (No CPU fallback files)
 SRC := src/main.c \
        src/tokenizer.c \
        src/vbs_gguf.c \
@@ -17,9 +16,9 @@ SRC := src/main.c \
        src/vbs_profiler.c \
        src/vbs_fabric.c \
        src/vbs_planner.c \
-       src/vbs_specializer.c
+       src/vbs_specializer.c \
+       src/vbs_specializer_bridge.c
 
-# Platform-specific Metal backend on macOS
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -DVBS_ENABLE_METAL=1
     LDFLAGS += -framework Foundation -framework Metal -framework CoreGraphics -lobjc

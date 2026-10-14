@@ -30,7 +30,7 @@ struct vbs_device {
 
 struct vbs_buffer {
     void *internal_handle;
-    void *host_ptr; // Shared CPU pointer if accessible
+    void *host_ptr;
     size_t size;
     vbs_device_t *device;
 };
@@ -42,6 +42,8 @@ typedef struct vbs_backend_ops {
 
     vbs_buffer_t *(*alloc_buffer)(vbs_device_t *dev, size_t bytes, bool shared);
     void (*free_buffer)(vbs_buffer_t *buf);
+    bool (*copy_to_device)(vbs_buffer_t *dst, const void *src, size_t bytes);
+    bool (*copy_to_host)(void *dst, const vbs_buffer_t *src, size_t bytes);
 
     void *(*compile_linear_pipeline)(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap);
     void *(*compile_primitive_pipeline)(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap);
@@ -56,7 +58,6 @@ typedef struct vbs_backend_ops {
     void (*synchronize_device)(vbs_device_t *dev);
 } vbs_backend_ops_t;
 
-extern const vbs_backend_ops_t g_vbs_cpu_backend;
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
 extern const vbs_backend_ops_t g_vbs_hip_backend;
 #if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL

@@ -1,4 +1,5 @@
 #include "vbs_engine.h"
+#include "tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,13 +19,7 @@ static void usage(void) {
         "  ./verum-slice --inspect model.gguf\n"
         "  ./verum-slice --compile [--window-mib N] model.gguf\n"
         "  ./verum-slice --benchmark [--tokens N] [--window-mib N] model.gguf\n"
-        "\n"
-        "Flags:\n"
-        "  --inspect         Parse container, profile hardware/model, print facts\n"
-        "  --compile         Derive graph, plan execution, JIT compile bespoke binary\n"
-        "  --benchmark       Run timed forward inference test and print throughput telemetry\n"
-        "  --tokens N        Number of tokens to generate during benchmark (default: 128)\n"
-        "  --window-mib N    Streaming staging window size in MiB (default: 256)\n"
+        "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
     );
 }
 
@@ -36,18 +31,26 @@ int main(int argc, const char *argv[]) {
 
     const char *mode = NULL;
     const char *model_path = NULL;
+    const char *tokenizer_path = NULL;
+    const char *prompt_text = "The universe is";
     size_t window_mib = 256;
     size_t bench_tokens = 128;
+    size_t max_gen_tokens = 64;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0 ||
             strcmp(argv[i], "--compile") == 0 ||
-            strcmp(argv[i], "--benchmark") == 0) {
+            strcmp(argv[i], "--benchmark") == 0 ||
+            strcmp(argv[i], "--generate") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             bench_tokens = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) {
+            tokenizer_path = argv[++i];
+        } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
+            prompt_text = argv[++i];
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         }
@@ -89,19 +92,11 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
 
-        printf("\n=== Running Verum Hardware Benchmark ===\n");
-        printf("Model: %s\n", model_path);
-        printf("Benchmark length: %zu tokens\n", bench_tokens);
-        printf("Staging window: %zu MiB\n", window_mib);
-
-        uint32_t prompt_tokens[1] = { 1 }; // BOS token
+        uint32_t prompt_tokens[1] = { 1 };
         float *dummy_logits = (float *)calloc(32000, sizeof(float));
 
-        // 1. Warm-up Pass (2 tokens to settle JIT caches and page mappings)
-        vbs_engine_forward(engine, prompt_tokens, 1, dummy_logits);
         vbs_engine_forward(engine, prompt_tokens, 1, dummy_logits);
 
-        // 2. Timed Execution Pass
         double t_start = get_time_sec();
         for (size_t i = 0; i < bench_tokens; i++) {
             vbs_engine_forward(engine, prompt_tokens, 1, dummy_logits);
@@ -111,18 +106,78 @@ int main(int argc, const char *argv[]) {
         double elapsed = t_end - t_start;
         double tok_per_sec = (double)bench_tokens / (elapsed > 0.0 ? elapsed : 1e-6);
         double model_gb = (double)engine->model_profile->total_model_bytes / 1e9;
-        double effective_bandwidth_gbps = tok_per_sec * model_gb;
 
         printf("\n=== Performance Telemetry ===\n");
-        printf("Total Model Weights:   %.2f GB\n", model_gb);
-        printf("Tokens Evaluated:      %zu\n", bench_tokens);
-        printf("Elapsed Time:          %.3f seconds\n", elapsed);
-        printf("Decode Throughput:     %.2f tokens/sec\n", tok_per_sec);
-        printf("Effective Bandwidth:   %.2f GB/s\n", effective_bandwidth_gbps);
-        printf("CPU Compute Activity:  0.0%% (GPU Native)\n");
+        printf("Decode Throughput:   %.2f tokens/sec\n", tok_per_sec);
+        printf("Effective Bandwidth: %.2f GB/s\n", tok_per_sec * model_gb);
         printf("=============================\n\n");
 
         free(dummy_logits);
+        vbs_engine_destroy(engine);
+        return 0;
+    }
+
+    if (strcmp(mode, "--generate") == 0) {
+        if (!tokenizer_path) {
+            fprintf(stderr, "Error: --generate requires --tokenizer /path/to/tokenizer.json\n");
+            vbs_engine_destroy(engine);
+            return 1;
+        }
+        tokenizer_t *tok = tokenizer_load(tokenizer_path);
+        if (!tok) {
+            fprintf(stderr, "Error: Failed to load tokenizer from %s\n", tokenizer_path);
+            vbs_engine_destroy(engine);
+            return 1;
+        }
+
+        if (!vbs_engine_compile(engine, err_buf, sizeof(err_buf))) {
+            fprintf(stderr, "Compilation refused: %s\n", err_buf);
+            tokenizer_free(tok);
+            vbs_engine_destroy(engine);
+            return 2;
+        }
+
+        uint32_t prompt_tokens[2048];
+        size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
+
+        float *logits = (float *)calloc(32000, sizeof(float));
+
+        // Prefill prompt tokens
+        for (size_t i = 0; i < n_prompt; i++) {
+            vbs_engine_forward(engine, &prompt_tokens[i], 1, logits);
+        }
+
+        printf("%s", prompt_text);
+        fflush(stdout);
+
+        // Simple argmax sample
+        uint32_t cur_token = 0;
+        float max_logit = -1e9f;
+        for (size_t i = 0; i < 32000; i++) {
+            if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
+        }
+
+        for (size_t i = 0; i < max_gen_tokens; i++) {
+            if ((int)cur_token == tokenizer_eos_id(tok)) break;
+
+            char *piece = tokenizer_decode(tok, &cur_token, 1);
+            if (piece) {
+                printf("%s", piece);
+                fflush(stdout);
+                free(piece);
+            }
+
+            vbs_engine_forward(engine, &cur_token, 1, logits);
+
+            max_logit = -1e9f;
+            for (size_t j = 0; j < 32000; j++) {
+                if (logits[j] > max_logit) { max_logit = logits[j]; cur_token = (uint32_t)j; }
+            }
+        }
+        printf("\n");
+
+        free(logits);
+        tokenizer_free(tok);
         vbs_engine_destroy(engine);
         return 0;
     }

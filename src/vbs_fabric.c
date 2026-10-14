@@ -26,8 +26,6 @@ vbs_fabric_t *vbs_fabric_create(
     if (posix_memalign(&f->pinned_pool, 4096, f->pinned_pool_size) != 0) {
         f->pinned_pool = NULL;
         f->pinned_pool_size = 0;
-    } else {
-        mlock(f->pinned_pool, f->pinned_pool_size);
     }
 
     if (nvme_swap_gib > 0 && nvme_swap_path) {
@@ -57,10 +55,7 @@ void vbs_fabric_free(vbs_fabric_t *f) {
         }
     }
     free(f->blocks);
-    if (f->pinned_pool) {
-        munlock(f->pinned_pool, f->pinned_pool_size);
-        free(f->pinned_pool);
-    }
+    if (f->pinned_pool) free(f->pinned_pool);
     if (f->nvme_swap_map) munmap(f->nvme_swap_map, f->nvme_swap_size);
     if (f->nvme_swap_fd > 0) close(f->nvme_swap_fd);
     free(f);
@@ -80,15 +75,14 @@ vbs_memory_block_t *vbs_fabric_register_tensor(
     vbs_memory_tier_t preferred_tier,
     vbs_device_t *preferred_device
 ) {
-    (void)source_data;
     if (f->n_blocks >= f->block_cap) {
         f->block_cap *= 2;
-        f->blocks = (vbs_memory_block_t **)realloc(f->blocks,
-            f->block_cap * sizeof(vbs_memory_block_t *));
+        f->blocks = (vbs_memory_block_t **)realloc(f->blocks, f->block_cap * sizeof(vbs_memory_block_t *));
     }
     vbs_memory_block_t *b = (vbs_memory_block_t *)calloc(1, sizeof(vbs_memory_block_t));
     b->size = tensor->byte_length;
     b->tensor = tensor;
+    b->data = (void *)source_data;
     b->current_tier = VBS_TIER_FILE_SOURCE;
     b->resident_device = NULL;
 
@@ -97,6 +91,9 @@ vbs_memory_block_t *vbs_fabric_register_tensor(
         if (di >= 0 && f->vram_in_use[di] + b->size <= f->vram_budget[di]) {
             b->gpu_buffer = f->backend->alloc_buffer(preferred_device, b->size, false);
             if (b->gpu_buffer) {
+                if (source_data && f->backend->copy_to_device) {
+                    f->backend->copy_to_device(b->gpu_buffer, source_data, b->size);
+                }
                 f->vram_in_use[di] += b->size;
                 b->current_tier = VBS_TIER_VRAM;
                 b->resident_device = preferred_device;
@@ -115,21 +112,18 @@ bool vbs_fabric_make_room(vbs_fabric_t *f, vbs_device_t *device, size_t bytes_ne
     uint64_t available = f->vram_budget[di] - f->vram_in_use[di];
     if (available >= bytes_needed) return true;
 
-    // LRU eviction
     while (f->vram_in_use[di] + bytes_needed > f->vram_budget[di]) {
         vbs_memory_block_t *victim = NULL;
         uint64_t oldest_tick = UINT64_MAX;
         for (size_t i = 0; i < f->n_blocks; i++) {
             vbs_memory_block_t *b = f->blocks[i];
-            if (b->resident_device == device && b->pin_count == 0 &&
-                b->last_access_tick < oldest_tick) {
+            if (b->resident_device == device && b->pin_count == 0 && b->last_access_tick < oldest_tick) {
                 victim = b;
                 oldest_tick = b->last_access_tick;
             }
         }
         if (!victim) return false;
 
-        // Evict to host
         if (victim->gpu_buffer) {
             f->backend->free_buffer(victim->gpu_buffer);
             victim->gpu_buffer = NULL;
@@ -155,6 +149,10 @@ vbs_buffer_t *vbs_fabric_fault_in_to_device(
 
     block->gpu_buffer = f->backend->alloc_buffer(device, block->size, false);
     if (!block->gpu_buffer) return NULL;
+
+    if (block->data && f->backend->copy_to_device) {
+        f->backend->copy_to_device(block->gpu_buffer, block->data, block->size);
+    }
 
     int di = device_index(f, device);
     if (di >= 0) f->vram_in_use[di] += block->size;
