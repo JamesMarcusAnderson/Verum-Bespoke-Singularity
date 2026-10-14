@@ -26,6 +26,7 @@ typedef struct {
     char id[128];
     vbs_op_kind_t kind;
     const vbs_tensor_t *weight;
+    uint32_t tensor_index; // index of weight in the model's tensor array (fabric registration order)
     char inputs[4][128];
     size_t n_inputs;
     char outputs[2][128];

@@ -194,7 +194,12 @@ static void *metal_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t k
         g_mtl_device_handle, sel_registerName("newComputePipelineStateWithFunction:error:"), fn, &err
     );
     ((void (*)(id, SEL))objc_msgSend)(fn, sel_registerName("release"));
-    return pso;
+    if (!pso) return NULL;
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)malloc(sizeof(vbs_prim_pipeline_t));
+    if (!pp) return NULL;
+    pp->native = pso;
+    pp->kind = kind;
+    return pp;
 }
 
 static bool metal_dispatch_linear_tile(
@@ -230,21 +235,33 @@ static bool metal_dispatch_linear_tile(
 
 static bool metal_dispatch_primitive(
     vbs_device_t *dev, void *pipeline,
-    void **args, size_t n_args,
+    const vbs_arg_t *args, size_t n_args,
     size_t grid_x, size_t block_x
 ) {
     (void)dev;
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)pipeline;
+    if (!pp || !pp->native) return false;
     id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
     id enc = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("computeCommandEncoder"));
 
-    ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pipeline);
+    ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pp->native);
     for (size_t i = 0; i < n_args; i++) {
-        ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
-            enc, sel_registerName("setBuffer:offset:atIndex:"), (id)args[i], (NSUInteger)0, (NSUInteger)i
-        );
+        if (args[i].tag == VBS_ARG_BUFFER) {
+            ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
+                enc, sel_registerName("setBuffer:offset:atIndex:"), (id)args[i].value, (NSUInteger)0, (NSUInteger)i
+            );
+        } else {
+            // Scalars go as inline bytes, per the convention in vbs_backend.h —
+            // binding a host pointer as a buffer was the bug this replaces.
+            ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
+                enc, sel_registerName("setBytes:length:atIndex:"), args[i].value, (NSUInteger)args[i].size, (NSUInteger)i
+            );
+        }
     }
 
-    MTLSize gridSize = { (NSUInteger)grid_x, 1, 1 };
+    // (grid_x, block_x) follow the CUDA blocks x threads convention used by
+    // the bridge; Metal dispatches a total thread count.
+    MTLSize gridSize = { (NSUInteger)(grid_x * block_x), 1, 1 };
     MTLSize tgSize = { (NSUInteger)block_x, 1, 1 };
 
     ((void (*)(id, SEL, MTLSize, MTLSize))objc_msgSend)(

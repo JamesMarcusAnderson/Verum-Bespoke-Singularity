@@ -83,6 +83,42 @@ static bool ggml_type_has_dispatch(vbs_ggml_type_t t) {
     return t == VBS_GGML_TYPE_F32 || t == VBS_GGML_TYPE_Q4_0 || t == VBS_GGML_TYPE_Q8_0;
 }
 
+// Sequenced emitter: instead of chaining every weight through two ping-pong
+// buffers (which cannot express attention), the forward pass is generated as
+// one token step with named buffers and the transformer block structure
+// written out per layer: norm -> Q/K/V -> rope -> KV store -> attention ->
+// output projection -> residual add -> norm -> gate/up -> SiLU*up -> down ->
+// residual add. Tensor roles are read from GGUF names (blk.<L>.*); a weight
+// the sequencer cannot place stops the compile loudly, like the graph
+// compiler's refusal of unresolved matrices.
+typedef enum {
+    SEQ_EMBED, SEQ_ATTN_NORM, SEQ_Q, SEQ_K, SEQ_V, SEQ_ATTN_OUT,
+    SEQ_FFN_NORM, SEQ_GATE, SEQ_UP, SEQ_DOWN, SEQ_FINAL_NORM, SEQ_FINAL_LINEAR
+} seq_role_t;
+
+static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
+    const char *name = n->weight ? n->weight->name : "";
+    *layer = -1;
+    const char *blk = strstr(name, "blk.");
+    if (blk) {
+        *layer = atoi(blk + 4);
+        if (strstr(name, "attn_norm"))   { *role = SEQ_ATTN_NORM; return true; }
+        if (strstr(name, "attn_q"))      { *role = SEQ_Q; return true; }
+        if (strstr(name, "attn_k"))      { *role = SEQ_K; return true; }
+        if (strstr(name, "attn_v"))      { *role = SEQ_V; return true; }
+        if (strstr(name, "attn_output")) { *role = SEQ_ATTN_OUT; return true; }
+        if (strstr(name, "ffn_norm"))    { *role = SEQ_FFN_NORM; return true; }
+        if (strstr(name, "ffn_gate"))    { *role = SEQ_GATE; return true; }
+        if (strstr(name, "ffn_up"))      { *role = SEQ_UP; return true; }
+        if (strstr(name, "ffn_down"))    { *role = SEQ_DOWN; return true; }
+        return false;
+    }
+    if (strstr(name, "token_embd")) { *role = SEQ_EMBED; return true; }
+    if (strstr(name, "output_norm")) { *role = SEQ_FINAL_NORM; return true; }
+    if (strstr(name, "output"))     { *role = SEQ_FINAL_LINEAR; return true; }
+    return false;
+}
+
 bool vbs_specializer_emit_source(
     const vbs_graph_t *graph,
     const vbs_system_profile_t *sys,
@@ -91,21 +127,57 @@ bool vbs_specializer_emit_source(
     const char *out_path
 ) {
     (void)sys;
+    (void)graph;
 
-    // Refuse loudly rather than emit a dispatch to the wrong kernel:
-    // a LINEAR node whose weight type has no real dispatcher stops the
-    // compile here and names the missing kernel.
+    // Classify every planned node up front; refuse what cannot be placed or
+    // has no real kernel, rather than emitting a wrong forward pass.
+    seq_role_t *roles = (seq_role_t *)calloc(plan->n_plans, sizeof(seq_role_t));
+    int *layers = (int *)calloc(plan->n_plans, sizeof(int));
+    long embed_slot = -1, final_norm_slot = -1, final_linear_slot = -1;
+    uint64_t gate_rows = 0;
     for (size_t i = 0; i < plan->n_plans; i++) {
         const vbs_node_t *n = plan->plans[i].node;
-        if (n && n->kind == VBS_OP_LINEAR && n->weight && !ggml_type_has_dispatch(n->weight->type)) {
+        if (!n || !n->weight) {
+            fprintf(stderr, "Specializer refused: plan node %zu has no weight tensor\n", i);
+            free(roles); free(layers);
+            return false;
+        }
+        if ((n->kind == VBS_OP_LINEAR || n->kind == VBS_OP_PROJECTION) && !ggml_type_has_dispatch(n->weight->type)) {
             fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
                     ggml_type_name(n->weight->type), n->weight->name);
+            free(roles); free(layers);
+            return false;
+        }
+        if (!seq_classify(n, &roles[i], &layers[i])) {
+            fprintf(stderr, "Specializer refused: cannot place tensor %s in a transformer block sequence\n", n->weight->name);
+            free(roles); free(layers);
+            return false;
+        }
+        if (roles[i] == SEQ_EMBED) embed_slot = (long)i;
+        if (roles[i] == SEQ_FINAL_NORM) final_norm_slot = (long)i;
+        if (roles[i] == SEQ_FINAL_LINEAR) final_linear_slot = (long)i;
+        if (roles[i] == SEQ_GATE) gate_rows = n->weight->rows;
+    }
+    if (embed_slot < 0) {
+        fprintf(stderr, "Specializer refused: no token embedding tensor found\n");
+        free(roles); free(layers);
+        return false;
+    }
+    if (final_linear_slot < 0) final_linear_slot = embed_slot; // tied embeddings
+    {
+        const vbs_node_t *fn_ = plan->plans[final_linear_slot].node;
+        if (!ggml_type_has_dispatch(fn_->weight->type)) {
+            fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
+                    ggml_type_name(fn_->weight->type), fn_->weight->name);
+            free(roles); free(layers);
             return false;
         }
     }
 
+    uint32_t kv_capacity = mp->kv_ctx_capacity ? mp->kv_ctx_capacity : mp->context_length;
+
     FILE *f = fopen(out_path, "w");
-    if (!f) return false;
+    if (!f) { free(roles); free(layers); return false; }
 
     fprintf(f,
         "// AUTO-GENERATED VERUM JIT SPECIALIZER MODULE\n"
@@ -118,7 +190,11 @@ bool vbs_specializer_emit_source(
         "#define HEAD_DIM       %u\n"
         "#define EMBED_DIM      %u\n"
         "#define CONTEXT_LEN    %u\n"
-        "#define VOCAB_SIZE     %u\n\n"
+        "#define VOCAB_SIZE     %u\n"
+        "#define KV_CAPACITY    %u\n"
+        "#define KV_DIM         %u\n"
+        "#define ROPE_THETA     %.9ef\n"
+        "#define RMS_EPS        %.9ef\n\n"
         "typedef struct { void *device_ptr; size_t size; } vbs_block_t;\n"
         "static vbs_block_t g_blocks[%zu];\n"
         "static size_t g_current_pos = 0;\n\n"
@@ -127,10 +203,13 @@ bool vbs_specializer_emit_source(
         "extern void *vbs_gpu_get_act_buffer_b(void);\n"
         "extern void *vbs_gpu_get_kv_k(void);\n"
         "extern void *vbs_gpu_get_kv_v(void);\n"
+        "extern void *vbs_gpu_get_logits(void);\n"
+        "extern void *vbs_gpu_get_scratch(size_t index);\n"
         "extern void vbs_gpu_dispatch_embed(void *w, uint32_t token, void *out, size_t dim);\n"
         "extern void vbs_gpu_dispatch_norm(void *w, void *in, void *out, size_t dim, float eps);\n"
         "extern void vbs_gpu_dispatch_rope(void *in, uint32_t pos, size_t hdim, size_t nh, float theta);\n"
-        "extern void vbs_gpu_dispatch_attn(void *q, void *k_cache, void *v_cache, void *out, uint32_t pos, size_t nqh, size_t nkh, size_t hd);\n"
+        "extern void vbs_gpu_dispatch_cache(void *k, void *v, void *kc, void *vc, uint32_t pos, uint32_t layer, uint32_t max_ctx, size_t kv_dim);\n"
+        "extern void vbs_gpu_dispatch_attn(void *q, void *k_cache, void *v_cache, void *out, uint32_t pos, uint32_t layer, uint32_t max_ctx, size_t nqh, size_t nkh, size_t hd);\n"
         "extern void vbs_gpu_dispatch_silu(void *gate, void *up, void *out, size_t n);\n"
         "extern void vbs_gpu_dispatch_add(void *a, void *b, void *out, size_t n);\n"
         "extern void vbs_gpu_dispatch_vram_q8_0(void *w, void *in, void *out, size_t r, size_t c);\n"
@@ -139,78 +218,123 @@ bool vbs_specializer_emit_source(
         "extern void vbs_gpu_readback_logits(void *d_src, float *h_dst, size_t n);\n\n",
         mp->n_layers, mp->n_heads, mp->n_kv_heads, mp->head_dim,
         mp->embedding_dim, mp->context_length, mp->vocab_size,
-        graph->n_nodes
+        kv_capacity, mp->n_kv_heads * mp->head_dim,
+        mp->rope_theta ? mp->rope_theta : 10000.0f,
+        mp->rms_eps ? mp->rms_eps : 1e-5f,
+        plan->n_plans
+    );
+
+    fprintf(f,
+        "static void forward_token(uint32_t tok) {\n"
+        "    void *STREAM = vbs_gpu_get_act_buffer_a();\n"
+        "    void *TMP    = vbs_gpu_get_act_buffer_b();\n"
+        "    void *QB     = vbs_gpu_get_scratch(0);\n"
+        "    void *KB     = vbs_gpu_get_scratch(1);\n"
+        "    void *VB     = vbs_gpu_get_scratch(2);\n"
+        "    void *AB     = vbs_gpu_get_scratch(3);\n"
+        "    void *GATE   = vbs_gpu_get_scratch(4);\n"
+        "    void *UP     = vbs_gpu_get_scratch(5);\n"
+        "    void *HIDDEN = vbs_gpu_get_scratch(6);\n"
+        "    void *NORMED = vbs_gpu_get_scratch(7);\n"
+        "    void *KC     = vbs_gpu_get_kv_k();\n"
+        "    void *VC     = vbs_gpu_get_kv_v();\n"
+        "    uint32_t pos = (uint32_t)g_current_pos;\n"
     );
 
     for (size_t i = 0; i < plan->n_plans; i++) {
         const vbs_node_t *n = plan->plans[i].node;
-        fprintf(f, "static inline void op_%zu(uint32_t tok, void *in_dptr, void *out_dptr, void *k_cache, void *v_cache) {\n", i);
-
-        switch (n->kind) {
-            case VBS_OP_EMBEDDING:
-                fprintf(f, "    vbs_gpu_dispatch_embed(g_blocks[%zu].device_ptr, tok, in_dptr, EMBED_DIM);\n", i);
+        int L = layers[i];
+        switch (roles[i]) {
+            case SEQ_EMBED:
+                fprintf(f, "    vbs_gpu_dispatch_embed(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n", i);
                 break;
-            case VBS_OP_NORMALIZE:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, in_dptr, out_dptr, EMBED_DIM, 1e-5f);\n", i);
+            case SEQ_ATTN_NORM:
+            case SEQ_FFN_NORM:
+                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, STREAM, NORMED, EMBED_DIM, RMS_EPS);\n", i);
                 break;
-            case VBS_OP_ROTARY:
-                fprintf(f, "    vbs_gpu_dispatch_rope(in_dptr, (uint32_t)g_current_pos, HEAD_DIM, N_HEADS, 10000.0f);\n");
-                break;
-            case VBS_OP_ATTENTION:
-                fprintf(f, "    vbs_gpu_dispatch_attn(in_dptr, k_cache, v_cache, out_dptr, (uint32_t)g_current_pos, N_HEADS, N_KV_HEADS, HEAD_DIM);\n");
-                break;
-            case VBS_OP_ACTIVATION:
-                fprintf(f, "    vbs_gpu_dispatch_silu(in_dptr, out_dptr, out_dptr, EMBED_DIM);\n");
-                break;
-            case VBS_OP_ELEMENTWISE:
-                fprintf(f, "    vbs_gpu_dispatch_add(in_dptr, out_dptr, out_dptr, EMBED_DIM);\n");
-                break;
-            case VBS_OP_LINEAR:
-                if (n->weight) {
-                    fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, in_dptr, out_dptr, %llu, %llu);\n",
+            case SEQ_Q:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, QB, %llu, %llu);\n",
                         ggml_type_name(n->weight->type), i,
                         (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                }
+                fprintf(f, "    vbs_gpu_dispatch_rope(QB, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
                 break;
-            default:
+            case SEQ_K:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, KB, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                fprintf(f, "    vbs_gpu_dispatch_rope(KB, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
                 break;
+            case SEQ_V:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, VB, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                fprintf(f, "    vbs_gpu_dispatch_cache(KB, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", L);
+                fprintf(f, "    vbs_gpu_dispatch_attn(QB, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", L);
+                break;
+            case SEQ_ATTN_OUT:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, AB, TMP, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
+                break;
+            case SEQ_GATE:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, GATE, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                break;
+            case SEQ_UP:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, UP, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                fprintf(f, "    vbs_gpu_dispatch_silu(GATE, UP, HIDDEN, %llu);\n", (unsigned long long)gate_rows);
+                break;
+            case SEQ_DOWN:
+                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, HIDDEN, TMP, %llu, %llu);\n",
+                        ggml_type_name(n->weight->type), i,
+                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+                fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
+                break;
+            case SEQ_FINAL_NORM:
+            case SEQ_FINAL_LINEAR:
+                break; // emitted at the tail below
         }
-        fprintf(f, "}\n\n");
+    }
+
+    if (final_norm_slot >= 0) {
+        fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%ld].device_ptr, STREAM, NORMED, EMBED_DIM, RMS_EPS);\n", final_norm_slot);
+    }
+    {
+        const vbs_node_t *n = plan->plans[final_linear_slot].node;
+        fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%ld].device_ptr, NORMED, vbs_gpu_get_logits(), VOCAB_SIZE, EMBED_DIM);\n",
+                ggml_type_name(n->weight->type), final_linear_slot);
     }
 
     fprintf(f,
+        "}\n\n"
         "void verum_forward(const uint32_t *tokens, size_t n_tokens, float *logits_out) {\n"
-        "    void *d_in = vbs_gpu_get_act_buffer_a();\n"
-        "    void *d_out = vbs_gpu_get_act_buffer_b();\n"
-        "    void *k_cache = vbs_gpu_get_kv_k();\n"
-        "    void *v_cache = vbs_gpu_get_kv_v();\n"
         "    for (size_t t = 0; t < n_tokens; t++) {\n"
-        "        uint32_t tok = tokens[t];\n"
-    );
-
-    for (size_t i = 0; i < plan->n_plans; i++) {
-        fprintf(f, "        op_%zu(tok, d_in, d_out, k_cache, v_cache);\n", i);
-        fprintf(f, "        { void *tmp = d_in; d_in = d_out; d_out = tmp; }\n");
-    }
-
-    fprintf(f,
+        "        forward_token(tokens[t]);\n"
         "        g_current_pos++;\n"
         "    }\n"
-        "    vbs_gpu_readback_logits(d_in, logits_out, VOCAB_SIZE);\n"
+        "    vbs_gpu_readback_logits(vbs_gpu_get_logits(), logits_out, VOCAB_SIZE);\n"
         "}\n\n"
         "void verum_init(void *fabric, void *backend) {\n"
         "    (void)fabric; (void)backend;\n"
-        "    for (size_t i = 0; i < %zu; i++) {\n"
-        "        g_blocks[i].device_ptr = vbs_bridge_get_block_dptr(i);\n"
-        "    }\n"
+    );
+    for (size_t i = 0; i < plan->n_plans; i++) {
+        fprintf(f, "    g_blocks[%zu].device_ptr = vbs_bridge_get_block_dptr(%u);\n",
+                i, plan->plans[i].node->tensor_index);
+    }
+    fprintf(f,
         "    g_current_pos = 0;\n"
         "}\n\n"
         "void verum_reset_cache(void) { g_current_pos = 0; }\n"
-        "void verum_shutdown(void) { memset(g_blocks, 0, sizeof(g_blocks)); }\n",
-        graph->n_nodes
+        "void verum_shutdown(void) { memset(g_blocks, 0, sizeof(g_blocks)); }\n"
     );
 
     fclose(f);
+    free(roles);
+    free(layers);
     return true;
 }
 

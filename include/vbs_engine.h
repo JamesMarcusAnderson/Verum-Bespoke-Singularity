@@ -9,6 +9,7 @@
 #include "vbs_fabric.h"
 #include "vbs_planner.h"
 #include "vbs_specializer.h"
+#include "vbs_specializer_bridge.h"
 #include "tokenizer.h"
 
 #ifdef __cplusplus
@@ -33,6 +34,7 @@ typedef struct vbs_engine {
     vbs_buffer_t *kv_cache_k;
     vbs_buffer_t *kv_cache_v;
     size_t kv_ctx_capacity; // positions the KV caches were actually allocated for; kernels must use this as the cache stride, not the model's context_length
+    vbs_buffer_t *scratch[VBS_SCRATCH_COUNT];
 
     size_t n_devices;
     vbs_device_t **devices;

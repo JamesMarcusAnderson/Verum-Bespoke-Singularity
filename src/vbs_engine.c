@@ -111,6 +111,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     }
     if (kv_cap == 0) kv_cap = 1;
     e->kv_ctx_capacity = kv_cap;
+    e->model_profile->kv_ctx_capacity = (uint32_t)kv_cap;
 
     e->act_a  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
     e->act_b  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
@@ -127,9 +128,32 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         return NULL;
     }
 
+    // Scratch buffers the generated forward pass routes through by name
+    // (Q/K/V, attention out, FFN gate/up/hidden, normed activation).
+    size_t q_dim = (e->model_profile->n_heads && head_d) ? (size_t)e->model_profile->n_heads * head_d : embed_dim;
+    size_t kv_dim = n_kv_h * head_d;
+    size_t ffn_dim = embed_dim;
+    for (size_t i = 0; i < model->n_tensors; i++) {
+        if (strstr(model->tensors[i].name, "ffn_gate") && model->tensors[i].rows > ffn_dim) {
+            ffn_dim = model->tensors[i].rows;
+        }
+    }
+    size_t scratch_sizes[VBS_SCRATCH_COUNT] = {
+        q_dim, kv_dim, kv_dim, q_dim, ffn_dim, ffn_dim, ffn_dim, embed_dim
+    };
+    for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) {
+        e->scratch[i] = backend->alloc_buffer(primary_dev, scratch_sizes[i] * sizeof(float), false);
+        if (!e->scratch[i]) {
+            snprintf(err, err_cap, "Failed allocating scratch buffer %zu (%zu B)", i, scratch_sizes[i] * sizeof(float));
+            vbs_engine_destroy(e);
+            return NULL;
+        }
+    }
+
     // Bind bridge pointers
     vbs_bridge_bind_runtime(primary_dev, e->backend, e->fabric);
     vbs_bridge_set_activations(e->act_a, e->act_b, e->kv_cache_k, e->kv_cache_v, e->logits);
+    vbs_bridge_set_scratch(e->scratch, VBS_SCRATCH_COUNT);
 
     return e;
 }
@@ -199,6 +223,9 @@ void vbs_engine_destroy(vbs_engine_t *e) {
     if (e->logits) e->backend->free_buffer(e->logits);
     if (e->kv_cache_k) e->backend->free_buffer(e->kv_cache_k);
     if (e->kv_cache_v) e->backend->free_buffer(e->kv_cache_v);
+    for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) {
+        if (e->scratch[i]) e->backend->free_buffer(e->scratch[i]);
+    }
     if (e->fabric) vbs_fabric_free(e->fabric);
     if (e->graph) vbs_graph_free(e->graph);
     for (size_t i = 0; i < e->n_devices; i++) {

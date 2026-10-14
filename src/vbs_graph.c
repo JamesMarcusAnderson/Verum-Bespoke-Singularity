@@ -72,6 +72,7 @@ vbs_graph_t *vbs_graph_compile(const vbs_gguf_model_t *model, char *err_buf, siz
         vbs_node_t *n = &g->nodes[g->n_nodes++];
         snprintf(n->id, sizeof(n->id), "%s", t->name);
         n->weight = t;
+        n->tensor_index = (uint32_t)i;
         n->rows = t->rows;
         n->columns = t->columns;
 

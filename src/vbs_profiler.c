@@ -267,6 +267,12 @@ vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
     if (mp->n_heads && mp->embedding_dim) mp->head_dim = mp->embedding_dim / mp->n_heads;
     if (mp->vocab_size == 0) mp->vocab_size = 32000;
 
+    mp->rope_theta = 10000.0f;
+    mp->rms_eps = 1e-5f;
+    float fv;
+    if (vbs_gguf_get_float32_metadata(model, "llama.rope.freq_base", &fv)) mp->rope_theta = fv;
+    if (vbs_gguf_get_float32_metadata(model, "llama.attention.layer_norm_rms_epsilon", &fv)) mp->rms_eps = fv;
+
     return mp;
 }
 

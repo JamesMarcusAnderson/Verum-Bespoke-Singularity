@@ -35,6 +35,31 @@ struct vbs_buffer {
     vbs_device_t *device;
 };
 
+// Primitive-dispatch argument convention — defined once here, honored by
+// every backend. Each argument is either a device buffer or a scalar passed
+// by value. CUDA passes buffer handles as u64 kernel params and scalars as
+// plain kernel params; Metal binds buffers with setBuffer and scalars with
+// setBytes. Argument ORDER per op kind is fixed by the bridge (see
+// vbs_specializer_bridge.h) and matches both the PTX and MSL kernel
+// signatures; backends whose kernels differ (CUDA attention takes pre-offset
+// cache pointers and no layer/max_ctx params) translate inside their own
+// dispatch_primitive.
+typedef enum { VBS_ARG_BUFFER = 0, VBS_ARG_SCALAR = 1 } vbs_arg_tag_t;
+
+typedef struct {
+    vbs_arg_tag_t tag;
+    const void *value; // BUFFER: device handle. SCALAR: pointer to the value.
+    size_t size;       // SCALAR: byte size of the value. BUFFER: unused (0).
+} vbs_arg_t;
+
+// Primitive pipeline handle returned by compile_primitive_pipeline: wraps
+// the backend-native object and records the op kind so dispatch_primitive
+// can marshal arguments to the kernel's native layout.
+typedef struct {
+    void *native;
+    vbs_op_kind_t kind;
+} vbs_prim_pipeline_t;
+
 typedef struct vbs_backend_ops {
     bool (*init)(void);
     size_t (*get_device_count)(void);
@@ -58,7 +83,7 @@ typedef struct vbs_backend_ops {
 
     bool (*dispatch_primitive)(
         vbs_device_t *dev, void *pipeline,
-        void **args, size_t n_args,
+        const vbs_arg_t *args, size_t n_args,
         size_t grid_x, size_t block_x
     );
 

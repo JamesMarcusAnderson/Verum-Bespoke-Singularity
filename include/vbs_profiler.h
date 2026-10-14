@@ -100,6 +100,10 @@ typedef struct {
     uint32_t context_length;
     uint32_t vocab_size;
     uint32_t embedding_dim;
+
+    float rope_theta;        // <arch>.rope.freq_base, default 10000
+    float rms_eps;           // <arch>.attention.layer_norm_rms_epsilon, default 1e-5
+    uint32_t kv_ctx_capacity; // set by the engine after allocation; 0 = use context_length
 } vbs_model_profile_t;
 
 vbs_system_profile_t *vbs_profiler_scan_system(void);

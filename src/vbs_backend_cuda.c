@@ -156,23 +156,30 @@ static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t typ
 static void *cuda_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
     vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
     CUfunction fn = NULL;
-    const char *kname = "rms_norm";
+    const char *kname = NULL;
 
     switch (kind) {
         case VBS_OP_EMBEDDING:   kname = "embedding_lookup"; break;
         case VBS_OP_NORMALIZE:   kname = "rms_norm";         break;
         case VBS_OP_ROTARY:      kname = "rope";             break;
+        case VBS_OP_CACHE:       kname = "kv_cache_store";   break;
         case VBS_OP_ATTENTION:   kname = "attention_gqa";    break;
         case VBS_OP_ACTIVATION:  kname = "silu_mul";         break;
         case VBS_OP_ELEMENTWISE: kname = "residual_add";     break;
-        default:                 kname = "rms_norm";         break;
+        default:
+            snprintf(err_buf, err_cap, "CUDA has no primitive kernel for op kind %d", (int)kind);
+            return NULL;
     }
 
     if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
         snprintf(err_buf, err_cap, "CUDA primitive %s not found", kname);
         return NULL;
     }
-    return (void *)fn;
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)malloc(sizeof(vbs_prim_pipeline_t));
+    if (!pp) return NULL;
+    pp->native = (void *)fn;
+    pp->kind = kind;
+    return pp;
 }
 
 static bool cuda_dispatch_linear_tile(
@@ -190,11 +197,51 @@ static bool cuda_dispatch_linear_tile(
 
 static bool cuda_dispatch_primitive(
     vbs_device_t *dev, void *pipeline,
-    void **args, size_t n_args,
+    const vbs_arg_t *args, size_t n_args,
     size_t grid_x, size_t block_x
 ) {
-    (void)dev; (void)n_args;
-    return g_cu.cuLaunchKernel((CUfunction)pipeline, (unsigned int)grid_x, 1, 1, (unsigned int)block_x, 1, 1, 0, NULL, args, NULL) == CUDA_SUCCESS;
+    (void)dev;
+    vbs_prim_pipeline_t *pp = (vbs_prim_pipeline_t *)pipeline;
+    if (!pp || !pp->native) return false;
+
+    uint64_t bufvals[16];
+    void *params[16];
+
+    if (pp->kind == VBS_OP_ATTENTION) {
+        // Canonical order (bridge): q, kc, vc, out, seq_len, layer, max_ctx,
+        // n_q_heads, n_kv_heads, head_dim, scale.
+        // PTX attention_gqa takes pre-offset cache pointers and no
+        // layer/max_ctx: fold the layer slice offset into the pointers.
+        if (n_args != 11) return false;
+        uint32_t layer   = *(const uint32_t *)args[5].value;
+        uint32_t max_ctx = *(const uint32_t *)args[6].value;
+        uint32_t nkh     = *(const uint32_t *)args[8].value;
+        uint32_t hd      = *(const uint32_t *)args[9].value;
+        uint64_t off = (uint64_t)layer * max_ctx * nkh * hd * 2; // f16 elements -> bytes
+        bufvals[0] = (uint64_t)(uintptr_t)args[0].value;
+        bufvals[1] = (uint64_t)(uintptr_t)args[1].value + off;
+        bufvals[2] = (uint64_t)(uintptr_t)args[2].value + off;
+        bufvals[3] = (uint64_t)(uintptr_t)args[3].value;
+        params[0] = &bufvals[0]; params[1] = &bufvals[1];
+        params[2] = &bufvals[2]; params[3] = &bufvals[3];
+        params[4] = (void *)args[4].value;  // seq_len
+        params[5] = (void *)args[7].value;  // n_q_heads
+        params[6] = (void *)args[8].value;  // n_kv_heads
+        params[7] = (void *)args[9].value;  // head_dim
+        params[8] = (void *)args[10].value; // scale
+    } else {
+        if (n_args > 16) return false;
+        for (size_t i = 0; i < n_args; i++) {
+            if (args[i].tag == VBS_ARG_BUFFER) {
+                bufvals[i] = (uint64_t)(uintptr_t)args[i].value;
+                params[i] = &bufvals[i];
+            } else {
+                params[i] = (void *)args[i].value;
+            }
+        }
+    }
+
+    return g_cu.cuLaunchKernel((CUfunction)pp->native, (unsigned int)grid_x, 1, 1, (unsigned int)block_x, 1, 1, 0, NULL, params, NULL) == CUDA_SUCCESS;
 }
 
 static void cuda_synchronize(vbs_device_t *dev) {

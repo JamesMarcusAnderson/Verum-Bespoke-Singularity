@@ -259,6 +259,18 @@ bool vbs_gguf_get_uint32_metadata(const vbs_gguf_model_t *model, const char *key
     return false;
 }
 
+bool vbs_gguf_get_float32_metadata(const vbs_gguf_model_t *model, const char *key, float *out_val) {
+    if (!model || !key) return false;
+    for (size_t i = 0; i < model->n_metadata; i++) {
+        if (strcmp(model->metadata[i].key, key) == 0) {
+            const uint8_t *p = (const uint8_t *)model->map + model->metadata[i].value_offset;
+            if (model->metadata[i].type == M_F32) { memcpy(out_val, p, 4); return true; }
+            if (model->metadata[i].type == M_F64) { double d; memcpy(&d, p, 8); *out_val = (float)d; return true; }
+        }
+    }
+    return false;
+}
+
 bool vbs_gguf_copy_packed_tile(
     const vbs_gguf_model_t *model,
     const vbs_tensor_t *t,

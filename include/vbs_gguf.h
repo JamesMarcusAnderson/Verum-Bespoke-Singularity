@@ -91,6 +91,7 @@ void vbs_gguf_close(vbs_gguf_model_t *model);
 const vbs_tensor_t *vbs_gguf_get_tensor(const vbs_gguf_model_t *model, const char *name);
 const char *vbs_gguf_get_string_metadata(const vbs_gguf_model_t *model, const char *key);
 bool vbs_gguf_get_uint32_metadata(const vbs_gguf_model_t *model, const char *key, uint32_t *out_val);
+bool vbs_gguf_get_float32_metadata(const vbs_gguf_model_t *model, const char *key, float *out_val);
 
 bool vbs_gguf_copy_packed_tile(
     const vbs_gguf_model_t *model,
