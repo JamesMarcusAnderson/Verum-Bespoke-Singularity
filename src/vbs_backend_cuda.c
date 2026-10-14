@@ -1,4 +1,5 @@
 #include "vbs_backend.h"
+#include "../kernels/cuda_kernels.ptx.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,19 +81,6 @@ static vbs_device_t g_cuda_devices[8];
 static vbs_cuda_internal_t g_cuda_internals[8];
 static int g_cuda_dev_count = 0;
 
-static const char *g_ptx_source =
-".version 7.0\n"
-".target sm_70\n"
-".address_size 64\n"
-".visible .entry matvec_f32(\n"
-"    .param .u64 w, .param .u64 x, .param .u64 y,\n"
-"    .param .u32 cols, .param .u32 rows\n"
-") { ret; }\n"
-".visible .entry matvec_q8_0(\n"
-"    .param .u64 w, .param .u64 x, .param .u64 y,\n"
-"    .param .u32 cols, .param .u32 rows\n"
-") { ret; }\n";
-
 static bool cuda_init(void) {
     g_cu.handle = dlopen("libcuda.so.1", RTLD_LAZY);
     if (!g_cu.handle) g_cu.handle = dlopen("libcuda.so", RTLD_LAZY);
@@ -147,7 +135,7 @@ static bool cuda_init(void) {
         vbs_cuda_internal_t *ci = &g_cuda_internals[g_cuda_dev_count];
         ci->dev = dev;
         if (g_cu.cuCtxCreate(&ci->ctx, 0, dev) != CUDA_SUCCESS) continue;
-        g_cu.cuModuleLoadData(&ci->mod, g_ptx_source);
+        g_cu.cuModuleLoadData(&ci->mod, g_cuda_kernels_ptx);
         if (g_cu.cuStreamCreate) g_cu.cuStreamCreate(&ci->stream, 0);
 
         g_cuda_dev_count++;
@@ -178,19 +166,40 @@ static void cuda_free_buffer(vbs_buffer_t *b) {
 }
 
 static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t type, char *err_buf, size_t err_cap) {
-    (void)type;
     vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
-    CUfunction fn;
-    if (g_cu.cuModuleGetFunction(&fn, ci->mod, "matvec_q8_0") != CUDA_SUCCESS) {
-        snprintf(err_buf, err_cap, "CUDA kernel lookup failed");
+    CUfunction fn = NULL;
+    const char *kname = "matvec_f32";
+
+    switch (type) {
+        case VBS_GGML_TYPE_Q8_0: kname = "matvec_q8_0"; break;
+        case VBS_GGML_TYPE_Q4_0: kname = "matvec_q4_0"; break;
+        default:                 kname = "matvec_f32";  break;
+    }
+
+    if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
+        snprintf(err_buf, err_cap, "CUDA kernel %s not found in PTX module", kname);
         return NULL;
     }
     return (void *)fn;
 }
 
 static void *cuda_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
-    (void)dev; (void)kind; (void)err_buf; (void)err_cap;
-    return (void *)0x1;
+    vbs_cuda_internal_t *ci = (vbs_cuda_internal_t *)dev->internal_handle;
+    CUfunction fn = NULL;
+    const char *kname = "rms_norm";
+
+    switch (kind) {
+        case VBS_OP_NORMALIZE:  kname = "rms_norm"; break;
+        case VBS_OP_ROTARY:     kname = "rope";     break;
+        case VBS_OP_ACTIVATION: kname = "silu_mul"; break;
+        default:                kname = "rms_norm"; break;
+    }
+
+    if (g_cu.cuModuleGetFunction(&fn, ci->mod, kname) != CUDA_SUCCESS) {
+        snprintf(err_buf, err_cap, "CUDA primitive %s not found in PTX module", kname);
+        return NULL;
+    }
+    return (void *)fn;
 }
 
 static bool cuda_dispatch_linear_tile(
