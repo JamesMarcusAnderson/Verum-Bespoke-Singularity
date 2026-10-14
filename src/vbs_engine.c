@@ -5,46 +5,52 @@
 #include <string.h>
 #include <sys/stat.h>
 
-extern const vbs_backend_ops_t g_vbs_cpu_backend;
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
 extern const vbs_backend_ops_t g_vbs_hip_backend;
-#if VBS_ENABLE_METAL
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
 extern const vbs_backend_ops_t g_vbs_metal_backend;
 #endif
 
-static const vbs_backend_ops_t *select_backend(const vbs_system_profile_t *sys) {
+static const vbs_backend_ops_t *select_gpu_backend(const vbs_system_profile_t *sys) {
     const char *pref = getenv("VBS_BACKEND");
     if (pref) {
         if (strcmp(pref, "cuda") == 0 && g_vbs_cuda_backend.init()) return &g_vbs_cuda_backend;
         if (strcmp(pref, "hip")  == 0 && g_vbs_hip_backend.init())  return &g_vbs_hip_backend;
-#if VBS_ENABLE_METAL
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
         if (strcmp(pref, "metal") == 0 && g_vbs_metal_backend.init()) return &g_vbs_metal_backend;
 #endif
-        if (strcmp(pref, "cpu")  == 0 && g_vbs_cpu_backend.init())  return &g_vbs_cpu_backend;
     }
 
     for (size_t i = 0; i < sys->n_gpus; i++) {
-        if (sys->gpus[i].type == VBS_BACKEND_CUDA)  return &g_vbs_cuda_backend;
-#if VBS_ENABLE_METAL
-        if (sys->gpus[i].type == VBS_BACKEND_METAL) return &g_vbs_metal_backend;
+        if (sys->gpus[i].type == VBS_BACKEND_CUDA && g_vbs_cuda_backend.init())  return &g_vbs_cuda_backend;
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
+        if (sys->gpus[i].type == VBS_BACKEND_METAL && g_vbs_metal_backend.init()) return &g_vbs_metal_backend;
 #endif
-        if (sys->gpus[i].type == VBS_BACKEND_HIP)   return &g_vbs_hip_backend;
+        if (sys->gpus[i].type == VBS_BACKEND_HIP && g_vbs_hip_backend.init())   return &g_vbs_hip_backend;
     }
-    return &g_vbs_cpu_backend;
+    return NULL; // Zero CPU fallback
 }
 
 vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, size_t err_cap) {
     vbs_gguf_model_t *model = vbs_gguf_open(path, err, err_cap);
     if (!model) return NULL;
 
+    vbs_system_profile_t *sys = vbs_profiler_scan_system();
+    vbs_profiler_benchmark_devices(sys);
+
+    const vbs_backend_ops_t *backend = select_gpu_backend(sys);
+    if (!backend) {
+        snprintf(err, err_cap, "Fatal: No supported GPU device detected (CUDA, HIP, or Metal). CPU execution is disabled.");
+        vbs_profiler_free_system(sys);
+        vbs_gguf_close(model);
+        return NULL;
+    }
+
     vbs_engine_t *e = (vbs_engine_t *)calloc(1, sizeof(vbs_engine_t));
     e->model = model;
-
-    e->sys_profile = vbs_profiler_scan_system();
-    vbs_profiler_benchmark_devices(e->sys_profile);
+    e->sys_profile = sys;
     e->model_profile = vbs_profiler_scan_model(model);
-
-    e->backend = select_backend(e->sys_profile);
+    e->backend = backend;
 
     const char *swap_path = getenv("VBS_SWAP_PATH");
     size_t swap_gib = 0;
@@ -53,7 +59,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
 
     e->fabric = vbs_fabric_create(
         e->sys_profile, e->backend,
-        512, // 512 MiB pinned host pool
+        512, // 512 MiB DMA pinned pool
         swap_gib,
         swap_path ? swap_path : "/tmp/verum_swap.bin"
     );
@@ -64,11 +70,13 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     e->executors = (vbs_slice_executor_t **)calloc(e->n_devices, sizeof(vbs_slice_executor_t *));
 
     for (size_t i = 0; i < e->n_devices; i++) {
-        e->devices[i] = e->sys_profile->n_gpus
-            ? e->sys_profile->gpus[i].device
-            : e->backend->get_device(0);
+        e->devices[i] = e->backend->get_device(i);
         e->executors[i] = vbs_slice_executor_create(
             model, e->backend, e->devices[i], e->window_bytes, err, err_cap);
+        if (!e->executors[i]) {
+            vbs_engine_destroy(e);
+            return NULL;
+        }
     }
     return e;
 }
@@ -83,7 +91,6 @@ bool vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap) {
         return false;
     }
 
-    // ===== SPECIALIZATION STAGE =====
     char hash[65] = {0};
     vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
 
@@ -104,7 +111,7 @@ bool vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap) {
 
         double compile_sec = 0;
         if (!vbs_specializer_compile(src_path, bin_path, e->sys_profile, &compile_sec)) {
-            snprintf(err, err_cap, "Specializer compilation failed (clang check)");
+            snprintf(err, err_cap, "Specializer compilation failed");
             return false;
         }
 
@@ -121,7 +128,6 @@ bool vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap) {
 
     e->specialized->n_kernels_emitted = e->plan->n_plans;
     e->specialized->init_fn(e->fabric, (void *)e->backend);
-
     return true;
 }
 
