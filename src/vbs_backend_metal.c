@@ -11,8 +11,15 @@
 typedef unsigned long NSUInteger;
 #endif
 
-#define OBJC_MSG(ret_type, target, sel_name, ...) \
-    ((ret_type (*)(id, SEL, ##__VA_ARGS__))objc_msgSend)((id)(target), sel_registerName(sel_name), ##__VA_ARGS__)
+#ifndef nil
+#define nil ((id)0)
+#endif
+
+typedef struct {
+    NSUInteger width;
+    NSUInteger height;
+    NSUInteger depth;
+} MTLSize;
 
 static vbs_device_t g_metal_device;
 static id g_mtl_device_handle = nil;
@@ -24,10 +31,16 @@ static const char *g_metal_shader_source =
 "using namespace metal;\n"
 "struct q80{half d;char q[32];};\n"
 "struct q40{half d;uchar q[16];};\n"
+"struct q41{half d;half m;uchar q[16];};\n"
 "kernel void matvec_q8_0(device const q80*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;uint nb=cols/32;for(uint b=0;b<nb;b++){float d=float(w[r*nb+b].d);for(uint i=0;i<32;i++)a+=d*float(w[r*nb+b].q[i])*x[b*32+i];}y[r]=a;}\n"
 "kernel void matvec_q4_0(device const q40*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;uint nb=cols/32;for(uint b=0;b<nb;b++){float d=float(w[r*nb+b].d);for(uint i=0;i<16;i++){uchar q=w[r*nb+b].q[i];a+=d*(float(q&15)-8.0f)*x[b*32+i]+d*(float(q>>4)-8.0f)*x[b*32+i+16];}}y[r]=a;}\n"
+"kernel void matvec_q4_1(device const q41*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;uint nb=cols/32;for(uint b=0;b<nb;b++){float d=float(w[r*nb+b].d),m=float(w[r*nb+b].m);for(uint i=0;i<16;i++){uchar q=w[r*nb+b].q[i];a+=(d*float(q&15)+m)*x[b*32+i]+(d*float(q>>4)+m)*x[b*32+i+16];}}y[r]=a;}\n"
 "kernel void matvec_f32(device const float*w[[buffer(0)]],device const float*x[[buffer(1)]],device float*y[[buffer(2)]],constant uint&cols[[buffer(3)]],constant uint&rows[[buffer(4)]],uint r[[thread_position_in_grid]]){if(r>=rows)return;float a=0;for(uint i=0;i<cols;i++)a+=w[r*cols+i]*x[i];y[r]=a;}\n"
+"kernel void embedding_lookup(device const float*w[[buffer(0)]],constant uint&tok[[buffer(1)]],device float*out[[buffer(2)]],constant uint&dim[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i<dim)out[i]=w[ulong(tok)*dim+i];}\n"
 "kernel void rms_norm(device const float*x[[buffer(0)]],device const float*w[[buffer(1)]],device float*y[[buffer(2)]],constant uint&n[[buffer(3)]],constant float&eps[[buffer(4)]],uint i[[thread_position_in_grid]]){if(i>=n)return;float ss=0;for(uint j=0;j<n;j++)ss+=x[j]*x[j];y[i]=x[i]*rsqrt(ss/float(n)+eps)*w[i];}\n"
+"kernel void rope(device float*x[[buffer(0)]],constant uint&pos[[buffer(1)]],constant uint&head_dim[[buffer(2)]],constant uint&n_heads[[buffer(3)]],constant float&theta[[buffer(4)]],uint i[[thread_position_in_grid]]){uint total_pairs=n_heads*(head_dim/2);if(i>=total_pairs)return;uint h=i/(head_dim/2),p=i%(head_dim/2),i0=h*head_dim+p*2,i1=i0+1;float freq=pow(theta,-(float)(p*2)/(float)head_dim),ang=float(pos)*freq,c=cos(ang),s=sin(ang),v0=x[i0],v1=x[i1];x[i0]=v0*c-v1*s;x[i1]=v1*c+v0*s;}\n"
+"kernel void kv_cache_store(device const float*k[[buffer(0)]],device const float*v[[buffer(1)]],device half*kc[[buffer(2)]],device half*vc[[buffer(3)]],constant uint&pos[[buffer(4)]],constant uint&l[[buffer(5)]],constant uint&max_ctx[[buffer(6)]],constant uint&kv_dim[[buffer(7)]],uint i[[thread_position_in_grid]]){if(i<kv_dim){ulong off=(ulong(l)*max_ctx+pos)*kv_dim+i;kc[off]=half(k[i]);vc[off]=half(v[i]);}}\n"
+"kernel void attention_gqa(device const float*q[[buffer(0)]],device const half*kc[[buffer(1)]],device const half*vc[[buffer(2)]],device float*out[[buffer(3)]],constant uint&seq_len[[buffer(4)]],constant uint&l[[buffer(5)]],constant uint&max_ctx[[buffer(6)]],constant uint&nqh[[buffer(7)]],constant uint&nkh[[buffer(8)]],constant uint&hd[[buffer(9)]],constant float&sc[[buffer(10)]],uint hid[[threadgroup_position_in_grid]]){if(hid>=nqh)return;uint kh=hid/(nqh/nkh),kvd=nkh*hd;device const float*qh=q+hid*hd;threadgroup float scores[2048];for(uint p=0;p<seq_len;p++){ulong off=(ulong(l)*max_ctx+p)*kvd+kh*hd;float dot=0;for(uint d=0;d<hd;d++)dot+=qh[d]*float(kc[off+d]);scores[p]=dot*sc;}float mx=-1e9f;for(uint p=0;p<seq_len;p++)mx=max(mx,scores[p]);float sm=0;for(uint p=0;p<seq_len;p++){scores[p]=exp(scores[p]-mx);sm+=scores[p];}float inv=1.0f/sm;for(uint d=0;d<hd;d++){float acc=0;for(uint p=0;p<seq_len;p++){ulong off=(ulong(l)*max_ctx+p)*kvd+kh*hd+d;acc+=scores[p]*inv*float(vc[off]);}}out[hid*hd]=acc;}\n"
 "kernel void silu_mul(device const float*g[[buffer(0)]],device const float*u[[buffer(1)]],device float*y[[buffer(2)]],constant uint&n[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i<n)y[i]=(g[i]/(1.0f+exp(-g[i])))*u[i];}\n"
 "kernel void residual_add(device const float*a[[buffer(0)]],device const float*b[[buffer(1)]],device float*y[[buffer(2)]],constant uint&n[[buffer(3)]],uint i[[thread_position_in_grid]]){if(i<n)y[i]=a[i]+b[i];}\n";
 
@@ -39,22 +52,21 @@ static bool metal_init(void) {
     g_mtl_device_handle = ((MTLCreateSystemDefaultDeviceFn)sym)();
     if (!g_mtl_device_handle) return false;
 
-    id name_str = OBJC_MSG(id, g_mtl_device_handle, "name");
-    const char *cstr = OBJC_MSG(const char *, name_str, "UTF8String");
+    id name_str = ((id (*)(id, SEL))objc_msgSend)(g_mtl_device_handle, sel_registerName("name"));
+    const char *cstr = ((const char * (*)(id, SEL))objc_msgSend)(name_str, sel_registerName("UTF8String"));
     snprintf(g_metal_device.name, sizeof(g_metal_device.name), "%s", cstr ? cstr : "Apple Metal GPU");
 
     g_metal_device.type = VBS_BACKEND_METAL;
-    g_metal_device.max_working_set_bytes = OBJC_MSG(unsigned long long, g_mtl_device_handle, "recommendedMaxWorkingSetSize");
-    g_metal_device.max_buffer_bytes = OBJC_MSG(unsigned long long, g_mtl_device_handle, "maxBufferLength");
+    g_metal_device.max_working_set_bytes = ((unsigned long long (*)(id, SEL))objc_msgSend)(g_mtl_device_handle, sel_registerName("recommendedMaxWorkingSetSize"));
+    g_metal_device.max_buffer_bytes = ((unsigned long long (*)(id, SEL))objc_msgSend)(g_mtl_device_handle, sel_registerName("maxBufferLength"));
     g_metal_device.internal_handle = g_mtl_device_handle;
 
-    g_mtl_queue_handle = OBJC_MSG(id, g_mtl_device_handle, "newCommandQueue");
+    g_mtl_queue_handle = ((id (*)(id, SEL))objc_msgSend)(g_mtl_device_handle, sel_registerName("newCommandQueue"));
 
-    // Compile embedded MSL library
     Class ns_string_cls = objc_getClass("NSString");
-    id ns_src = OBJC_MSG(id, ns_string_cls, "stringWithUTF8String:", g_metal_shader_source);
+    id ns_src = ((id (*)(id, SEL, const char *))objc_msgSend)((id)ns_string_cls, sel_registerName("stringWithUTF8String:"), g_metal_shader_source);
     id err = nil;
-    g_mtl_library = OBJC_MSG(id, g_mtl_device_handle, "newLibraryWithSource:options:error:", ns_src, nil, &err);
+    g_mtl_library = ((id (*)(id, SEL, id, id, id *))objc_msgSend)(g_mtl_device_handle, sel_registerName("newLibraryWithSource:options:error:"), ns_src, nil, &err);
 
     return (g_mtl_library != nil);
 }
@@ -64,8 +76,9 @@ static vbs_device_t *metal_get_device(size_t i) { (void)i; return &g_metal_devic
 
 static vbs_buffer_t *metal_alloc_buffer(vbs_device_t *dev, size_t bytes, bool shared) {
     NSUInteger options = shared ? (0x0000UL) : (0x0020UL);
-    typedef id (*alloc_buf_fn)(id, SEL, NSUInteger, NSUInteger);
-    id buf_handle = ((alloc_buf_fn)objc_msgSend)(dev->internal_handle, sel_registerName("newBufferWithLength:options:"), (NSUInteger)bytes, options);
+    id buf_handle = ((id (*)(id, SEL, NSUInteger, NSUInteger))objc_msgSend)(
+        dev->internal_handle, sel_registerName("newBufferWithLength:options:"), (NSUInteger)bytes, options
+    );
     if (!buf_handle) return NULL;
 
     vbs_buffer_t *buf = (vbs_buffer_t *)calloc(1, sizeof(vbs_buffer_t));
@@ -73,7 +86,7 @@ static vbs_buffer_t *metal_alloc_buffer(vbs_device_t *dev, size_t bytes, bool sh
     buf->size = bytes;
     buf->device = dev;
     if (shared) {
-        buf->host_ptr = OBJC_MSG(void *, buf_handle, "contents");
+        buf->host_ptr = ((void * (*)(id, SEL))objc_msgSend)(buf_handle, sel_registerName("contents"));
     }
     return buf;
 }
@@ -81,7 +94,7 @@ static vbs_buffer_t *metal_alloc_buffer(vbs_device_t *dev, size_t bytes, bool sh
 static void metal_free_buffer(vbs_buffer_t *buf) {
     if (!buf) return;
     if (buf->internal_handle) {
-        OBJC_MSG(void, buf->internal_handle, "release");
+        ((void (*)(id, SEL))objc_msgSend)(buf->internal_handle, sel_registerName("release"));
     }
     free(buf);
 }
@@ -91,14 +104,22 @@ static bool metal_copy_to_device(vbs_buffer_t *dst, const void *src, size_t byte
         memcpy(dst->host_ptr, src, bytes);
         return true;
     }
-    id stage = OBJC_MSG(id, dst->device->internal_handle, "newBufferWithBytes:length:options:", src, (NSUInteger)bytes, (NSUInteger)0);
-    id cb = OBJC_MSG(id, g_mtl_queue_handle, "commandBuffer");
-    id blit = OBJC_MSG(id, cb, "blitCommandEncoder");
-    OBJC_MSG(void, blit, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", stage, (NSUInteger)0, dst->internal_handle, (NSUInteger)0, (NSUInteger)bytes);
-    OBJC_MSG(void, blit, "endEncoding");
-    OBJC_MSG(void, cb, "commit");
-    OBJC_MSG(void, cb, "waitUntilCompleted");
-    OBJC_MSG(void, stage, "release");
+
+    id stage = ((id (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
+        dst->device->internal_handle, sel_registerName("newBufferWithBytes:length:options:"), src, (NSUInteger)bytes, (NSUInteger)0
+    );
+    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
+    id blit = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("blitCommandEncoder"));
+
+    ((void (*)(id, SEL, id, NSUInteger, id, NSUInteger, NSUInteger))objc_msgSend)(
+        blit, sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+        stage, (NSUInteger)0, dst->internal_handle, (NSUInteger)0, (NSUInteger)bytes
+    );
+
+    ((void (*)(id, SEL))objc_msgSend)(blit, sel_registerName("endEncoding"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
+    ((void (*)(id, SEL))objc_msgSend)(stage, sel_registerName("release"));
     return true;
 }
 
@@ -107,15 +128,25 @@ static bool metal_copy_to_host(void *dst, const vbs_buffer_t *src, size_t bytes)
         memcpy(dst, src->host_ptr, bytes);
         return true;
     }
-    id stage = OBJC_MSG(id, src->device->internal_handle, "newBufferWithLength:options:", (NSUInteger)bytes, (NSUInteger)0);
-    id cb = OBJC_MSG(id, g_mtl_queue_handle, "commandBuffer");
-    id blit = OBJC_MSG(id, cb, "blitCommandEncoder");
-    OBJC_MSG(void, blit, "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:", src->internal_handle, (NSUInteger)0, stage, (NSUInteger)0, (NSUInteger)bytes);
-    OBJC_MSG(void, blit, "endEncoding");
-    OBJC_MSG(void, cb, "commit");
-    OBJC_MSG(void, cb, "waitUntilCompleted");
-    memcpy(dst, OBJC_MSG(void *, stage, "contents"), bytes);
-    OBJC_MSG(void, stage, "release");
+
+    id stage = ((id (*)(id, SEL, NSUInteger, NSUInteger))objc_msgSend)(
+        src->device->internal_handle, sel_registerName("newBufferWithLength:options:"), (NSUInteger)bytes, (NSUInteger)0
+    );
+    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
+    id blit = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("blitCommandEncoder"));
+
+    ((void (*)(id, SEL, id, NSUInteger, id, NSUInteger, NSUInteger))objc_msgSend)(
+        blit, sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+        src->internal_handle, (NSUInteger)0, stage, (NSUInteger)0, (NSUInteger)bytes
+    );
+
+    ((void (*)(id, SEL))objc_msgSend)(blit, sel_registerName("endEncoding"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
+
+    void *stage_contents = ((void * (*)(id, SEL))objc_msgSend)(stage, sel_registerName("contents"));
+    memcpy(dst, stage_contents, bytes);
+    ((void (*)(id, SEL))objc_msgSend)(stage, sel_registerName("release"));
     return true;
 }
 
@@ -123,37 +154,46 @@ static void *metal_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t ty
     (void)dev;
     const char *fn_name = "matvec_f32";
     if (type == VBS_GGML_TYPE_Q8_0) fn_name = "matvec_q8_0";
-    if (type == VBS_GGML_TYPE_Q4_0) fn_name = "matvec_q4_0";
+    else if (type == VBS_GGML_TYPE_Q4_0) fn_name = "matvec_q4_0";
+    else if (type == VBS_GGML_TYPE_Q4_1) fn_name = "matvec_q4_1";
 
     Class ns_string_cls = objc_getClass("NSString");
-    id ns_fn = OBJC_MSG(id, ns_string_cls, "stringWithUTF8String:", fn_name);
-    id fn = OBJC_MSG(id, g_mtl_library, "newFunctionWithName:", ns_fn);
+    id ns_fn = ((id (*)(id, SEL, const char *))objc_msgSend)((id)ns_string_cls, sel_registerName("stringWithUTF8String:"), fn_name);
+    id fn = ((id (*)(id, SEL, id))objc_msgSend)(g_mtl_library, sel_registerName("newFunctionWithName:"), ns_fn);
     if (!fn) {
         snprintf(err_buf, err_cap, "Metal function %s not found", fn_name);
         return NULL;
     }
     id err = nil;
-    id pso = OBJC_MSG(id, g_mtl_device_handle, "newComputePipelineStateWithFunction:error:", fn, &err);
-    OBJC_MSG(void, fn, "release");
+    id pso = ((id (*)(id, SEL, id, id *))objc_msgSend)(
+        g_mtl_device_handle, sel_registerName("newComputePipelineStateWithFunction:error:"), fn, &err
+    );
+    ((void (*)(id, SEL))objc_msgSend)(fn, sel_registerName("release"));
     return pso;
 }
 
 static void *metal_compile_primitive_pipeline(vbs_device_t *dev, vbs_op_kind_t kind, char *err_buf, size_t err_cap) {
     (void)dev;
     const char *fn_name = "rms_norm";
-    if (kind == VBS_OP_ACTIVATION) fn_name = "silu_mul";
+    if (kind == VBS_OP_EMBEDDING)   fn_name = "embedding_lookup";
+    if (kind == VBS_OP_ROTARY)      fn_name = "rope";
+    if (kind == VBS_OP_CACHE)       fn_name = "kv_cache_store";
+    if (kind == VBS_OP_ATTENTION)   fn_name = "attention_gqa";
+    if (kind == VBS_OP_ACTIVATION)  fn_name = "silu_mul";
     if (kind == VBS_OP_ELEMENTWISE) fn_name = "residual_add";
 
     Class ns_string_cls = objc_getClass("NSString");
-    id ns_fn = OBJC_MSG(id, ns_string_cls, "stringWithUTF8String:", fn_name);
-    id fn = OBJC_MSG(id, g_mtl_library, "newFunctionWithName:", ns_fn);
+    id ns_fn = ((id (*)(id, SEL, const char *))objc_msgSend)((id)ns_string_cls, sel_registerName("stringWithUTF8String:"), fn_name);
+    id fn = ((id (*)(id, SEL, id))objc_msgSend)(g_mtl_library, sel_registerName("newFunctionWithName:"), ns_fn);
     if (!fn) {
         snprintf(err_buf, err_cap, "Metal primitive %s not found", fn_name);
         return NULL;
     }
     id err = nil;
-    id pso = OBJC_MSG(id, g_mtl_device_handle, "newComputePipelineStateWithFunction:error:", fn, &err);
-    OBJC_MSG(void, fn, "release");
+    id pso = ((id (*)(id, SEL, id, id *))objc_msgSend)(
+        g_mtl_device_handle, sel_registerName("newComputePipelineStateWithFunction:error:"), fn, &err
+    );
+    ((void (*)(id, SEL))objc_msgSend)(fn, sel_registerName("release"));
     return pso;
 }
 
@@ -165,26 +205,55 @@ static bool metal_dispatch_linear_tile(
     bool acc
 ) {
     (void)dev; (void)ws; (void)copied; (void)col_off; (void)row_off; (void)acc;
-    id cb = OBJC_MSG(id, g_mtl_queue_handle, "commandBuffer");
-    id enc = OBJC_MSG(id, cb, "computeCommandEncoder");
+    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
+    id enc = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("computeCommandEncoder"));
 
-    OBJC_MSG(void, enc, "setComputePipelineState:", pipeline);
-    OBJC_MSG(void, enc, "setBuffer:offset:atIndex:", wp->internal_handle, (NSUInteger)0, (NSUInteger)0);
-    OBJC_MSG(void, enc, "setBuffer:offset:atIndex:", in->internal_handle, (NSUInteger)0, (NSUInteger)1);
-    OBJC_MSG(void, enc, "setBuffer:offset:atIndex:", out->internal_handle, (NSUInteger)0, (NSUInteger)2);
-    OBJC_MSG(void, enc, "setBytes:length:atIndex:", &cols, sizeof(uint32_t), (NSUInteger)3);
-    OBJC_MSG(void, enc, "setBytes:length:atIndex:", &rows, sizeof(uint32_t), (NSUInteger)4);
+    ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pipeline);
+    ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBuffer:offset:atIndex:"), wp->internal_handle, (NSUInteger)0, (NSUInteger)0);
+    ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBuffer:offset:atIndex:"), in->internal_handle, (NSUInteger)0, (NSUInteger)1);
+    ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBuffer:offset:atIndex:"), out->internal_handle, (NSUInteger)0, (NSUInteger)2);
+    ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBytes:length:atIndex:"), &cols, sizeof(uint32_t), (NSUInteger)3);
+    ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(enc, sel_registerName("setBytes:length:atIndex:"), &rows, sizeof(uint32_t), (NSUInteger)4);
 
-    typedef struct { NSUInteger width, height, depth; } MTLSize;
     MTLSize gridSize = { (NSUInteger)rows, 1, 1 };
-    MTLSize tgSize = { (NSUInteger)MIN(rows, 64), 1, 1 };
+    MTLSize tgSize = { (NSUInteger)(rows < 64 ? rows : 64), 1, 1 };
 
-    typedef void (*dispatch_fn)(id, SEL, MTLSize, MTLSize);
-    ((dispatch_fn)objc_msgSend)(enc, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), gridSize, tgSize);
+    ((void (*)(id, SEL, MTLSize, MTLSize))objc_msgSend)(
+        enc, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), gridSize, tgSize
+    );
 
-    OBJC_MSG(void, enc, "endEncoding");
-    OBJC_MSG(void, cb, "commit");
-    OBJC_MSG(void, cb, "waitUntilCompleted");
+    ((void (*)(id, SEL))objc_msgSend)(enc, sel_registerName("endEncoding"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
+    return true;
+}
+
+static bool metal_dispatch_primitive(
+    vbs_device_t *dev, void *pipeline,
+    void **args, size_t n_args,
+    size_t grid_x, size_t block_x
+) {
+    (void)dev;
+    id cb = ((id (*)(id, SEL))objc_msgSend)(g_mtl_queue_handle, sel_registerName("commandBuffer"));
+    id enc = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("computeCommandEncoder"));
+
+    ((void (*)(id, SEL, id))objc_msgSend)(enc, sel_registerName("setComputePipelineState:"), (id)pipeline);
+    for (size_t i = 0; i < n_args; i++) {
+        ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
+            enc, sel_registerName("setBuffer:offset:atIndex:"), (id)args[i], (NSUInteger)0, (NSUInteger)i
+        );
+    }
+
+    MTLSize gridSize = { (NSUInteger)grid_x, 1, 1 };
+    MTLSize tgSize = { (NSUInteger)block_x, 1, 1 };
+
+    ((void (*)(id, SEL, MTLSize, MTLSize))objc_msgSend)(
+        enc, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), gridSize, tgSize
+    );
+
+    ((void (*)(id, SEL))objc_msgSend)(enc, sel_registerName("endEncoding"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("commit"));
+    ((void (*)(id, SEL))objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
     return true;
 }
 
@@ -203,5 +272,6 @@ const vbs_backend_ops_t g_vbs_metal_backend = {
     .compile_linear_pipeline = metal_compile_linear_pipeline,
     .compile_primitive_pipeline = metal_compile_primitive_pipeline,
     .dispatch_linear_tile = metal_dispatch_linear_tile,
+    .dispatch_primitive = metal_dispatch_primitive,
     .synchronize_device = metal_synchronize
 };
