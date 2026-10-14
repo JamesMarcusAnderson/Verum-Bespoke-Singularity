@@ -8,12 +8,14 @@
 #include "vbs_profiler.h"
 #include "vbs_fabric.h"
 #include "vbs_planner.h"
+#include "vbs_specializer.h"
+#include "tokenizer.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef struct {
+typedef struct vbs_engine {
     vbs_gguf_model_t *model;
     vbs_graph_t *graph;
     const vbs_backend_ops_t *backend;
@@ -23,18 +25,25 @@ typedef struct {
     vbs_fabric_t *fabric;
     vbs_execution_plan_t *plan;
 
+    // The JIT-compiled zero-interpretation binary
+    vbs_specialized_binary_t *specialized;
+
     size_t n_devices;
     vbs_device_t **devices;
     vbs_slice_executor_t **executors;
     size_t window_bytes;
+
+    tokenizer_t *tokenizer;
 } vbs_engine_t;
 
-vbs_engine_t *vbs_engine_create(const char *model_path, size_t window_mib, char *err, size_t err_cap);
-void          vbs_engine_destroy(vbs_engine_t *e);
-void          vbs_engine_print_inspection(const vbs_engine_t *e);
-bool          vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap);
+vbs_engine_t *vbs_engine_create(const char *model_path, size_t window_mib, char *err_buf, size_t err_cap);
+void          vbs_engine_destroy(vbs_engine_t *engine);
+void          vbs_engine_print_inspection(const vbs_engine_t *engine);
+bool          vbs_engine_compile(vbs_engine_t *engine, char *err_buf, size_t err_cap);
+bool          vbs_engine_forward(vbs_engine_t *engine, const uint32_t *tokens, size_t n_tokens, float *logits_out);
 
 #ifdef __cplusplus
 }
 #endif
-#endif
+
+#endif // VBS_ENGINE_H
