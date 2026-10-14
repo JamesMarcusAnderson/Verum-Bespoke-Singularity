@@ -61,9 +61,26 @@ static const char *ggml_type_name(vbs_ggml_type_t t) {
         case VBS_GGML_TYPE_F32:   return "f32";
         case VBS_GGML_TYPE_F16:   return "f16";
         case VBS_GGML_TYPE_Q4_0:  return "q4_0";
+        case VBS_GGML_TYPE_Q4_1:  return "q4_1";
+        case VBS_GGML_TYPE_Q5_0:  return "q5_0";
+        case VBS_GGML_TYPE_Q5_1:  return "q5_1";
         case VBS_GGML_TYPE_Q8_0:  return "q8_0";
-        default:                  return "q8_0";
+        case VBS_GGML_TYPE_Q8_1:  return "q8_1";
+        case VBS_GGML_TYPE_Q2_K:  return "q2_k";
+        case VBS_GGML_TYPE_Q3_K:  return "q3_k";
+        case VBS_GGML_TYPE_Q4_K:  return "q4_k";
+        case VBS_GGML_TYPE_Q5_K:  return "q5_k";
+        case VBS_GGML_TYPE_Q6_K:  return "q6_k";
+        case VBS_GGML_TYPE_Q8_K:  return "q8_k";
+        default:                  return "unknown";
     }
+}
+
+// Only these weight types have a real vbs_gpu_dispatch_vram_* implementation
+// in the bridge. Anything else must refuse loudly instead of silently
+// running through the wrong kernel.
+static bool ggml_type_has_dispatch(vbs_ggml_type_t t) {
+    return t == VBS_GGML_TYPE_F32 || t == VBS_GGML_TYPE_Q4_0 || t == VBS_GGML_TYPE_Q8_0;
 }
 
 bool vbs_specializer_emit_source(
@@ -74,6 +91,19 @@ bool vbs_specializer_emit_source(
     const char *out_path
 ) {
     (void)sys;
+
+    // Refuse loudly rather than emit a dispatch to the wrong kernel:
+    // a LINEAR node whose weight type has no real dispatcher stops the
+    // compile here and names the missing kernel.
+    for (size_t i = 0; i < plan->n_plans; i++) {
+        const vbs_node_t *n = plan->plans[i].node;
+        if (n && n->kind == VBS_OP_LINEAR && n->weight && !ggml_type_has_dispatch(n->weight->type)) {
+            fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
+                    ggml_type_name(n->weight->type), n->weight->name);
+            return false;
+        }
+    }
+
     FILE *f = fopen(out_path, "w");
     if (!f) return false;
 

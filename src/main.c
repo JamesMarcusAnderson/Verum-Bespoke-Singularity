@@ -93,7 +93,8 @@ int main(int argc, const char *argv[]) {
         }
 
         uint32_t prompt_tokens[1] = { 1 };
-        float *dummy_logits = (float *)calloc(32000, sizeof(float));
+        size_t vocab_size = engine->model_profile->vocab_size ? engine->model_profile->vocab_size : 32000;
+        float *dummy_logits = (float *)calloc(vocab_size, sizeof(float));
 
         vbs_engine_forward(engine, prompt_tokens, 1, dummy_logits);
 
@@ -140,7 +141,8 @@ int main(int argc, const char *argv[]) {
         uint32_t prompt_tokens[2048];
         size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
 
-        float *logits = (float *)calloc(32000, sizeof(float));
+        size_t vocab_size = engine->model_profile->vocab_size ? engine->model_profile->vocab_size : 32000;
+        float *logits = (float *)calloc(vocab_size, sizeof(float));
 
         // Prefill prompt tokens
         for (size_t i = 0; i < n_prompt; i++) {
@@ -153,7 +155,7 @@ int main(int argc, const char *argv[]) {
         // Simple argmax sample
         uint32_t cur_token = 0;
         float max_logit = -1e9f;
-        for (size_t i = 0; i < 32000; i++) {
+        for (size_t i = 0; i < vocab_size; i++) {
             if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
         }
 
@@ -170,7 +172,7 @@ int main(int argc, const char *argv[]) {
             vbs_engine_forward(engine, &cur_token, 1, logits);
 
             max_logit = -1e9f;
-            for (size_t j = 0; j < 32000; j++) {
+            for (size_t j = 0; j < vocab_size; j++) {
                 if (logits[j] > max_logit) { max_logit = logits[j]; cur_token = (uint32_t)j; }
             }
         }

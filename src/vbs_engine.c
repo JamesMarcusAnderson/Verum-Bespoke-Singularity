@@ -96,13 +96,36 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     size_t n_kv_h = e->model_profile->n_kv_heads ? e->model_profile->n_kv_heads : 8;
     size_t head_d = e->model_profile->head_dim ? e->model_profile->head_dim : 128;
 
+    // KV cache capacity: sizing for the model's full context length would
+    // need ~7 GiB per cache on a 28-layer / 131k-context model -- more than
+    // the card holds next to the weights. Cap positions by what fits: at
+    // most half the VRAM left after the model, never more than 16384.
+    // Kernels must use e->kv_ctx_capacity as the cache stride.
+    size_t kv_pos_bytes = n_layers * n_kv_h * head_d * sizeof(uint16_t); // per position, per cache
+    size_t kv_cap = max_ctx < 16384 ? max_ctx : 16384;
+    uint64_t total_vram = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].total_vram_bytes : 0;
+    uint64_t model_bytes = e->model_profile->total_model_bytes;
+    if (total_vram > model_bytes && kv_pos_bytes > 0) {
+        size_t fit = (size_t)((total_vram - model_bytes) / 2 / (2 * kv_pos_bytes));
+        if (fit < kv_cap) kv_cap = fit;
+    }
+    if (kv_cap == 0) kv_cap = 1;
+    e->kv_ctx_capacity = kv_cap;
+
     e->act_a  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
     e->act_b  = backend->alloc_buffer(primary_dev, embed_dim * sizeof(float), false);
     e->logits = backend->alloc_buffer(primary_dev, vocab_size * sizeof(float), false);
 
-    size_t kv_bytes = n_layers * max_ctx * n_kv_h * head_d * sizeof(uint16_t);
+    size_t kv_bytes = kv_pos_bytes * kv_cap;
     e->kv_cache_k = backend->alloc_buffer(primary_dev, kv_bytes, false);
     e->kv_cache_v = backend->alloc_buffer(primary_dev, kv_bytes, false);
+
+    if (!e->act_a || !e->act_b || !e->logits || !e->kv_cache_k || !e->kv_cache_v) {
+        snprintf(err, err_cap, "Failed allocating runtime buffers (act %zu B, logits %zu B, KV %zu B x2 for %zu positions)",
+                 embed_dim * sizeof(float), vocab_size * sizeof(float), kv_bytes, kv_cap);
+        vbs_engine_destroy(e);
+        return NULL;
+    }
 
     // Bind bridge pointers
     vbs_bridge_bind_runtime(primary_dev, e->backend, e->fabric);
