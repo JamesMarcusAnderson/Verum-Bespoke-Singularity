@@ -36,6 +36,8 @@ void *vbs_bridge_get_block_dptr(size_t index);
 void vbs_gpu_dispatch_vram_q8_0(void *w, void *in, void *out, size_t r, size_t c);
 void vbs_gpu_dispatch_vram_q4_0(void *w, void *in, void *out, size_t r, size_t c);
 void vbs_gpu_dispatch_vram_q4_1(void *w, void *in, void *out, size_t r, size_t c);
+void vbs_gpu_dispatch_vram_q6_k(void *w, void *in, void *out, size_t r, size_t c);
+void vbs_gpu_dispatch_vram_f16(void *w, void *in, void *out, size_t r, size_t c);
 void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c);
 
 // Primitive dispatch argument order is canonical — it matches the PTX and
