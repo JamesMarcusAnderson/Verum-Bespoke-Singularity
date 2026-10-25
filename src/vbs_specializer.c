@@ -72,6 +72,7 @@ static const char *ggml_type_name(vbs_ggml_type_t t) {
         case VBS_GGML_TYPE_Q5_K:  return "q5_k";
         case VBS_GGML_TYPE_Q6_K:  return "q6_k";
         case VBS_GGML_TYPE_Q8_K:  return "q8_k";
+        case VBS_GGML_TYPE_LNS8:  return "lns8";
         default:                  return "unknown";
     }
 }
@@ -80,7 +81,7 @@ static const char *ggml_type_name(vbs_ggml_type_t t) {
 // in the bridge. Anything else must refuse loudly instead of silently
 // running through the wrong kernel.
 static bool ggml_type_has_dispatch(vbs_ggml_type_t t) {
-    return t == VBS_GGML_TYPE_F32 || t == VBS_GGML_TYPE_F16 || t == VBS_GGML_TYPE_Q4_0 || t == VBS_GGML_TYPE_Q4_1 || t == VBS_GGML_TYPE_Q6_K || t == VBS_GGML_TYPE_Q8_0;
+    return t == VBS_GGML_TYPE_F32 || t == VBS_GGML_TYPE_F16 || t == VBS_GGML_TYPE_Q4_0 || t == VBS_GGML_TYPE_Q4_1 || t == VBS_GGML_TYPE_Q6_K || t == VBS_GGML_TYPE_Q8_0 || t == VBS_GGML_TYPE_LNS8;
 }
 
 // Sequenced emitter: instead of chaining every weight through two ping-pong
@@ -223,6 +224,7 @@ bool vbs_specializer_emit_source(
         "extern void vbs_gpu_dispatch_vram_q6_k(void *w, void *in, void *out, size_t r, size_t c);\n"
         "extern void vbs_gpu_dispatch_vram_f16(void *w, void *in, void *out, size_t r, size_t c);\n"
         "extern void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c);\n"
+        "extern void vbs_gpu_dispatch_vram_lns8(void *w, void *in, void *out, size_t r, size_t c);\n"
         "extern void vbs_gpu_readback_logits(void *d_src, float *h_dst, size_t n);\n\n",
         mp->n_layers, mp->n_heads, mp->n_kv_heads, mp->head_dim,
         mp->embedding_dim, mp->context_length, mp->vocab_size,

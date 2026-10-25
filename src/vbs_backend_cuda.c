@@ -150,6 +150,7 @@ static void *cuda_compile_linear_pipeline(vbs_device_t *dev, vbs_ggml_type_t typ
         case VBS_GGML_TYPE_Q4_0: kname = "matvec_q4_0"; break;
         case VBS_GGML_TYPE_Q4_1: kname = "matvec_q4_1"; break;
         case VBS_GGML_TYPE_Q6_K: kname = "matvec_q6_k"; break;
+        case VBS_GGML_TYPE_LNS8: kname = "matvec_lns8"; break;
         default:
             snprintf(err_buf, err_cap, "CUDA linear pipeline refusal: no kernel for weight type %d", (int)type);
             return NULL;

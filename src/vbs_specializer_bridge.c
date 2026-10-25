@@ -57,8 +57,8 @@ void *vbs_bridge_get_block_dptr(size_t index) {
 // Pipelines are per-(device, kind/type) constants; compile once and reuse
 // instead of re-creating a pipeline object on every dispatch.
 static void *linear_pipeline(vbs_ggml_type_t type) {
-    static void *cache[16];
-    if ((unsigned)type >= 16 || !g_backend || !g_backend->compile_linear_pipeline) return NULL;
+    static void *cache[64];
+    if ((unsigned)type >= 64 || !g_backend || !g_backend->compile_linear_pipeline) return NULL;
     if (!cache[type]) {
         char err[256];
         cache[type] = g_backend->compile_linear_pipeline(g_dev, type, err, sizeof(err));
@@ -111,6 +111,10 @@ void vbs_gpu_dispatch_vram_f16(void *w, void *in, void *out, size_t r, size_t c)
 
 void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c) {
     dispatch_linear(VBS_GGML_TYPE_F32, w, in, out, r, c);
+}
+
+void vbs_gpu_dispatch_vram_lns8(void *w, void *in, void *out, size_t r, size_t c) {
+    dispatch_linear(VBS_GGML_TYPE_LNS8, w, in, out, r, c);
 }
 
 static void *embed_pipeline(vbs_ggml_type_t type) {

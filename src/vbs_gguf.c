@@ -35,6 +35,7 @@ bool vbs_get_geometry(vbs_ggml_type_t t, vbs_block_geometry_t *g) {
         case VBS_GGML_TYPE_Q5_K:    x = (vbs_block_geometry_t){256, 176}; break;
         case VBS_GGML_TYPE_Q6_K:    x = (vbs_block_geometry_t){256, 210}; break;
         case VBS_GGML_TYPE_Q8_K:    x = (vbs_block_geometry_t){256, 292}; break;
+        case VBS_GGML_TYPE_LNS8:    x = (vbs_block_geometry_t){32, 36}; break;
         default: return false;
     }
     if (g) *g = x;
