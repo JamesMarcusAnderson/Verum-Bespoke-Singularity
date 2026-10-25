@@ -89,6 +89,12 @@ typedef struct vbs_backend_ops {
     );
 
     void (*synchronize_device)(vbs_device_t *dev);
+
+    /* PGAE Phase 2 hook, currently NULL in every backend. A real
+     * implementation must be a device-side persistent kernel, not a
+     * host JIT function. Until one exists, the engine uses Phase 1
+     * and this pointer stays NULL; it is never called blindly. */
+    bool (*launch_persistent_kernel)(vbs_device_t *dev, void *pipeline, vbs_buffer_t *control_buffer);
 } vbs_backend_ops_t;
 
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
