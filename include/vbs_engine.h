@@ -44,11 +44,17 @@ typedef struct vbs_engine {
     tokenizer_t *tokenizer;
 } vbs_engine_t;
 
+#define VBS_MAX_LAYERS 512
+extern float g_vbs_layer_energy[VBS_MAX_LAYERS];
+
 vbs_engine_t *vbs_engine_create(const char *model_path, size_t window_mib, char *err_buf, size_t err_cap);
 void          vbs_engine_destroy(vbs_engine_t *engine);
 void          vbs_engine_print_inspection(const vbs_engine_t *engine);
 bool          vbs_engine_compile(vbs_engine_t *engine, char *err_buf, size_t err_cap);
 bool          vbs_engine_forward(vbs_engine_t *engine, const uint32_t *tokens, size_t n_tokens, float *logits_out);
+void          vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation_rate);
+void          vbs_engine_reset_energy(void);
+void          vbs_engine_recompile(vbs_engine_t *e, char *err_buf, size_t err_cap);
 
 #ifdef __cplusplus
 }
