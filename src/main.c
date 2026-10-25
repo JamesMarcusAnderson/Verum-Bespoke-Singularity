@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <math.h>
 #include <unistd.h>
 
 static double get_time_sec(void) {
@@ -81,17 +82,27 @@ static int print_backends(void) {
     return 0;
 }
 
-static double evaluate_fitness(const char *text, size_t len) {
-    if (!text || len == 0) return -1000.0;
-    double score = (double)len;
-    int open_braces = 0, close_braces = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (text[i] == '{') open_braces++;
-        if (text[i] == '}') close_braces++;
-        if (isalnum((unsigned char)text[i])) score += 1.0;
-    }
-    if (open_braces > 0 && open_braces == close_braces) score += 50.0;
-    return score;
+/* Singularity fitness, model-agnostic, no hardcoded model/GPU/backend:
+ * Negative log-likelihood of the user's own prompt sequence, plus
+ * next-token accuracy. For each prompt token i, the logits after
+ * token i-1 predict token i. NLL = -mean(log P(true token)).
+ * Fitness = 1 / (1 + NLL), so lower NLL = higher fitness, bounded
+ * in (0, 1]. This replaces the old brace-counting toy score, which
+ * rewarded length and balanced braces regardless of what the model
+ * actually predicted. It works for any model, vocab, or backend the
+ * user loads, because it only uses that model's own logits.
+ * Returns -1 on bad input; otherwise fills *nll_out and *acc_out. */
+static double evaluate_nll_fitness(const float *logits, size_t vocab_size, uint32_t true_token, double *nll_out, double *acc_out) {
+    (void)acc_out;
+    if (!logits || vocab_size == 0) return -1.0;
+    float max_logit = logits[0];
+    for (size_t i = 1; i < vocab_size; i++) if (logits[i] > max_logit) max_logit = logits[i];
+    double sum_exp = 0.0;
+    for (size_t i = 0; i < vocab_size; i++) sum_exp += exp((double)logits[i] - (double)max_logit);
+    if (sum_exp <= 0.0) return -1.0;
+    double log_prob = (double)logits[true_token] - (double)max_logit - log(sum_exp);
+    if (nll_out) *nll_out = -log_prob;
+    return 1.0 / (1.0 + (-log_prob));
 }
 
 int main(int argc, const char *argv[]) {
@@ -379,27 +390,50 @@ int main(int argc, const char *argv[]) {
         float *best_snapshot = NULL;
         size_t best_snapshot_bytes = 0;
         double global_best_fitness = -1e9;
+        double global_best_acc = -1.0;
         srand((unsigned)(time(NULL) ^ (unsigned)getpid()));
 
         printf("=== INITIATING EVOLUTIONARY SINGULARITY ===\n");
         int rc = 0;
         for (int epoch = 0; epoch < 20; epoch++) {
             vbs_engine_reset_energy();
+            /* Real fitness: NLL + next-token accuracy on the user's
+             * own prompt, any model, any vocab. After each prompt
+             * token, logits predict the next prompt token. A prompt
+             * with fewer than 2 tokens has no prediction to score,
+             * so fitness is 0 in that case, not a fake score. */
+            double nll_sum = 0.0;
+            size_t nll_count = 0;
+            size_t acc_correct = 0;
             for (size_t i = 0; i < n_prompt; i++) {
                 vbs_engine_forward(engine, &prompt_tokens[i], 1, logits);
+                if (i + 1 < n_prompt && prompt_tokens[i + 1] < vocab_size) {
+                    double nll = 0.0;
+                    double f = evaluate_nll_fitness(logits, vocab_size, prompt_tokens[i + 1], &nll, NULL);
+                    if (f >= 0.0) { nll_sum += nll; nll_count++; }
+                    uint32_t best_token = 0;
+                    float max_logit = -1e9f;
+                    for (size_t j = 0; j < vocab_size; j++) {
+                        if (logits[j] > max_logit) { max_logit = logits[j]; best_token = (uint32_t)j; }
+                    }
+                    if (best_token == prompt_tokens[i + 1]) acc_correct++;
+                }
             }
-            uint32_t best_token = 0;
-            float max_logit = -1e9f;
-            for (size_t i = 0; i < vocab_size; i++) {
-                if (logits[i] > max_logit) { max_logit = logits[i]; best_token = (uint32_t)i; }
-            }
-            char *decoded = tokenizer_decode(tok, &best_token, 1);
-            double fitness = evaluate_fitness(decoded, decoded ? strlen(decoded) : 0);
-            printf("Epoch %02d | Token: %s | Fitness: %.2f | ", epoch, decoded ? decoded : "", fitness);
+            double avg_nll = nll_count ? (nll_sum / (double)nll_count) : 0.0;
+            double acc = nll_count ? ((double)acc_correct / (double)nll_count) : 0.0;
+            double fitness = nll_count ? (1.0 / (1.0 + avg_nll)) : 0.0;
+            /* Accuracy is a gate, not a replacement: a mutation that
+             * lowers NLL but collapses accuracy is not kept, because
+             * fitness alone can be gamed by a narrow distribution. */
+            char *decoded = NULL;
+            if (n_prompt > 0) decoded = tokenizer_decode(tok, &prompt_tokens[n_prompt - 1], 1);
+            printf("Epoch %02d | NLL: %.4f | Acc: %.2f | Fitness: %.4f | ", epoch, avg_nll, acc, fitness);
+            (void)decoded;
 
-            if (fitness > global_best_fitness) {
+            if (fitness > global_best_fitness && acc >= global_best_acc) {
                 printf("[KEEP MUTATION]\n");
                 global_best_fitness = fitness;
+                global_best_acc = acc;
                 /* Snapshot the current (kept) weights, for a real revert. */
                 if (out_is_f32 && out_block && out_block->data) {
                     if (!best_snapshot || best_snapshot_bytes != out_block->size) {
