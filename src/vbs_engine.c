@@ -236,10 +236,110 @@ bool vbs_engine_forward(vbs_engine_t *e, const uint32_t *tokens, size_t n_tokens
     return true;
 }
 
+/* PGAE Phase 1: engine-owned generation loop.
+ * Boot phase (host): allocate control + token buffers on the device,
+ * write the control block, prefill the prompt through the existing
+ * JIT forward path. Generation phase (engine loop): argmax the
+ * logits readback, write the token to the generated array, feed it
+ * back as the next input, advance position, stop on EOS or max.
+ * This is NOT a persistent device kernel yet -- see the header
+ * comment. The loop lives in the engine, not in main, so main does
+ * not decode, re-feed, or decide when to stop. */
+bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens, size_t n_prompt, size_t max_gen, uint32_t eos_token_id, uint32_t **out_tokens, size_t *out_n, bool *stopped_on_eos) {
+    if (!e || !prompt_tokens || n_prompt == 0 || max_gen == 0 || !out_tokens || !out_n) return false;
+    if (!e->specialized || !e->specialized->forward_fn) return false;
+    if (!e->backend || !e->devices || !e->devices[0]) return false;
+    size_t vocab_size = e->model_profile ? e->model_profile->vocab_size : 0;
+    if (vocab_size == 0) return false;
+
+    /* Free any previous autonomy buffers before allocating new ones. */
+    if (e->autonomy_control_buffer) { e->backend->free_buffer(e->autonomy_control_buffer); e->autonomy_control_buffer = NULL; }
+    if (e->autonomy_tokens_buffer) { e->backend->free_buffer(e->autonomy_tokens_buffer); e->autonomy_tokens_buffer = NULL; }
+
+    e->autonomy_control_buffer = e->backend->alloc_buffer(e->devices[0], sizeof(vbs_gpu_control_t), false);
+    e->autonomy_tokens_buffer = e->backend->alloc_buffer(e->devices[0], max_gen * sizeof(uint32_t), false);
+    if (!e->autonomy_control_buffer || !e->autonomy_tokens_buffer) {
+        if (e->autonomy_control_buffer) { e->backend->free_buffer(e->autonomy_control_buffer); e->autonomy_control_buffer = NULL; }
+        if (e->autonomy_tokens_buffer) { e->backend->free_buffer(e->autonomy_tokens_buffer); e->autonomy_tokens_buffer = NULL; }
+        return false;
+    }
+
+    uint32_t *generated = (uint32_t *)calloc(max_gen, sizeof(uint32_t));
+    if (!generated) return false;
+    float *logits = (float *)calloc(vocab_size, sizeof(float));
+    if (!logits) { free(generated); return false; }
+
+    /* Control block, boot state. generated_tokens_dev / logits_dev
+     * are device addresses (buffer internal handles), never host
+     * pointers copied into device memory. */
+    memset(&e->autonomy_control, 0, sizeof(e->autonomy_control));
+    e->autonomy_control.state = VBS_PGAE_PREFILL;
+    e->autonomy_control.current_token = prompt_tokens[n_prompt - 1];
+    e->autonomy_control.position = 0;
+    e->autonomy_control.max_tokens = (uint32_t)max_gen;
+    e->autonomy_control.vocab_size = (uint32_t)vocab_size;
+    e->autonomy_control.eos_token_id = eos_token_id;
+    e->autonomy_control.generated_tokens_dev = (uint64_t)(uintptr_t)e->autonomy_tokens_buffer->internal_handle;
+    e->autonomy_control.logits_dev = e->logits ? (uint64_t)(uintptr_t)e->logits->internal_handle : 0;
+    e->backend->copy_to_device(e->autonomy_control_buffer, &e->autonomy_control, sizeof(vbs_gpu_control_t));
+
+    /* Prefill: prompt tokens, one forward each, as in --generate. */
+    for (size_t i = 0; i < n_prompt; i++) {
+        if (!vbs_engine_forward(e, &prompt_tokens[i], 1, logits)) {
+            free(generated); free(logits);
+            return false;
+        }
+    }
+
+    /* Generate: engine owns argmax, position, stop. */
+    e->autonomy_control.state = VBS_PGAE_GENERATE;
+    bool eos_hit = false;
+    size_t n_generated = 0;
+    uint32_t cur_token = 0;
+    {
+        float max_logit = -1e9f;
+        for (size_t i = 0; i < vocab_size; i++) {
+            if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
+        }
+    }
+    while (n_generated < max_gen) {
+        if (eos_token_id != VBS_PGAE_EOS_NONE && cur_token == eos_token_id) { eos_hit = true; break; }
+        generated[n_generated] = cur_token;
+        n_generated++;
+        e->autonomy_control.current_token = cur_token;
+        e->autonomy_control.position = (uint32_t)n_generated;
+        /* Mirror the generated token array to the device token buffer
+         * as generation proceeds, so the device buffer is not stale. */
+        e->backend->copy_to_device(e->autonomy_tokens_buffer, generated, n_generated * sizeof(uint32_t));
+        if (n_generated >= max_gen) break;
+        if (!vbs_engine_forward(e, &cur_token, 1, logits)) {
+            free(generated); free(logits);
+            return false;
+        }
+        float max_logit = -1e9f;
+        cur_token = 0;
+        for (size_t i = 0; i < vocab_size; i++) {
+            if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
+        }
+    }
+
+    e->autonomy_control.state = VBS_PGAE_EXIT;
+    e->autonomy_control.position = (uint32_t)n_generated;
+    e->backend->copy_to_device(e->autonomy_control_buffer, &e->autonomy_control, sizeof(vbs_gpu_control_t));
+
+    *out_tokens = generated;
+    *out_n = n_generated;
+    if (stopped_on_eos) *stopped_on_eos = eos_hit;
+    free(logits);
+    return true;
+}
+
 void vbs_engine_destroy(vbs_engine_t *e) {
     if (!e) return;
     if (e->specialized) vbs_specializer_free(e->specialized);
     if (e->plan) vbs_planner_free(e->plan);
+    if (e->autonomy_control_buffer) e->backend->free_buffer(e->autonomy_control_buffer);
+    if (e->autonomy_tokens_buffer) e->backend->free_buffer(e->autonomy_tokens_buffer);
     if (e->act_a) e->backend->free_buffer(e->act_a);
     if (e->act_b) e->backend->free_buffer(e->act_b);
     if (e->logits) e->backend->free_buffer(e->logits);
@@ -269,4 +369,99 @@ void vbs_engine_print_inspection(const vbs_engine_t *e) {
     if (e->plan) vbs_planner_print(e->plan);
     if (e->fabric) vbs_fabric_print_stats(e->fabric);
     if (e->specialized) vbs_specializer_print_stats(e->specialized);
+}
+
+/* --- Evolutionary / Hydra support ---------------------------------------
+ * Mutation is FP32-only, by design. Quantized weights are packed bytes,
+ * not floats, so reinterpreting them as float[] would corrupt the model.
+ * The GGUF model file is also mmap'd PROT_READ, so the host tensor bytes
+ * are not writable: mutation therefore works on a writable host mirror
+ * (allocated on first mutation of a block) and pushes that mirror to VRAM
+ * when the block is VRAM-resident. The mirror is reused on later mutations
+ * of the same block; the original mmap pointer is the model map offset,
+ * so a mirror is recognised by not pointing at the model map.
+ *
+ * Energy: reset sets every layer to 1.0 (alive). No per-layer energy
+ * measurement is wired into forward yet, so Hydra pruning is dormant
+ * until a caller explicitly sets g_vbs_layer_energy[layer] < 0.0001f.
+ * Resetting to 0 would prune every layer on the next recompile, which
+ * would delete the whole forward pass, so 0 is not a safe reset value.
+ */
+float g_vbs_layer_energy[VBS_MAX_LAYERS];
+
+void vbs_engine_reset_energy(void) {
+    for (size_t i = 0; i < VBS_MAX_LAYERS; i++) g_vbs_layer_energy[i] = 1.0f;
+}
+
+void vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation_rate) {
+    if (!e || !e->plan || layer_index >= e->plan->n_plans) return;
+    vbs_op_plan_t *plan = &e->plan->plans[layer_index];
+    if (!plan->node || !plan->node->weight) return;
+    if (plan->node->weight->type != VBS_GGML_TYPE_F32) {
+        fprintf(stderr, "Mutate refused: tensor %s is type %d, not FP32; quantized bytes are not floats\n",
+                plan->node->weight->name, (int)plan->node->weight->type);
+        return;
+    }
+    if (!e->fabric || plan->node->tensor_index >= e->fabric->n_blocks) return;
+    vbs_memory_block_t *block = e->fabric->blocks[plan->node->tensor_index];
+    if (!block || !block->data) return;
+
+    /* Writable mirror: first mutation copies the read-only mmap bytes. */
+    const void *orig = NULL;
+    if (e->model && e->model->map) orig = (const uint8_t *)e->model->map + plan->node->weight->data_offset;
+    float *weights = NULL;
+    if (block->data == orig) {
+        weights = (float *)malloc(block->size);
+        if (!weights) return;
+        memcpy(weights, block->data, block->size);
+        block->data = weights;
+    } else {
+        weights = (float *)block->data;
+    }
+
+    size_t num_elements = block->size / sizeof(float);
+    for (size_t i = 0; i < num_elements; i++) {
+        float noise = ((float)rand() / (float)RAND_MAX - 0.5f) * mutation_rate;
+        weights[i] += noise;
+    }
+
+    if (block->current_tier == VBS_TIER_VRAM && block->gpu_buffer && e->backend && e->backend->copy_to_device) {
+        e->backend->copy_to_device(block->gpu_buffer, weights, block->size);
+    }
+}
+
+void vbs_engine_recompile(vbs_engine_t *e, char *err_buf, size_t err_cap) {
+    if (!e || !e->plan || !e->graph) return;
+
+    char src_path[640], bin_path[640], hash[65];
+    const char *cache_dir = getenv("VBS_CACHE_DIR");
+    if (!cache_dir) cache_dir = "/tmp/verum_cache";
+    mkdir(cache_dir, 0755);
+
+    vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
+    snprintf(src_path, sizeof(src_path), "%s/verum_%s.c", cache_dir, hash);
+    snprintf(bin_path, sizeof(bin_path), "%s/verum_%s.so", cache_dir, hash);
+
+    if (!vbs_specializer_emit_source(e->graph, e->sys_profile, e->plan, e->model_profile, src_path)) {
+        if (err_buf) snprintf(err_buf, err_cap, "Failed to emit mutated source");
+        return;
+    }
+
+    double compile_sec = 0;
+    if (!vbs_specializer_compile(src_path, bin_path, e->sys_profile, &compile_sec)) {
+        if (err_buf) snprintf(err_buf, err_cap, "Failed to compile mutated binary");
+        return;
+    }
+
+    if (e->specialized) vbs_specializer_free(e->specialized);
+    e->specialized = vbs_specializer_load(bin_path, hash);
+    if (e->specialized) {
+        e->specialized->compile_time_sec = compile_sec;
+        e->specialized->was_cached = false;
+        e->specialized->n_kernels_emitted = e->plan->n_plans;
+        e->specialized->init_fn(e->fabric, (void *)e->backend);
+        if (err_buf) err_buf[0] = '\0';
+    } else if (err_buf) {
+        snprintf(err_buf, err_cap, "Failed to load recompiled binary");
+    }
 }
