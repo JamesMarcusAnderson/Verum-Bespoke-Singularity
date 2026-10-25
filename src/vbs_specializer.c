@@ -120,6 +120,10 @@ static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
     return false;
 }
 
+#ifndef VBS_MAX_LAYERS
+#define VBS_MAX_LAYERS 512
+#endif
+
 bool vbs_specializer_emit_source(
     const vbs_graph_t *graph,
     const vbs_system_profile_t *sys,
@@ -251,9 +255,23 @@ bool vbs_specializer_emit_source(
         "    uint32_t pos = (uint32_t)g_current_pos;\n"
     );
 
+    /* HYDRA PROTOCOL: prune whole transformer layers, not single nodes.
+     * layers[i] is the blk.<L> layer number (-1 for embed/final, which are
+     * never pruned: deleting embed or the output projection would delete
+     * the forward pass itself). A layer is pruned only when its energy
+     * was explicitly set below threshold; reset sets all energies to 1.0,
+     * so a plain recompile prunes nothing. Skipping a whole blk layer
+     * leaves the residual stream untouched, which is the coherent
+     * pruning semantics; skipping one Q/K/V/down node alone would not be.
+     */
+    extern float g_vbs_layer_energy[VBS_MAX_LAYERS];
     for (size_t i = 0; i < plan->n_plans; i++) {
         const vbs_node_t *n = plan->plans[i].node;
         int L = layers[i];
+        if (L >= 0 && L < (int)VBS_MAX_LAYERS && g_vbs_layer_energy[L] < 0.0001f) {
+            fprintf(f, "    // HYDRA PROTOCOL: transformer layer %d pruned (energy: %f)\n", L, g_vbs_layer_energy[L]);
+            continue;
+        }
         switch (roles[i]) {
             case SEQ_EMBED:
                 fprintf(f, "    vbs_gpu_dispatch_embed_%s(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n",
