@@ -39,6 +39,7 @@ void vbs_gpu_dispatch_vram_q4_1(void *w, void *in, void *out, size_t r, size_t c
 void vbs_gpu_dispatch_vram_q6_k(void *w, void *in, void *out, size_t r, size_t c);
 void vbs_gpu_dispatch_vram_f16(void *w, void *in, void *out, size_t r, size_t c);
 void vbs_gpu_dispatch_vram_f32(void *w, void *in, void *out, size_t r, size_t c);
+void vbs_gpu_dispatch_vram_lns8(void *w, void *in, void *out, size_t r, size_t c);
 
 // Primitive dispatch argument order is canonical — it matches the PTX and
 // MSL kernel signatures slot for slot (B = buffer, S = scalar):

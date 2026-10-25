@@ -41,7 +41,8 @@ typedef enum {
     VBS_GGML_TYPE_BF16    = 30,
     VBS_GGML_TYPE_TQ1_0   = 34,
     VBS_GGML_TYPE_TQ2_0   = 35,
-    VBS_GGML_TYPE_MXFP4   = 39
+    VBS_GGML_TYPE_MXFP4   = 39,
+    VBS_GGML_TYPE_LNS8    = 40
 } vbs_ggml_type_t;
 
 typedef struct {
