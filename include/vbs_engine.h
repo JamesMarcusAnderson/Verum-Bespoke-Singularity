@@ -114,6 +114,13 @@ bool          vbs_engine_forward(vbs_engine_t *engine, const uint32_t *tokens, s
  * is the number of generated tokens (excluding the prompt), and
  * *stopped_on_eos is true only if EOS actually stopped it. */
 bool          vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens, size_t n_prompt, size_t max_gen, uint32_t eos_token_id, uint32_t **out_tokens, size_t *out_n, bool *stopped_on_eos);
+/* Hydra-NLL: average NLL of a prompt sequence, model-agnostic.
+ * For each prompt token i, logits after token i predict token i+1.
+ * Returns average NLL, or -1 on error (no prompt prediction to score,
+ * uncompiled engine, bad vocab). *acc_out, if non-NULL, is next-token
+ * argmax accuracy over the same predictions. Cache is reset before
+ * the sequence, so repeated measurements are comparable. */
+double        vbs_engine_evaluate_prompt_nll(vbs_engine_t *e, const uint32_t *prompt_tokens, size_t n_prompt, double *acc_out);
 void          vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation_rate);
 void          vbs_engine_reset_energy(void);
 void          vbs_engine_recompile(vbs_engine_t *e, char *err_buf, size_t err_cap);
