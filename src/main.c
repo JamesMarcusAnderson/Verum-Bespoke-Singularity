@@ -26,6 +26,7 @@ static void usage(void) {
         "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
+        "  ./verum-slice --prune --tokenizer tokenizer.json --prompt \"The capital of France is Paris\" model.gguf\n"
     );
 }
 
@@ -133,6 +134,7 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--benchmark") == 0 ||
             strcmp(argv[i], "--generate") == 0 ||
             strcmp(argv[i], "--autonomy") == 0 ||
+            strcmp(argv[i], "--prune") == 0 ||
             strcmp(argv[i], "--evolve") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
@@ -332,6 +334,99 @@ int main(int argc, const char *argv[]) {
         tokenizer_free(tok);
         vbs_engine_destroy(engine);
         return 0;
+    }
+
+    if (strcmp(mode, "--prune") == 0) {
+        /* Hydra-NLL Pruning Loop: standalone, other modes untouched.
+         * No hardcoded tokens: the evaluation sequence is the user's
+         * --prompt, encoded with their --tokenizer, for whatever model
+         * they loaded. Baseline NLL is measured, then each distinct
+         * transformer layer is trial-pruned by layer number (not plan
+         * index: plan index != blk.<L>), recompiled, and re-measured.
+         * Keep if delta < threshold, else revert and recompile.
+         * The specializer already skips by layer number when energy
+         * < 0.0001, so no new specializer hook is added here. */
+        if (!tokenizer_path) {
+            fprintf(stderr, "Error: --prune requires --tokenizer /path/to/tokenizer.json\n");
+            vbs_engine_destroy(engine);
+            return 1;
+        }
+        tokenizer_t *tok = tokenizer_load(tokenizer_path);
+        if (!tok) {
+            fprintf(stderr, "Error: Failed to load tokenizer from %s\n", tokenizer_path);
+            vbs_engine_destroy(engine);
+            return 1;
+        }
+        if (!vbs_engine_compile(engine, err_buf, sizeof(err_buf))) {
+            fprintf(stderr, "Compilation refused: %s\n", err_buf);
+            tokenizer_free(tok);
+            vbs_engine_destroy(engine);
+            return 2;
+        }
+        uint32_t prompt_tokens[2048];
+        size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
+        if (n_prompt < 2) {
+            fprintf(stderr, "Error: --prune requires a prompt with at least 2 tokens to score NLL\n");
+            tokenizer_free(tok);
+            vbs_engine_destroy(engine);
+            return 1;
+        }
+        vbs_engine_reset_energy();
+        double baseline_acc = 0.0;
+        double baseline_nll = vbs_engine_evaluate_prompt_nll(engine, prompt_tokens, n_prompt, &baseline_acc);
+        if (baseline_nll < 0.0) {
+            fprintf(stderr, "Error: --prune could not measure baseline NLL\n");
+            tokenizer_free(tok);
+            vbs_engine_destroy(engine);
+            return 2;
+        }
+        const double threshold = 0.05;
+        size_t n_layers = engine->model_profile ? engine->model_profile->n_layers : 0;
+        if (n_layers == 0 || n_layers > VBS_MAX_LAYERS) n_layers = VBS_MAX_LAYERS;
+        printf("=== HYDRA PRUNING INITIATED ===\n");
+        printf("Baseline NLL: %.4f | Acc: %.2f | Threshold: %.4f\n", baseline_nll, baseline_acc, threshold);
+        printf("Note: Hydra energy is still a trial-prune trigger here, not a measured activation energy. NLL is the measured signal.\n");
+        size_t kept = 0;
+        int rc = 0;
+        for (size_t layer = 0; layer < n_layers; layer++) {
+            g_vbs_layer_energy[layer] = 0.0f;
+            err_buf[0] = '\0';
+            vbs_engine_recompile(engine, err_buf, sizeof(err_buf));
+            if (err_buf[0] != '\0') {
+                fprintf(stderr, "Recompile failed for layer %zu: %s\n", layer, err_buf);
+                g_vbs_layer_energy[layer] = 1.0f;
+                err_buf[0] = '\0';
+                vbs_engine_recompile(engine, err_buf, sizeof(err_buf));
+                rc = 2;
+                break;
+            }
+            double acc = 0.0;
+            double pruned_nll = vbs_engine_evaluate_prompt_nll(engine, prompt_tokens, n_prompt, &acc);
+            if (pruned_nll < 0.0) {
+                fprintf(stderr, "NLL measurement failed for layer %zu, reverting\n", layer);
+                g_vbs_layer_energy[layer] = 1.0f;
+                err_buf[0] = '\0';
+                vbs_engine_recompile(engine, err_buf, sizeof(err_buf));
+                rc = 2;
+                break;
+            }
+            double delta = pruned_nll - baseline_nll;
+            if (delta < threshold) {
+                printf("[KEEP] Layer %zu | Pruned NLL: %.4f | Delta: %+.4f | Acc: %.2f\n", layer, pruned_nll, delta, acc);
+                baseline_nll = pruned_nll;
+                kept++;
+            } else {
+                printf("[REVERT] Layer %zu | Pruned NLL: %.4f | Delta: %+.4f (Too High) | Acc: %.2f\n", layer, pruned_nll, delta, acc);
+                g_vbs_layer_energy[layer] = 1.0f;
+                err_buf[0] = '\0';
+                vbs_engine_recompile(engine, err_buf, sizeof(err_buf));
+                if (err_buf[0] != '\0') { fprintf(stderr, "Recompile failed on revert for layer %zu: %s\n", layer, err_buf); rc = 2; break; }
+            }
+        }
+        printf("=== HYDRA PRUNING COMPLETE | Kept %zu / %zu layers pruned ===\n", kept, n_layers);
+        tokenizer_free(tok);
+        vbs_engine_destroy(engine);
+        return rc;
     }
 
     if (strcmp(mode, "--evolve") == 0) {
