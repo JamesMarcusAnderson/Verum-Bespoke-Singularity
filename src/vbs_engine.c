@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <sys/stat.h>
 
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
@@ -332,6 +333,40 @@ bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens,
     if (stopped_on_eos) *stopped_on_eos = eos_hit;
     free(logits);
     return true;
+}
+
+double vbs_engine_evaluate_prompt_nll(vbs_engine_t *e, const uint32_t *prompt_tokens, size_t n_prompt, double *acc_out) {
+    if (!e || !prompt_tokens || n_prompt < 2) return -1.0;
+    if (!e->specialized || !e->specialized->forward_fn) return -1.0;
+    size_t vocab_size = e->model_profile ? e->model_profile->vocab_size : 0;
+    if (vocab_size == 0) return -1.0;
+    float *logits = (float *)calloc(vocab_size, sizeof(float));
+    if (!logits) return -1.0;
+    if (e->specialized->reset_cache_fn) e->specialized->reset_cache_fn();
+    double nll_sum = 0.0;
+    size_t count = 0;
+    size_t correct = 0;
+    for (size_t i = 0; i + 1 < n_prompt; i++) {
+        if (!vbs_engine_forward(e, &prompt_tokens[i], 1, logits)) { free(logits); return -1.0; }
+        uint32_t target = prompt_tokens[i + 1];
+        if (target >= vocab_size) continue;
+        float max_logit = logits[0];
+        for (size_t j = 1; j < vocab_size; j++) if (logits[j] > max_logit) max_logit = logits[j];
+        double sum_exp = 0.0;
+        for (size_t j = 0; j < vocab_size; j++) sum_exp += exp((double)logits[j] - (double)max_logit);
+        if (sum_exp <= 0.0) continue;
+        double log_prob = (double)logits[target] - (double)max_logit - log(sum_exp);
+        nll_sum += -log_prob;
+        count++;
+        uint32_t best = 0;
+        float best_logit = logits[0];
+        for (size_t j = 1; j < vocab_size; j++) if (logits[j] > best_logit) { best_logit = logits[j]; best = (uint32_t)j; }
+        if (best == target) correct++;
+    }
+    free(logits);
+    if (count == 0) return -1.0;
+    if (acc_out) *acc_out = (double)correct / (double)count;
+    return nll_sum / (double)count;
 }
 
 void vbs_engine_destroy(vbs_engine_t *e) {
