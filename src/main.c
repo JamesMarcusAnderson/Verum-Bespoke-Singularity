@@ -274,8 +274,15 @@ int main(int argc, const char *argv[]) {
             printf("autonomous-c: attempt %d generate %s\n", attempt+1, ok?"correct":"wrong, retraining");
             if (!ok && attempt<2) { /* self-correction: keep training, no human input */ }
         }
-        vbs_block_save(blk, "autonomous.bin");
-        printf("autonomous-c: saved model to autonomous.bin\n");
+        double best = 1e9; FILE *bf = fopen("autonomous-best.txt", "r");
+        if (bf) { if (fscanf(bf, "%lf", &best) != 1) best = 1e9; fclose(bf); }
+        if (loss < best) {
+            vbs_block_save(blk, "autonomous.bin");
+            FILE *bo = fopen("autonomous-best.txt", "w"); if (bo) { fprintf(bo, "%.6f\n", loss); fclose(bo); }
+            printf("autonomous-c: saved model to autonomous.bin, new best loss=%.4f\n", loss);
+        } else {
+            printf("autonomous-c: NOT saving, loss %.4f worse than best %.4f, keeping old model\n", loss, best);
+        }
         printf("autonomous-c: scheduler lr at epoch 500 = %.4f\n", vbs_scheduler_lr(0.05f, 500));
         int ctx[3] = {1,2,3};
         printf("autonomous-c: generate: 1 2 3");
