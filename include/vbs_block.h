@@ -24,3 +24,8 @@ void vbs_block_free(vbs_block_t *b);
  * Returns CE loss before the update. */
 double vbs_block_train_step(vbs_block_t *b, const int *tokens, int target, float lr);
 #endif
+/* Inference only: greedy next-token prediction from a trained block. */
+int vbs_block_predict(vbs_block_t *b, const int *tokens);
+void vbs_block_save(vbs_block_t *b, const char *path);
+int vbs_block_load(vbs_block_t *b, const char *path);
+double vbs_block_loss(vbs_block_t *b, const int *tokens, int target);

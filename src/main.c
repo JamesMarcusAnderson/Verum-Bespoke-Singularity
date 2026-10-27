@@ -31,6 +31,7 @@ static void usage(void) {
         "  ./verum-slice --train-adapter --target-token 1234 [--vocab 32000] [--epochs 100] [--lr 0.5] --adapter-out adapter.bin\n"
         "  ./verum-slice --generate --adapter adapter.bin ...\n"
         "  ./verum-slice --train-block [--epochs 500] [--lr 0.05]\n"
+        "  ./verum-slice --train-tiny [--epochs 500] [--lr 0.05] [--block-out tiny.bin]\n"
         "  ./verum-slice --generate --memory verum-memory.tsv --tokenizer tokenizer.json --prompt \"What is X?\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
@@ -135,6 +136,7 @@ int main(int argc, const char *argv[]) {
     const char *memory_path = "verum-memory.tsv";
     const char *adapter_path = NULL;
     const char *adapter_out = NULL;
+    const char *block_out = NULL;
     size_t train_target = 0; int have_target = 0;
     size_t train_vocab = 32000; size_t train_epochs = 100; float train_lr = 0.5f;
     const char *prompt_text = "The universe is";
@@ -152,7 +154,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--evolve") == 0 ||
             strcmp(argv[i], "--learn") == 0 ||
             strcmp(argv[i], "--train-adapter") == 0 ||
-            strcmp(argv[i], "--train-block") == 0) {
+            strcmp(argv[i], "--train-block") == 0 ||
+            strcmp(argv[i], "--train-tiny") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
@@ -170,6 +173,8 @@ int main(int argc, const char *argv[]) {
             adapter_path = argv[++i];
         } else if (strcmp(argv[i], "--adapter-out") == 0 && i + 1 < argc) {
             adapter_out = argv[++i];
+        } else if (strcmp(argv[i], "--block-out") == 0 && i + 1 < argc) {
+            block_out = argv[++i];
         } else if (strcmp(argv[i], "--target-token") == 0 && i + 1 < argc) {
             train_target = (size_t)strtoull(argv[++i], NULL, 10); have_target = 1;
         } else if (strcmp(argv[i], "--vocab") == 0 && i + 1 < argc) {
@@ -183,7 +188,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0)) {
         usage();
         return 64;
     }
@@ -193,6 +198,36 @@ int main(int argc, const char *argv[]) {
         if (!vbs_learn_append(memory_path, prompt_text, correct_text)) { fprintf(stderr, "Error: could not write %s\n", memory_path); return 1; }
         printf("LEARNED: %s -> %s  [file=%s]\n", prompt_text, correct_text, memory_path);
         return 0;
+    }
+    if (strcmp(mode, "--train-tiny") == 0) {
+        /* End-to-end tiny LLM: learn a repeating pattern, then generate.
+         * Pattern: 1,2,3,5 repeating, vocab 8, context 3.
+         * Train on every window in the pattern, then greedy-generate
+         * starting from 1,2,3 and print the result. */
+        int pattern[12] = {1,2,3,5,1,2,3,5,1,2,3,5};
+        vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
+        printf("before: predict [1,2,3] -> %d (want 5)\n", vbs_block_predict(blk, (int[]){1,2,3}));
+        double loss = 0;
+        for (size_t ep=0; ep<train_epochs; ep++) {
+            loss = 0;
+            for (int i=0; i<9; i++) {
+                int win[3] = {pattern[i], pattern[i+1], pattern[i+2]};
+                loss += vbs_block_train_step(blk, win, pattern[i+3], train_lr);
+            }
+            loss /= 9.0;
+            if (ep==0 || ep+1==train_epochs || (ep+1)%100==0) printf("tiny epoch %zu loss=%.4f\n", ep+1, loss);
+        }
+        int ctx[3] = {1,2,3};
+        printf("after: predict [1,2,3] -> %d (want 5)\n", vbs_block_predict(blk, ctx));
+        printf("generate: 1 2 3");
+        for (int step=0; step<9; step++) {
+            int nxt = vbs_block_predict(blk, ctx);
+            printf(" %d", nxt);
+            ctx[0]=ctx[1]; ctx[1]=ctx[2]; ctx[2]=nxt;
+        }
+        printf("\n");
+        if (block_out) { vbs_block_save(blk, block_out); printf("saved block -> %s\n", block_out); }
+        vbs_block_free(blk); return 0;
     }
     if (strcmp(mode, "--train-block") == 0) {
         /* Task: memorize [1,2,3] -> 5, vocab 8, d 16, hidden 32.

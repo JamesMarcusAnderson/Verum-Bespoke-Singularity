@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 static float rnd(unsigned *s){ *s=*s*1664525u+1013904223u; return ((float)(*s>>8)/16777216.0f-0.5f)*0.2f; }
 static float *alloc(int n, unsigned *s){ float *p=calloc(n,sizeof(float)); for(int i=0;i<n;i++) p[i]=rnd(s); return p; }
 vbs_block_t *vbs_block_create(int vocab,int d,int seq,int hidden,unsigned seed){
@@ -32,7 +33,7 @@ static void ln_bwd(const float *dY,const float *X,const float *mean,const float 
     for(int i=0;i<seq;i++){
         for(int j=0;j<d;j++){ dbe[j]+=dY[i*d+j]; dg[j]+=dY[i*d+j]*(X[i*d+j]-mean[i])*rstd[i]; }
         double sum1=0,sum2=0; for(int j=0;j<d;j++){ double dy=dY[i*d+j]*g[j]; sum1+=dy; sum2+=dy*(X[i*d+j]-mean[i]); }
-        for(int j=0;j<d;j++){ double dy=dY[i*d+j]*g[j]; dX[i*d+j]=(float)(rstd[i]*(dy - sum1/d - (X[i*d+j]-mean[i])*rstd[i]*rstd[i]*sum2)); }
+        for(int j=0;j<d;j++){ double dy=dY[i*d+j]*g[j]; dX[i*d+j]=(float)(rstd[i]*(dy - sum1/d - (X[i*d+j]-mean[i])*rstd[i]*rstd[i]*sum2/d)); }
     }
 }
 double vbs_block_train_step(vbs_block_t *b, const int *tokens, int target, float lr){
@@ -126,4 +127,74 @@ double vbs_block_train_step(vbs_block_t *b, const int *tokens, int target, float
     float *all[]={x,ln1,m1,r1,Q,K,Va,scores,probs,att,attproj,res1,ln2,m2,r2,hpre,hact,mlp,res2,lnf,mf,rf,logits,dlogits,dWout,dbout,dlnf,dres2,dgf,dbef,dres1,dmlp,dhact,dW2,db2,dhpre,dln2,dW1,db1,dres1b,dg2,dbe2,dattproj,dx,datt,dWo,dprobs,dVa,dscores,dQ,dK,dWq,dWk,dWv,dln1,dx2,dg1,dbe1,dE,dP};
     for(unsigned i=0;i<sizeof(all)/sizeof(all[0]);i++) free(all[i]);
     return loss;
+}
+
+/* --- Inference: same forward as train_step, no backward, no cache --- */
+static void block_forward_logits(vbs_block_t *b, const int *tokens, float *logits_out){
+    int S=b->seq, D=b->d, H=b->hidden, V=b->vocab;
+    float *x=calloc(S*D,sizeof(float)), *ln1=calloc(S*D,sizeof(float)), *m1=calloc(S,sizeof(float)), *r1=calloc(S,sizeof(float));
+    float *Q=calloc(S*D,sizeof(float)), *K=calloc(S*D,sizeof(float)), *Va=calloc(S*D,sizeof(float));
+    float *scores=calloc(S*S,sizeof(float)), *probs=calloc(S*S,sizeof(float)), *att=calloc(S*D,sizeof(float)), *attproj=calloc(S*D,sizeof(float)), *res1=calloc(S*D,sizeof(float));
+    float *ln2=calloc(S*D,sizeof(float)), *m2=calloc(S,sizeof(float)), *r2=calloc(S,sizeof(float));
+    float *hpre=calloc(S*H,sizeof(float)), *hact=calloc(S*H,sizeof(float)), *mlp=calloc(S*D,sizeof(float)), *res2=calloc(S*D,sizeof(float));
+    float *lnf=calloc(S*D,sizeof(float)), *mf=calloc(S,sizeof(float)), *rf=calloc(S,sizeof(float));
+    for(int i=0;i<S;i++) for(int j=0;j<D;j++) x[i*D+j]=b->E[tokens[i]*D+j]+b->P[i*D+j];
+    ln_fwd(x,ln1,m1,r1,b->g1,b->be1,S,D);
+    matmul_sd(ln1,b->Wq,Q,S,D); matmul_sd(ln1,b->Wk,K,S,D); matmul_sd(ln1,b->Wv,Va,S,D);
+    double scale=1.0/sqrt((double)D);
+    for(int i=0;i<S;i++) for(int j=0;j<S;j++){
+        if(j>i){ scores[i*S+j]=-1e9f; probs[i*S+j]=0; continue; }
+        double s=0; for(int k=0;k<D;k++) s+=(double)Q[i*D+k]*K[j*D+k]; scores[i*S+j]=(float)(s*scale);
+    }
+    for(int i=0;i<S;i++){ float mx=-1e9f; for(int j=0;j<=i;j++) if(scores[i*S+j]>mx) mx=scores[i*S+j]; double sum=0; for(int j=0;j<=i;j++) sum+=exp(scores[i*S+j]-mx); for(int j=0;j<=i;j++) probs[i*S+j]=(float)(exp(scores[i*S+j]-mx)/sum); }
+    for(int i=0;i<S;i++) for(int j=0;j<D;j++){ double s=0; for(int k=0;k<S;k++) s+=(double)probs[i*S+k]*Va[k*D+j]; att[i*D+j]=(float)s; }
+    matmul_sd(att,b->Wo,attproj,S,D);
+    for(int i=0;i<S*D;i++) res1[i]=x[i]+attproj[i];
+    ln_fwd(res1,ln2,m2,r2,b->g2,b->be2,S,D);
+    for(int i=0;i<S;i++) for(int j=0;j<H;j++){ double s=b->b1[j]; for(int k=0;k<D;k++) s+=(double)ln2[i*D+k]*b->W1[k*H+j]; hpre[i*H+j]=(float)s; hact[i*H+j]=s>0?(float)s:0; }
+    for(int i=0;i<S;i++) for(int j=0;j<D;j++){ double s=b->b2[j]; for(int k=0;k<H;k++) s+=(double)hact[i*H+k]*b->W2[k*D+j]; mlp[i*D+j]=(float)s; }
+    for(int i=0;i<S*D;i++) res2[i]=res1[i]+mlp[i];
+    ln_fwd(res2,lnf,mf,rf,b->gf,b->bef,S,D);
+    int last=S-1;
+    for(int v=0;v<V;v++){ double s=b->bout[v]; for(int k=0;k<D;k++) s+=(double)lnf[last*D+k]*b->Wout[k*V+v]; logits_out[v]=(float)s; }
+    float *all[]={x,ln1,m1,r1,Q,K,Va,scores,probs,att,attproj,res1,ln2,m2,r2,hpre,hact,mlp,res2,lnf,mf,rf};
+    for(unsigned i=0;i<sizeof(all)/sizeof(all[0]);i++) free(all[i]);
+}
+int vbs_block_predict(vbs_block_t *b, const int *tokens){
+    float *logits=calloc(b->vocab,sizeof(float));
+    block_forward_logits(b,tokens,logits);
+    int best=0; for(int v=1;v<b->vocab;v++) if(logits[v]>logits[best]) best=v;
+    free(logits); return best;
+}
+static void save_arr(FILE *f, float *p, int n){ fwrite(p,sizeof(float),n,f); }
+static int load_arr(FILE *f, float *p, int n){ return fread(p,sizeof(float),n,f)==(size_t)n; }
+void vbs_block_save(vbs_block_t *b, const char *path){
+    FILE *f=fopen(path,"wb"); if(!f) return;
+    int hdr[4]={b->vocab,b->d,b->seq,b->hidden}; fwrite(hdr,sizeof(int),4,f);
+    save_arr(f,b->E,b->vocab*b->d); save_arr(f,b->P,b->seq*b->d);
+    save_arr(f,b->Wq,b->d*b->d); save_arr(f,b->Wk,b->d*b->d); save_arr(f,b->Wv,b->d*b->d); save_arr(f,b->Wo,b->d*b->d);
+    save_arr(f,b->W1,b->d*b->hidden); save_arr(f,b->b1,b->hidden); save_arr(f,b->W2,b->hidden*b->d); save_arr(f,b->b2,b->d);
+    save_arr(f,b->Wout,b->d*b->vocab); save_arr(f,b->bout,b->vocab);
+    save_arr(f,b->g1,b->d); save_arr(f,b->be1,b->d); save_arr(f,b->g2,b->d); save_arr(f,b->be2,b->d); save_arr(f,b->gf,b->d); save_arr(f,b->bef,b->d);
+    fclose(f);
+}
+int vbs_block_load(vbs_block_t *b, const char *path){
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    int hdr[4]; if(fread(hdr,sizeof(int),4,f)!=4){fclose(f);return 0;}
+    if(hdr[0]!=b->vocab||hdr[1]!=b->d||hdr[2]!=b->seq||hdr[3]!=b->hidden){fclose(f);return 0;}
+    int ok=1;
+    ok&=load_arr(f,b->E,b->vocab*b->d); ok&=load_arr(f,b->P,b->seq*b->d);
+    ok&=load_arr(f,b->Wq,b->d*b->d); ok&=load_arr(f,b->Wk,b->d*b->d); ok&=load_arr(f,b->Wv,b->d*b->d); ok&=load_arr(f,b->Wo,b->d*b->d);
+    ok&=load_arr(f,b->W1,b->d*b->hidden); ok&=load_arr(f,b->b1,b->hidden); ok&=load_arr(f,b->W2,b->hidden*b->d); ok&=load_arr(f,b->b2,b->d);
+    ok&=load_arr(f,b->Wout,b->d*b->vocab); ok&=load_arr(f,b->bout,b->vocab);
+    ok&=load_arr(f,b->g1,b->d); ok&=load_arr(f,b->be1,b->d); ok&=load_arr(f,b->g2,b->d); ok&=load_arr(f,b->be2,b->d); ok&=load_arr(f,b->gf,b->d); ok&=load_arr(f,b->bef,b->d);
+    fclose(f); return ok;
+}
+double vbs_block_loss(vbs_block_t *b, const int *tokens, int target){
+    float *logits=calloc(b->vocab,sizeof(float));
+    block_forward_logits(b,tokens,logits);
+    float mx=logits[0]; for(int v=1;v<b->vocab;v++) if(logits[v]>mx) mx=logits[v];
+    double sum=0; for(int v=0;v<b->vocab;v++) sum+=exp(logits[v]-mx);
+    double loss=-log(exp(logits[target]-mx)/sum);
+    free(logits); return loss;
 }

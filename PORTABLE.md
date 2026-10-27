@@ -9,3 +9,11 @@
   That loop edits only src/self_tune.h, rebuilds, tests, and reverts
   any edit that does not improve loss. It never edits core engine files
   without a test gate, and it keeps a .bak backup during each try.
+
+## Train-tiny end-to-end
+./verum-slice --train-tiny --epochs 500 --lr 0.05 --block-out tiny.bin
+Learns pattern 1,2,3,5 repeating, then greedy-generates:
+  1 2 3 5 1 2 3 5 1 2 3 5
+Loss 2.07 -> 0.0004. Gradient-checked: numeric vs analytic diff < 0.00003
+for Wq/Wk/Wv/Wo/W1/W2/Wout, LayerNorm gammas, and biases.
+A LayerNorm backward bug (missing /d) was found by that check and fixed.
