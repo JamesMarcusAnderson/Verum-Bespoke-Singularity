@@ -7,6 +7,7 @@
 #include "vbs_autotune.h"
 #include "vbs_cpu.h"
 #include "vbs_dequant.h"
+#include "vbs_sampling.h"
 #include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
@@ -35,6 +36,7 @@ static void usage(void) {
         "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --cpu --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --dequant\n"
+        "  ./verum-slice --sample [--temperature 0.7] [--top-k 40] [--top-p 0.9] [--seed 12345]\n"
         "  ./verum-slice --learn --prompt \"What is X?\" --correct \"X is Y\" [--memory verum-memory.tsv]\n"
         "  ./verum-slice --train-adapter --target-token 1234 [--vocab 32000] [--epochs 100] [--lr 0.5] --adapter-out adapter.bin\n"
         "  ./verum-slice --generate --adapter adapter.bin ...\n"
@@ -162,6 +164,7 @@ int main(int argc, const char *argv[]) {
     size_t window_mib = 256; int have_window = 0;
     size_t bench_tokens = 128;
     size_t max_gen_tokens = 64;
+    float sample_temp = 0.0f; int sample_top_k = 0; float sample_top_p = 1.0f; uint64_t sample_seed = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--inspect") == 0 ||
@@ -179,8 +182,17 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--autotune") == 0 ||
             strcmp(argv[i], "--train-text") == 0 ||
             strcmp(argv[i], "--cpu") == 0 ||
-            strcmp(argv[i], "--dequant") == 0) {
+            strcmp(argv[i], "--dequant") == 0 ||
+            strcmp(argv[i], "--sample") == 0) {
             mode = argv[i];
+        } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            sample_temp = (float)strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            sample_top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            sample_top_p = (float)strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            sample_seed = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10); have_window = 1;
         } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
@@ -214,7 +226,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0 && strcmp(mode, "--dequant") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0 && strcmp(mode, "--dequant") != 0 && strcmp(mode, "--sample") != 0)) {
         usage();
         return 64;
     }
@@ -351,6 +363,19 @@ int main(int argc, const char *argv[]) {
         printf("TRAINED adapter: target=%zu vocab=%zu epochs=%zu lr=%.3f -> %s bias[target]=%.4f\n", train_target, train_vocab, train_epochs, train_lr, adapter_out, ad->bias[train_target]);
         vbs_adapter_free(ad); return 0;
     }
+    if (strcmp(mode, "--sample") == 0) {
+        float logits[4] = {0.0f, 1.0f, 3.0f, 2.0f};
+        vbs_sampler_t s; vbs_sampler_init(&s);
+        uint32_t g = vbs_sampler_sample(&s, logits, 4, NULL, 0);
+        printf("sample: greedy token=%u (want 2)\n", g);
+        vbs_sampler_init(&s); s.temperature = sample_temp > 0 ? sample_temp : 0.7f; s.top_k = sample_top_k ? sample_top_k : 2; s.seed = sample_seed ? sample_seed : 12345;
+        uint32_t a = vbs_sampler_sample(&s, logits, 4, NULL, 0);
+        vbs_sampler_init(&s); s.temperature = sample_temp > 0 ? sample_temp : 0.7f; s.top_k = sample_top_k ? sample_top_k : 2; s.seed = sample_seed ? sample_seed : 12345;
+        uint32_t b = vbs_sampler_sample(&s, logits, 4, NULL, 0);
+        printf("sample: temp/top-k token=%u repeat=%u deterministic=%s\n", a, b, a==b ? "yes" : "no");
+        if (g != 2 || a != b) { printf("sample: FAIL\n"); return 1; }
+        printf("sample: ALL PASS\n"); return 0;
+    }
     if (strcmp(mode, "--dequant") == 0) {
         /* Dequant decode check: verifies the quant decode path for types
            the GPU specializer previously refused, using known blocks. */
@@ -411,10 +436,15 @@ int main(int argc, const char *argv[]) {
         }
         printf("%s", prompt_text); fflush(stdout);
         uint32_t eos = vbs_cpu_eos_id(cm);
+        vbs_sampler_t sampler; vbs_sampler_init(&sampler);
+        sampler.temperature = sample_temp; sampler.top_k = sample_top_k; sampler.top_p = sample_top_p; sampler.seed = sample_seed;
+        uint32_t recent[4096]; size_t n_recent = 0;
+        for (size_t i = 0; i < n_prompt && n_recent < 4096; i++) recent[n_recent++] = prompt_tokens[i];
         for (size_t i = 0; i < max_gen_tokens; i++) {
             const float *logits = vbs_cpu_logits(cm);
-            uint32_t best = 0; size_t vocab = vbs_cpu_vocab_size(cm);
-            for (size_t k = 1; k < vocab; k++) if (logits[k] > logits[best]) best = (uint32_t)k;
+            size_t vocab = vbs_cpu_vocab_size(cm);
+            uint32_t best = vbs_sampler_sample(&sampler, logits, vocab, recent, n_recent);
+            if (n_recent < 4096) recent[n_recent++] = best;
             if (best == eos) break;
             char *piece = tokenizer_decode(tok, &best, 1);
             if (piece) { printf("%s", piece); fflush(stdout); free(piece); }

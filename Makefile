@@ -25,7 +25,8 @@ SRC := src/main.c \
        src/vbs_scheduler.c \
        src/vbs_autotune.c \
        src/vbs_cpu.c \
-       src/vbs_dequant.c
+       src/vbs_dequant.c \
+       src/vbs_sampling.c
 
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -DVBS_ENABLE_METAL=1
