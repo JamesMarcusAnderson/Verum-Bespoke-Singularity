@@ -17,7 +17,10 @@ SRC := src/main.c \
        src/vbs_fabric.c \
        src/vbs_planner.c \
        src/vbs_specializer.c \
-       src/vbs_specializer_bridge.c
+       src/vbs_specializer_bridge.c \
+       src/vbs_learn.c \
+       src/vbs_train.c \
+       src/vbs_block.c
 
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -DVBS_ENABLE_METAL=1

@@ -1,4 +1,7 @@
 #include "vbs_engine.h"
+#include "vbs_learn.h"
+#include "vbs_train.h"
+#include "vbs_block.h"
 #include "tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +27,11 @@ static void usage(void) {
         "  ./verum-slice --compile [--window-mib N] model.gguf\n"
         "  ./verum-slice --benchmark [--tokens N] [--window-mib N] model.gguf\n"
         "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
+        "  ./verum-slice --learn --prompt \"What is X?\" --correct \"X is Y\" [--memory verum-memory.tsv]\n"
+        "  ./verum-slice --train-adapter --target-token 1234 [--vocab 32000] [--epochs 100] [--lr 0.5] --adapter-out adapter.bin\n"
+        "  ./verum-slice --generate --adapter adapter.bin ...\n"
+        "  ./verum-slice --train-block [--epochs 500] [--lr 0.05]\n"
+        "  ./verum-slice --generate --memory verum-memory.tsv --tokenizer tokenizer.json --prompt \"What is X?\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
         "  ./verum-slice --prune --tokenizer tokenizer.json --prompt \"The capital of France is Paris\" model.gguf\n"
@@ -123,6 +131,12 @@ int main(int argc, const char *argv[]) {
     const char *mode = NULL;
     const char *model_path = NULL;
     const char *tokenizer_path = NULL;
+    const char *correct_text = NULL;
+    const char *memory_path = "verum-memory.tsv";
+    const char *adapter_path = NULL;
+    const char *adapter_out = NULL;
+    size_t train_target = 0; int have_target = 0;
+    size_t train_vocab = 32000; size_t train_epochs = 100; float train_lr = 0.5f;
     const char *prompt_text = "The universe is";
     size_t window_mib = 256;
     size_t bench_tokens = 128;
@@ -135,7 +149,10 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--generate") == 0 ||
             strcmp(argv[i], "--autonomy") == 0 ||
             strcmp(argv[i], "--prune") == 0 ||
-            strcmp(argv[i], "--evolve") == 0) {
+            strcmp(argv[i], "--evolve") == 0 ||
+            strcmp(argv[i], "--learn") == 0 ||
+            strcmp(argv[i], "--train-adapter") == 0 ||
+            strcmp(argv[i], "--train-block") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
@@ -145,16 +162,62 @@ int main(int argc, const char *argv[]) {
             tokenizer_path = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt_text = argv[++i];
+        } else if (strcmp(argv[i], "--correct") == 0 && i + 1 < argc) {
+            correct_text = argv[++i];
+        } else if (strcmp(argv[i], "--memory") == 0 && i + 1 < argc) {
+            memory_path = argv[++i];
+        } else if (strcmp(argv[i], "--adapter") == 0 && i + 1 < argc) {
+            adapter_path = argv[++i];
+        } else if (strcmp(argv[i], "--adapter-out") == 0 && i + 1 < argc) {
+            adapter_out = argv[++i];
+        } else if (strcmp(argv[i], "--target-token") == 0 && i + 1 < argc) {
+            train_target = (size_t)strtoull(argv[++i], NULL, 10); have_target = 1;
+        } else if (strcmp(argv[i], "--vocab") == 0 && i + 1 < argc) {
+            train_vocab = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
+            train_epochs = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
+            train_lr = (float)strtod(argv[++i], NULL);
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         }
     }
 
-    if (!mode || !model_path) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0)) {
         usage();
         return 64;
     }
 
+    if (strcmp(mode, "--learn") == 0) {
+        if (!prompt_text || !correct_text) { fprintf(stderr, "Error: --learn requires --prompt and --correct\n"); return 1; }
+        if (!vbs_learn_append(memory_path, prompt_text, correct_text)) { fprintf(stderr, "Error: could not write %s\n", memory_path); return 1; }
+        printf("LEARNED: %s -> %s  [file=%s]\n", prompt_text, correct_text, memory_path);
+        return 0;
+    }
+    if (strcmp(mode, "--train-block") == 0) {
+        /* Task: memorize [1,2,3] -> 5, vocab 8, d 16, hidden 32.
+         * If backprop is wrong, loss will not go to near 0. */
+        vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
+        int toks[3] = {1,2,3};
+        for (size_t ep=0; ep<train_epochs; ep++) {
+            double loss = vbs_block_train_step(blk, toks, 5, train_lr);
+            if (ep==0 || ep+1==train_epochs || (ep+1)%100==0) printf("block epoch %zu loss=%.4f\n", ep+1, loss);
+        }
+        vbs_block_free(blk); return 0;
+    }
+    if (strcmp(mode, "--train-adapter") == 0) {
+        if (!have_target || !adapter_out || train_target >= train_vocab) { fprintf(stderr, "Error: --train-adapter requires --target-token < vocab and --adapter-out\n"); return 1; }
+        vbs_adapter_t *ad = vbs_adapter_create(train_vocab); if(!ad) return 1;
+        float *base = calloc(train_vocab, sizeof(float));
+        for (size_t ep=0; ep<train_epochs; ep++) {
+            double prob=0; double loss = vbs_train_bias_step(ad, base, train_target, train_lr, &prob);
+            if (ep==0 || ep+1==train_epochs || (ep+1)%20==0) printf("epoch %zu loss=%.4f p(target)=%.4f\n", ep+1, loss, prob);
+        }
+        free(base);
+        if (!vbs_adapter_save(ad, adapter_out)) { fprintf(stderr, "Error: could not write %s\n", adapter_out); vbs_adapter_free(ad); return 1; }
+        printf("TRAINED adapter: target=%zu vocab=%zu epochs=%zu lr=%.3f -> %s bias[target]=%.4f\n", train_target, train_vocab, train_epochs, train_lr, adapter_out, ad->bias[train_target]);
+        vbs_adapter_free(ad); return 0;
+    }
     char err_buf[512] = {0};
     vbs_engine_t *engine = vbs_engine_create(model_path, window_mib, err_buf, sizeof(err_buf));
     if (!engine) {
@@ -232,18 +295,33 @@ int main(int argc, const char *argv[]) {
             return 2;
         }
 
+        char recalled[4096] = {0};
+        double recall_score = vbs_learn_recall(memory_path, prompt_text, recalled, sizeof recalled);
+        char effective_prompt[8192];
+        const char *gen_prompt = prompt_text;
+        if (recall_score > 0.0 && recalled[0]) {
+            printf("LEARNED RECALL score=%.2f: %s\n", recall_score, recalled);
+            snprintf(effective_prompt, sizeof effective_prompt, "Previously corrected answer: %s\nQuestion: %s", recalled, prompt_text);
+            gen_prompt = effective_prompt;
+        }
         uint32_t prompt_tokens[2048];
-        size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
+        size_t n_prompt = tokenizer_encode(tok, gen_prompt, prompt_tokens, 2048);
 
         size_t vocab_size = engine->model_profile->vocab_size ? engine->model_profile->vocab_size : 32000;
         float *logits = (float *)calloc(vocab_size, sizeof(float));
+        vbs_adapter_t *gen_adapter = NULL;
+        if (adapter_path) {
+            gen_adapter = vbs_adapter_create(vocab_size);
+            if (gen_adapter && vbs_adapter_load(gen_adapter, adapter_path)) printf("ADAPTER LOADED: %s\n", adapter_path);
+            else { fprintf(stderr, "Warning: adapter %s not loaded, continuing without it\n", adapter_path); if(gen_adapter) vbs_adapter_free(gen_adapter); gen_adapter=NULL; }
+        }
 
         // Prefill prompt tokens
         for (size_t i = 0; i < n_prompt; i++) {
             vbs_engine_forward(engine, &prompt_tokens[i], 1, logits);
         }
 
-        printf("%s", prompt_text);
+        printf("%s", gen_prompt);
         fflush(stdout);
 
         // Simple argmax sample
@@ -264,6 +342,7 @@ int main(int argc, const char *argv[]) {
             }
 
             vbs_engine_forward(engine, &cur_token, 1, logits);
+            if (gen_adapter) vbs_adapter_apply(gen_adapter, logits);
 
             max_logit = -1e9f;
             for (size_t j = 0; j < vocab_size; j++) {
@@ -273,6 +352,7 @@ int main(int argc, const char *argv[]) {
         printf("\n");
 
         free(logits);
+        if (gen_adapter) vbs_adapter_free(gen_adapter);
         tokenizer_free(tok);
         vbs_engine_destroy(engine);
         return 0;
