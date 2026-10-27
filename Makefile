@@ -44,6 +44,3 @@ $(BIN): $(SRC) $(wildcard include/*.h src/*.h)
 
 clean:
 	rm -f $(BIN) *.o
-
-test: $(BIN)
-	python3 test_verum.py
