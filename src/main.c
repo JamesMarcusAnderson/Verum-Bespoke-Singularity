@@ -5,6 +5,7 @@
 #include "vbs_autonomy.h"
 #include "vbs_scheduler.h"
 #include "vbs_autotune.h"
+#include "vbs_cpu.h"
 #include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
@@ -31,6 +32,7 @@ static void usage(void) {
         "  ./verum-slice --compile [--window-mib N] model.gguf\n"
         "  ./verum-slice --benchmark [--tokens N] [--window-mib N] model.gguf\n"
         "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
+        "  ./verum-slice --cpu --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --learn --prompt \"What is X?\" --correct \"X is Y\" [--memory verum-memory.tsv]\n"
         "  ./verum-slice --train-adapter --target-token 1234 [--vocab 32000] [--epochs 100] [--lr 0.5] --adapter-out adapter.bin\n"
         "  ./verum-slice --generate --adapter adapter.bin ...\n"
@@ -173,7 +175,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--train-tiny") == 0 ||
             strcmp(argv[i], "--autonomous-c") == 0 ||
             strcmp(argv[i], "--autotune") == 0 ||
-            strcmp(argv[i], "--train-text") == 0) {
+            strcmp(argv[i], "--train-text") == 0 ||
+            strcmp(argv[i], "--cpu") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10); have_window = 1;
@@ -208,7 +211,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0)) {
         usage();
         return 64;
     }
@@ -344,6 +347,31 @@ int main(int argc, const char *argv[]) {
         if (!vbs_adapter_save(ad, adapter_out)) { fprintf(stderr, "Error: could not write %s\n", adapter_out); vbs_adapter_free(ad); return 1; }
         printf("TRAINED adapter: target=%zu vocab=%zu epochs=%zu lr=%.3f -> %s bias[target]=%.4f\n", train_target, train_vocab, train_epochs, train_lr, adapter_out, ad->bias[train_target]);
         vbs_adapter_free(ad); return 0;
+    }
+    if (strcmp(mode, "--cpu") == 0) {
+        if (!tokenizer_path) { fprintf(stderr, "Error: --cpu requires --tokenizer /path/to/tokenizer.json\n"); return 1; }
+        tokenizer_t *tok = tokenizer_load(tokenizer_path);
+        if (!tok) { fprintf(stderr, "Error: Failed to load tokenizer from %s\n", tokenizer_path); return 1; }
+        char cpu_err[512] = {0};
+        vbs_cpu_model_t *cm = vbs_cpu_open(model_path, 256, cpu_err, sizeof(cpu_err));
+        if (!cm) { fprintf(stderr, "CPU model load failed: %s\n", cpu_err); tokenizer_free(tok); return 1; }
+        uint32_t prompt_tokens[2048];
+        size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
+        for (size_t i = 0; i < n_prompt; i++) {
+            if (!vbs_cpu_step_ex(cm, prompt_tokens[i], i + 1 == n_prompt, cpu_err, sizeof(cpu_err))) { fprintf(stderr, "CPU inference failed: %s\n", cpu_err); vbs_cpu_close(cm); tokenizer_free(tok); return 1; }
+        }
+        printf("%s", prompt_text); fflush(stdout);
+        uint32_t eos = vbs_cpu_eos_id(cm);
+        for (size_t i = 0; i < max_gen_tokens; i++) {
+            const float *logits = vbs_cpu_logits(cm);
+            uint32_t best = 0; size_t vocab = vbs_cpu_vocab_size(cm);
+            for (size_t k = 1; k < vocab; k++) if (logits[k] > logits[best]) best = (uint32_t)k;
+            if (best == eos) break;
+            char *piece = tokenizer_decode(tok, &best, 1);
+            if (piece) { printf("%s", piece); fflush(stdout); free(piece); }
+            if (!vbs_cpu_step(cm, best, cpu_err, sizeof(cpu_err))) { fprintf(stderr, "CPU inference failed: %s\n", cpu_err); break; }
+        }
+        printf("\n"); vbs_cpu_close(cm); tokenizer_free(tok); return 0;
     }
     /* Any PC, any config: if the user did not give --window-mib, autotune
        this machine first and use its window/backend. Override with --window-mib. */
