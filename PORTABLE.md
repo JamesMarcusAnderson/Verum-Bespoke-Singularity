@@ -17,3 +17,10 @@ Learns pattern 1,2,3,5 repeating, then greedy-generates:
 Loss 2.07 -> 0.0004. Gradient-checked: numeric vs analytic diff < 0.00003
 for Wq/Wk/Wv/Wo/W1/W2/Wout, LayerNorm gammas, and biases.
 A LayerNorm backward bug (missing /d) was found by that check and fixed.
+
+## Automated daemon
+Start once, it learns on its own:
+  ./run-daemon.sh 300   # background, 300s/cycle, log daemon.log
+  python3 verum-daemon.py --cycles 3 --interval 2   # test run
+Each cycle: watches verum-memory.tsv for new corrections (AUTO-LEARN),
+runs --autonomous-c, every 3rd cycle runs self_edit.py, writes daemon_state.json.
