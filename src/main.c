@@ -155,7 +155,7 @@ int main(int argc, const char *argv[]) {
     train_lr = (float)VBS_SELF_TUNE_LR;
 #endif
     const char *prompt_text = "The universe is";
-    size_t window_mib = 256;
+    size_t window_mib = 256; int have_window = 0;
     size_t bench_tokens = 128;
     size_t max_gen_tokens = 64;
 
@@ -176,7 +176,7 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--train-text") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
-            window_mib = (size_t)strtoull(argv[++i], NULL, 10);
+            window_mib = (size_t)strtoull(argv[++i], NULL, 10); have_window = 1;
         } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
             bench_tokens = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) {
@@ -344,6 +344,13 @@ int main(int argc, const char *argv[]) {
         if (!vbs_adapter_save(ad, adapter_out)) { fprintf(stderr, "Error: could not write %s\n", adapter_out); vbs_adapter_free(ad); return 1; }
         printf("TRAINED adapter: target=%zu vocab=%zu epochs=%zu lr=%.3f -> %s bias[target]=%.4f\n", train_target, train_vocab, train_epochs, train_lr, adapter_out, ad->bias[train_target]);
         vbs_adapter_free(ad); return 0;
+    }
+    /* Any PC, any config: if the user did not give --window-mib, autotune
+       this machine first and use its window/backend. Override with --window-mib. */
+    if (!have_window && model_path) {
+        vbs_autotune_t acfg; vbs_autotune_run(autotune_path, &acfg);
+        window_mib = acfg.window_mib;
+        printf("auto-config: backend=%s threads=%d window=%zu MiB (autotuned for this PC)\n", acfg.backend, acfg.threads, acfg.window_mib);
     }
     char err_buf[512] = {0};
     vbs_engine_t *engine = vbs_engine_create(model_path, window_mib, err_buf, sizeof(err_buf));
