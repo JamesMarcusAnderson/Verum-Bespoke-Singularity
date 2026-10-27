@@ -42,7 +42,8 @@ typedef enum {
     VBS_GGML_TYPE_TQ1_0   = 34,
     VBS_GGML_TYPE_TQ2_0   = 35,
     VBS_GGML_TYPE_MXFP4   = 39,
-    VBS_GGML_TYPE_LNS8    = 40
+    VBS_GGML_TYPE_LNS8    = 40,
+    VBS_GGML_TYPE_I8G     = 100  /* internal dequant target only, not a GGUF file type */
 } vbs_ggml_type_t;
 
 typedef struct {

@@ -6,6 +6,7 @@
 #include "vbs_scheduler.h"
 #include "vbs_autotune.h"
 #include "vbs_cpu.h"
+#include "vbs_dequant.h"
 #include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
@@ -33,6 +34,7 @@ static void usage(void) {
         "  ./verum-slice --benchmark [--tokens N] [--window-mib N] model.gguf\n"
         "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --cpu --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
+        "  ./verum-slice --dequant\n"
         "  ./verum-slice --learn --prompt \"What is X?\" --correct \"X is Y\" [--memory verum-memory.tsv]\n"
         "  ./verum-slice --train-adapter --target-token 1234 [--vocab 32000] [--epochs 100] [--lr 0.5] --adapter-out adapter.bin\n"
         "  ./verum-slice --generate --adapter adapter.bin ...\n"
@@ -176,7 +178,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--autonomous-c") == 0 ||
             strcmp(argv[i], "--autotune") == 0 ||
             strcmp(argv[i], "--train-text") == 0 ||
-            strcmp(argv[i], "--cpu") == 0) {
+            strcmp(argv[i], "--cpu") == 0 ||
+            strcmp(argv[i], "--dequant") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10); have_window = 1;
@@ -211,7 +214,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0 && strcmp(mode, "--dequant") != 0)) {
         usage();
         return 64;
     }
@@ -347,6 +350,52 @@ int main(int argc, const char *argv[]) {
         if (!vbs_adapter_save(ad, adapter_out)) { fprintf(stderr, "Error: could not write %s\n", adapter_out); vbs_adapter_free(ad); return 1; }
         printf("TRAINED adapter: target=%zu vocab=%zu epochs=%zu lr=%.3f -> %s bias[target]=%.4f\n", train_target, train_vocab, train_epochs, train_lr, adapter_out, ad->bias[train_target]);
         vbs_adapter_free(ad); return 0;
+    }
+    if (strcmp(mode, "--dequant") == 0) {
+        /* Dequant decode check: verifies the quant decode path for types
+           the GPU specializer previously refused, using known blocks. */
+        int fails = 0;
+        struct { vbs_ggml_type_t type; const char *name; } types[] = {
+            {VBS_GGML_TYPE_F32, "F32"}, {VBS_GGML_TYPE_F16, "F16"},
+            {VBS_GGML_TYPE_Q4_0, "Q4_0"}, {VBS_GGML_TYPE_Q4_1, "Q4_1"},
+            {VBS_GGML_TYPE_Q5_0, "Q5_0"}, {VBS_GGML_TYPE_Q5_1, "Q5_1"},
+            {VBS_GGML_TYPE_Q8_0, "Q8_0"}, {VBS_GGML_TYPE_Q8_1, "Q8_1"},
+            {VBS_GGML_TYPE_Q2_K, "Q2_K"}, {VBS_GGML_TYPE_Q3_K, "Q3_K"},
+            {VBS_GGML_TYPE_Q4_K, "Q4_K"}, {VBS_GGML_TYPE_Q5_K, "Q5_K"},
+            {VBS_GGML_TYPE_Q6_K, "Q6_K"}, {VBS_GGML_TYPE_Q8_K, "Q8_K"},
+            {VBS_GGML_TYPE_BF16, "BF16"},
+        };
+        for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); i++) {
+            printf("dequant: %s native=%s dequantizable=%s\n", types[i].name,
+                vbs_dequant_has_native_kernel(types[i].type) ? "yes" : "no",
+                vbs_dequant_supported(types[i].type) ? "yes" : "no");
+        }
+        /* Q4_0 known block: scale 0.5, nibbles i / 15-i */
+        { uint8_t blk[18] = {0}; ((uint16_t*)blk)[0] = vbs_f32_to_f16(0.5f);
+          for (int i = 0; i < 16; i++) blk[2+i] = (uint8_t)(i | ((15-i)<<4));
+          float y[32]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q4_0, blk, y);
+          if (n != 32 || fabsf(y[0] - 0.5f*(0-8)) > 1e-6f || fabsf(y[16] - 0.5f*(15-8)) > 1e-6f) { printf("dequant: Q4_0 FAIL n=%d y0=%f y16=%f\n", n, y[0], y[16]); fails++; }
+          else printf("dequant: Q4_0 OK 32 values\n"); }
+        /* Q8_0 known block: scale 0.125, quants i*7-80 */
+        { uint8_t blk[34] = {0}; ((uint16_t*)blk)[0] = vbs_f32_to_f16(0.125f);
+          for (int i = 0; i < 32; i++) blk[2+i] = (uint8_t)(int8_t)(i*7-80);
+          float y[32]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q8_0, blk, y);
+          if (n != 32 || fabsf(y[0] - 0.125f*(int8_t)(-80)) > 1e-6f) { printf("dequant: Q8_0 FAIL n=%d\n", n); fails++; }
+          else printf("dequant: Q8_0 OK 32 values\n"); }
+        /* K-quant count check with zero blocks (values 0, count must match) */
+        { uint8_t blk[292] = {0}; float y[256];
+          struct { vbs_ggml_type_t type; const char *name; } ktypes[] = {
+            {VBS_GGML_TYPE_Q2_K, "Q2_K"}, {VBS_GGML_TYPE_Q3_K, "Q3_K"},
+            {VBS_GGML_TYPE_Q4_K, "Q4_K"}, {VBS_GGML_TYPE_Q5_K, "Q5_K"},
+            {VBS_GGML_TYPE_Q6_K, "Q6_K"},
+          }; /* Q8_K: upstream dequant has no reference layout, honestly not supported */
+          for (size_t i = 0; i < sizeof(ktypes)/sizeof(ktypes[0]); i++) {
+            int n = vbs_dequant_block(ktypes[i].type, blk, y);
+            if (n != 256) { printf("dequant: %s FAIL n=%d\n", ktypes[i].name, n); fails++; }
+            else printf("dequant: %s OK 256 values\n", ktypes[i].name);
+          } }
+        printf("dequant: %s\n", fails ? "FAILURES" : "ALL PASS");
+        return fails ? 1 : 0;
     }
     if (strcmp(mode, "--cpu") == 0) {
         if (!tokenizer_path) { fprintf(stderr, "Error: --cpu requires --tokenizer /path/to/tokenizer.json\n"); return 1; }
