@@ -23,7 +23,7 @@ void vbs_bridge_set_scratch(vbs_buffer_t **bufs, size_t n);
 #define VBS_SCRATCH_UP     5
 #define VBS_SCRATCH_HIDDEN 6
 #define VBS_SCRATCH_NORMED 7
-#define VBS_SCRATCH_COUNT  8
+#define VBS_SCRATCH_COUNT  10
 
 void *vbs_gpu_get_act_buffer_a(void);
 void *vbs_gpu_get_act_buffer_b(void);

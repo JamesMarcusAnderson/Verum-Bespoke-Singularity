@@ -254,6 +254,8 @@ bool vbs_specializer_emit_source(
         "    void *UP     = vbs_gpu_get_scratch(5);\n"
         "    void *HIDDEN = vbs_gpu_get_scratch(6);\n"
         "    void *NORMED = vbs_gpu_get_scratch(7);\n"
+        "    void *QN     = vbs_gpu_get_scratch(8);\n"
+        "    void *KN     = vbs_gpu_get_scratch(9);\n"
         "    void *KC     = vbs_gpu_get_kv_k();\n"
         "    void *VC     = vbs_gpu_get_kv_v();\n"
         "    uint32_t pos = (uint32_t)g_current_pos;\n"
@@ -269,6 +271,16 @@ bool vbs_specializer_emit_source(
      * pruning semantics; skipping one Q/K/V/down node alone would not be.
      */
     extern float g_vbs_layer_energy[VBS_MAX_LAYERS];
+    /* Fix: RoPE must come AFTER Q/K norm, not before. Pre-scan which layers
+       have q_norm/k_norm, so RoPE can be deferred to the norm step. */
+    int has_q_norm[VBS_MAX_LAYERS]; int has_k_norm[VBS_MAX_LAYERS];
+    for (int li=0; li<VBS_MAX_LAYERS; li++) { has_q_norm[li]=0; has_k_norm[li]=0; }
+    for (size_t i = 0; i < plan->n_plans; i++) {
+        if (layers[i]>=0 && layers[i]<(int)VBS_MAX_LAYERS) {
+            if (roles[i]==SEQ_Q_NORM) has_q_norm[layers[i]]=1;
+            if (roles[i]==SEQ_K_NORM) has_k_norm[layers[i]]=1;
+        }
+    }
     for (size_t i = 0; i < plan->n_plans; i++) {
         const vbs_node_t *n = plan->plans[i].node;
         int L = layers[i];
@@ -289,26 +301,28 @@ bool vbs_specializer_emit_source(
                 fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, QB, %llu, %llu);\n",
                         ggml_type_name(n->weight->type), i,
                         (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_rope(QB, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
+                if (L<0 || !has_q_norm[L]) fprintf(f, "    vbs_gpu_dispatch_rope(QB, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
                 break;
             case SEQ_K:
                 fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, KB, %llu, %llu);\n",
                         ggml_type_name(n->weight->type), i,
                         (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_rope(KB, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
+                if (L<0 || !has_k_norm[L]) fprintf(f, "    vbs_gpu_dispatch_rope(KB, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
                 break;
             case SEQ_V:
                 fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, VB, %llu, %llu);\n",
                         ggml_type_name(n->weight->type), i,
                         (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_cache(KB, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", L);
-                fprintf(f, "    vbs_gpu_dispatch_attn(QB, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", L);
+                fprintf(f, "    vbs_gpu_dispatch_cache(%s, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", (L>=0 && has_k_norm[L]) ? "KN" : "KB", L);
+                fprintf(f, "    vbs_gpu_dispatch_attn(%s, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", (L>=0 && has_q_norm[L]) ? "QN" : "QB", L);
                 break;
             case SEQ_Q_NORM:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, QB, QB, N_HEADS*HEAD_DIM, RMS_EPS);\n", i);
+                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, QB, QN, N_HEADS*HEAD_DIM, RMS_EPS);\n", i);
+                fprintf(f, "    vbs_gpu_dispatch_rope(QN, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
                 break;
             case SEQ_K_NORM:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, KB, KB, N_KV_HEADS*HEAD_DIM, RMS_EPS);\n", i);
+                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, KB, KN, N_KV_HEADS*HEAD_DIM, RMS_EPS);\n", i);
+                fprintf(f, "    vbs_gpu_dispatch_rope(KN, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
                 break;
             case SEQ_ATTN_OUT:
                 fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, AB, TMP, %llu, %llu);\n",

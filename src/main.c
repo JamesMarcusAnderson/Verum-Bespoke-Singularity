@@ -262,7 +262,7 @@ int main(int argc, const char *argv[]) {
         int pattern[12] = {1,2,3,5,1,2,3,5,1,2,3,5};
         vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
         if (vbs_block_load(blk, "autonomous.bin")) printf("autonomous-c: loaded saved model autonomous.bin, continuing learning\n");
-        else printf("autonomous-c: no saved model, starting fresh\n");
+        else { vbs_block_free(blk); blk = vbs_block_create(8, 16, 3, 32, 12345u); printf("autonomous-c: no saved model, starting fresh\n"); }
         printf("autonomous-c: before predict [1,2,3] -> %d\n", vbs_block_predict(blk, (int[]){1,2,3}));
         double loss = 0; int ok = 0;
         for (int attempt=0; attempt<3 && !ok; attempt++) {
@@ -350,7 +350,7 @@ int main(int argc, const char *argv[]) {
     if (!have_window && model_path) {
         vbs_autotune_t acfg; vbs_autotune_run(autotune_path, &acfg);
         window_mib = acfg.window_mib;
-        printf("auto-config: backend=%s threads=%d window=%zu MiB (autotuned for this PC)\n", acfg.backend, acfg.threads, acfg.window_mib);
+        printf("auto-config: backend=%s threads=%d window=%zu MiB (autotuned for this PC)\n", acfg.backend, acfg.threads, acfg.window_mib); fflush(stdout);
     }
     char err_buf[512] = {0};
     vbs_engine_t *engine = vbs_engine_create(model_path, window_mib, err_buf, sizeof(err_buf));

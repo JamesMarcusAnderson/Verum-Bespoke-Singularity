@@ -116,7 +116,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         }
     }
     size_t scratch_sizes[VBS_SCRATCH_COUNT] = {
-        q_dim, kv_dim, kv_dim, q_dim, ffn_dim, ffn_dim, ffn_dim, embed_dim
+        q_dim, kv_dim, kv_dim, q_dim, ffn_dim, ffn_dim, ffn_dim, embed_dim, q_dim, kv_dim
     };
     size_t scratch_bytes = 0;
     for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) scratch_bytes += scratch_sizes[i] * sizeof(float);
