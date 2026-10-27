@@ -258,10 +258,24 @@ int main(int argc, const char *argv[]) {
         return 0;
     }
     if (strcmp(mode, "--autonomous-c") == 0) {
+        vbs_autotune_t acfg; vbs_autotune_run("verum-autotune.json", &acfg);
         int pattern[12] = {1,2,3,5,1,2,3,5,1,2,3,5};
         vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
+        if (vbs_block_load(blk, "autonomous.bin")) printf("autonomous-c: loaded saved model autonomous.bin, continuing learning\n");
+        else printf("autonomous-c: no saved model, starting fresh\n");
         printf("autonomous-c: before predict [1,2,3] -> %d\n", vbs_block_predict(blk, (int[]){1,2,3}));
-        double loss = vbs_autonomous_train(blk, pattern, 12, 0.01, 1000);
+        double loss = 0; int ok = 0;
+        for (int attempt=0; attempt<3 && !ok; attempt++) {
+            loss = vbs_autonomous_train(blk, pattern, 12, 0.01, 1000);
+            int ctx[3] = {1,2,3}; int gen[9];
+            for (int step=0; step<9; step++) { gen[step] = vbs_block_predict(blk, ctx); ctx[0]=ctx[1]; ctx[1]=ctx[2]; ctx[2]=gen[step]; }
+            int want[9] = {5,1,2,3,5,1,2,3,5}; ok = 1;
+            for (int i=0;i<9;i++) if (gen[i]!=want[i]) ok=0;
+            printf("autonomous-c: attempt %d generate %s\n", attempt+1, ok?"correct":"wrong, retraining");
+            if (!ok && attempt<2) { /* self-correction: keep training, no human input */ }
+        }
+        vbs_block_save(blk, "autonomous.bin");
+        printf("autonomous-c: saved model to autonomous.bin\n");
         printf("autonomous-c: scheduler lr at epoch 500 = %.4f\n", vbs_scheduler_lr(0.05f, 500));
         int ctx[3] = {1,2,3};
         printf("autonomous-c: generate: 1 2 3");
