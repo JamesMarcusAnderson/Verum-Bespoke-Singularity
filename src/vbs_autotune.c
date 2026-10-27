@@ -45,7 +45,8 @@ int vbs_autotune_detect(vbs_autotune_t *cfg){
 #endif
     else strcpy(cfg->backend,"CPU");
     size_t win = cfg->ram_bytes/8/1024/1024;
-    if(win<64) win=64; if(win>1024) win=1024;
+    if(win<64) win=64;
+    if(win>1024) win=1024;
     cfg->window_mib=win;
     snprintf(cfg->fingerprint,sizeof cfg->fingerprint,"%s-%d-%llu",cfg->backend,cfg->cores,(unsigned long long)(cfg->ram_bytes>>20));
     return 1;

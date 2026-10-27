@@ -38,6 +38,7 @@ static void usage(void) {
         "  ./verum-slice --train-tiny [--epochs 500] [--lr 0.05] [--block-out tiny.bin]\n"
         "  ./verum-slice --autonomous-c\n"
         "  ./verum-slice --autotune [--autotune-out verum-autotune.json]\n"
+        "  ./verum-slice --train-text --prompt \"hello world \" [--epochs 500]\n"
         "  ./verum-slice --generate --memory verum-memory.tsv --tokenizer tokenizer.json --prompt \"What is X?\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
@@ -125,6 +126,10 @@ int main(int argc, const char *argv[]) {
     /* Model-free diagnostic: handled before the model requirement below,
      * so "./verum-slice --backends" works with a single argument. */
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage();
+            return 0;
+        }
         if (strcmp(argv[i], "--backends") == 0) {
             return print_backends();
         }
@@ -167,7 +172,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--train-block") == 0 ||
             strcmp(argv[i], "--train-tiny") == 0 ||
             strcmp(argv[i], "--autonomous-c") == 0 ||
-            strcmp(argv[i], "--autotune") == 0) {
+            strcmp(argv[i], "--autotune") == 0 ||
+            strcmp(argv[i], "--train-text") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
@@ -202,7 +208,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0)) {
         usage();
         return 64;
     }
@@ -212,6 +218,38 @@ int main(int argc, const char *argv[]) {
         if (!vbs_learn_append(memory_path, prompt_text, correct_text)) { fprintf(stderr, "Error: could not write %s\n", memory_path); return 1; }
         printf("LEARNED: %s -> %s  [file=%s]\n", prompt_text, correct_text, memory_path);
         return 0;
+    }
+    if (strcmp(mode, "--train-text") == 0) {
+        /* Real text, not just a pattern: train next-char prediction on
+         * the user's --prompt text, repeated. Vocab = 32 (char % 32),
+         * context 3. This is still a tiny model, not a real LLM. */
+        const char *txt = prompt_text ? prompt_text : "hello world ";
+        int n = (int)strlen(txt);
+        if (n < 4) { fprintf(stderr, "Error: --train-text needs at least 4 chars\n"); return 1; }
+        vbs_block_t *blk = vbs_block_create(32, 16, 3, 32, 12345u);
+        double loss = 0;
+        for (size_t ep=0; ep<train_epochs; ep++) {
+            loss = 0; int cnt = 0;
+            for (int i=0; i+3<n; i++) {
+                int win[3] = {(unsigned char)txt[i]%32, (unsigned char)txt[i+1]%32, (unsigned char)txt[i+2]%32};
+                loss += vbs_block_train_step(blk, win, (unsigned char)txt[i+3]%32, train_lr); cnt++;
+            }
+            loss /= cnt;
+            if (ep==0 || ep+1==train_epochs || (ep+1)%100==0) printf("text epoch %zu loss=%.4f\n", ep+1, loss);
+        }
+        /* generate 20 chars starting from first 3 chars */
+        int ctx[3] = {(unsigned char)txt[0]%32, (unsigned char)txt[1]%32, (unsigned char)txt[2]%32};
+        printf("text generate: ");
+        for (int i=0;i<3;i++) printf("%c", txt[i]);
+        for (int step=0; step<20; step++) {
+            int nxt = vbs_block_predict(blk, ctx);
+            /* map token back: find a char in txt with that token, else '?' */
+            char out='?'; for(int i=0;i<n;i++) if((unsigned char)txt[i]%32==nxt){ out=txt[i]; break; }
+            printf("%c", out);
+            ctx[0]=ctx[1]; ctx[1]=ctx[2]; ctx[2]=nxt;
+        }
+        printf("\n");
+        vbs_block_free(blk); return 0;
     }
     if (strcmp(mode, "--autotune") == 0) {
         vbs_autotune_t cfg;
