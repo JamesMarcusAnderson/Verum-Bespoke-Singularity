@@ -94,7 +94,8 @@ static bool ggml_type_has_dispatch(vbs_ggml_type_t t) {
 // compiler's refusal of unresolved matrices.
 typedef enum {
     SEQ_EMBED, SEQ_ATTN_NORM, SEQ_Q, SEQ_K, SEQ_V, SEQ_ATTN_OUT,
-    SEQ_FFN_NORM, SEQ_GATE, SEQ_UP, SEQ_DOWN, SEQ_FINAL_NORM, SEQ_FINAL_LINEAR
+    SEQ_FFN_NORM, SEQ_GATE, SEQ_UP, SEQ_DOWN, SEQ_FINAL_NORM, SEQ_FINAL_LINEAR,
+    SEQ_Q_NORM, SEQ_K_NORM
 } seq_role_t;
 
 static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
@@ -104,10 +105,13 @@ static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
     if (blk) {
         *layer = atoi(blk + 4);
         if (strstr(name, "attn_norm"))   { *role = SEQ_ATTN_NORM; return true; }
+        if (strstr(name, "attn_q_norm")) { *role = SEQ_Q_NORM; return true; }
+        if (strstr(name, "attn_k_norm")) { *role = SEQ_K_NORM; return true; }
         if (strstr(name, "attn_q"))      { *role = SEQ_Q; return true; }
         if (strstr(name, "attn_k"))      { *role = SEQ_K; return true; }
         if (strstr(name, "attn_v"))      { *role = SEQ_V; return true; }
         if (strstr(name, "attn_output")) { *role = SEQ_ATTN_OUT; return true; }
+        if (strstr(name, "attn_out"))    { *role = SEQ_ATTN_OUT; return true; }
         if (strstr(name, "ffn_norm"))    { *role = SEQ_FFN_NORM; return true; }
         if (strstr(name, "ffn_gate"))    { *role = SEQ_GATE; return true; }
         if (strstr(name, "ffn_up"))      { *role = SEQ_UP; return true; }
@@ -299,6 +303,12 @@ bool vbs_specializer_emit_source(
                         (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
                 fprintf(f, "    vbs_gpu_dispatch_cache(KB, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", L);
                 fprintf(f, "    vbs_gpu_dispatch_attn(QB, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", L);
+                break;
+            case SEQ_Q_NORM:
+                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, QB, QB, N_HEADS*HEAD_DIM, RMS_EPS);\n", i);
+                break;
+            case SEQ_K_NORM:
+                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, KB, KB, N_KV_HEADS*HEAD_DIM, RMS_EPS);\n", i);
                 break;
             case SEQ_ATTN_OUT:
                 fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, AB, TMP, %llu, %llu);\n",
