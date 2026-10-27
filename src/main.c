@@ -4,6 +4,7 @@
 #include "vbs_block.h"
 #include "vbs_autonomy.h"
 #include "vbs_scheduler.h"
+#include "vbs_autotune.h"
 #include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
@@ -36,6 +37,7 @@ static void usage(void) {
         "  ./verum-slice --train-block [--epochs 500] [--lr 0.05]\n"
         "  ./verum-slice --train-tiny [--epochs 500] [--lr 0.05] [--block-out tiny.bin]\n"
         "  ./verum-slice --autonomous-c\n"
+        "  ./verum-slice --autotune [--autotune-out verum-autotune.json]\n"
         "  ./verum-slice --generate --memory verum-memory.tsv --tokenizer tokenizer.json --prompt \"What is X?\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
@@ -139,6 +141,7 @@ int main(int argc, const char *argv[]) {
     const char *correct_text = NULL;
     const char *memory_path = "verum-memory.tsv";
     const char *adapter_path = NULL;
+    const char *autotune_path = "verum-autotune.json";
     const char *adapter_out = NULL;
     const char *block_out = NULL;
     size_t train_target = 0; int have_target = 0;
@@ -163,7 +166,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--train-adapter") == 0 ||
             strcmp(argv[i], "--train-block") == 0 ||
             strcmp(argv[i], "--train-tiny") == 0 ||
-            strcmp(argv[i], "--autonomous-c") == 0) {
+            strcmp(argv[i], "--autonomous-c") == 0 ||
+            strcmp(argv[i], "--autotune") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
@@ -183,6 +187,8 @@ int main(int argc, const char *argv[]) {
             adapter_out = argv[++i];
         } else if (strcmp(argv[i], "--block-out") == 0 && i + 1 < argc) {
             block_out = argv[++i];
+        } else if (strcmp(argv[i], "--autotune-out") == 0 && i + 1 < argc) {
+            autotune_path = argv[++i];
         } else if (strcmp(argv[i], "--target-token") == 0 && i + 1 < argc) {
             train_target = (size_t)strtoull(argv[++i], NULL, 10); have_target = 1;
         } else if (strcmp(argv[i], "--vocab") == 0 && i + 1 < argc) {
@@ -196,7 +202,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0)) {
         usage();
         return 64;
     }
@@ -205,6 +211,12 @@ int main(int argc, const char *argv[]) {
         if (!prompt_text || !correct_text) { fprintf(stderr, "Error: --learn requires --prompt and --correct\n"); return 1; }
         if (!vbs_learn_append(memory_path, prompt_text, correct_text)) { fprintf(stderr, "Error: could not write %s\n", memory_path); return 1; }
         printf("LEARNED: %s -> %s  [file=%s]\n", prompt_text, correct_text, memory_path);
+        return 0;
+    }
+    if (strcmp(mode, "--autotune") == 0) {
+        vbs_autotune_t cfg;
+        int rc = vbs_autotune_run(autotune_path, &cfg);
+        printf("autotune: %s config -> %s (backend=%s threads=%d window=%zu MiB)\n", rc==2?"reused":"saved", autotune_path, cfg.backend, cfg.threads, cfg.window_mib);
         return 0;
     }
     if (strcmp(mode, "--autonomous-c") == 0) {

@@ -4,6 +4,7 @@ Verum automated self-learning daemon.
 Start it once, it keeps learning on its own - no human trigger per cycle.
 
 Each cycle, automatically:
+ 1b. Runs --autotune (hardware: backend/threads/window, learned config reused if unchanged)
  1. Watches verum-memory.tsv for new corrections. If new lines appeared
     since last cycle, it logs them as AUTO-LEARN and runs --learn recall
     verification (via the memory file itself, no manual input).
@@ -42,6 +43,9 @@ def main():
     ap.add_argument("--memory", default=os.path.join(ROOT, "verum-memory.tsv"))
     args = ap.parse_args()
     log("=== VERUM DAEMON START (automated, no human trigger per cycle) ===")
+    if not os.path.exists(os.path.join(ROOT, "verum-slice")):
+        log("verum-slice missing, building")
+        run(["make"])
     last_count = count_lines(args.memory)
     log(f"watching {args.memory} initial_lines={last_count}")
     cycle = 0
@@ -59,6 +63,9 @@ def main():
             last_count = cur
         else:
             log(f"no new memory (lines={cur})")
+        # 1b. hardware autotune: best config for THIS computer, reused if hardware unchanged
+        ra = run(["./verum-slice", "--autotune"])
+        log(f"autotune rc={ra.returncode} {(ra.stdout.strip().splitlines() or [''])[-1] if ra.stdout else ''}")
         # 2. autonomous C training
         r = run(["./verum-slice", "--autonomous-c"])
         tail = (r.stdout.strip().splitlines() or [""])[-1] if r.stdout else ""

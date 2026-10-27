@@ -24,3 +24,12 @@ Start once, it learns on its own:
   python3 verum-daemon.py --cycles 3 --interval 2   # test run
 Each cycle: watches verum-memory.tsv for new corrections (AUTO-LEARN),
 runs --autonomous-c, every 3rd cycle runs self_edit.py, writes daemon_state.json.
+
+## Hardware autotune: best performance for any computer
+  ./verum-slice --autotune
+Detects cores, RAM, GPU (CUDA/HIP/Metal, else CPU), chooses backend,
+threads=cores, window=RAM/8 clamped 64-1024 MiB, benchmarks the tiny
+transformer block, saves verum-autotune.json with a hardware fingerprint.
+Next run, if fingerprint matches, it reuses the learned config instead
+of re-tuning. If hardware changes, it re-tunes automatically.
+Daemon runs autotune every cycle, so it adapts to the machine it is on.
