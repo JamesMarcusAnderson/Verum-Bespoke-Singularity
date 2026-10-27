@@ -35,8 +35,13 @@ def build():
     return r.returncode == 0
 
 def train_block_loss(lr):
-    # train-block prints "block epoch N loss=X" lines; take last
-    r = run(["./verum-slice", "--train-block", "--epochs", "200", "--lr", str(lr)])
+    # REAL self-edit: write lr to src/self_tune.h, rebuild, then run
+    # train-block WITHOUT --lr, so the edited file itself controls training.
+    # Previously this passed --lr on the CLI, bypassing the tune file.
+    edit_tune(lr)
+    if not build():
+        return None
+    r = run(["./verum-slice", "--train-block", "--epochs", "200"])
     if r.returncode != 0:
         return None
     losses = re.findall(r"loss=([0-9.]+)", r.stdout)

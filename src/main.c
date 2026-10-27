@@ -2,6 +2,9 @@
 #include "vbs_learn.h"
 #include "vbs_train.h"
 #include "vbs_block.h"
+#include "vbs_autonomy.h"
+#include "vbs_scheduler.h"
+#include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +35,7 @@ static void usage(void) {
         "  ./verum-slice --generate --adapter adapter.bin ...\n"
         "  ./verum-slice --train-block [--epochs 500] [--lr 0.05]\n"
         "  ./verum-slice --train-tiny [--epochs 500] [--lr 0.05] [--block-out tiny.bin]\n"
+        "  ./verum-slice --autonomous-c\n"
         "  ./verum-slice --generate --memory verum-memory.tsv --tokenizer tokenizer.json --prompt \"What is X?\" model.gguf\n"
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
@@ -124,7 +128,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (argc < 3) {
+    if (argc < 2) {
         usage();
         return 64;
     }
@@ -139,6 +143,9 @@ int main(int argc, const char *argv[]) {
     const char *block_out = NULL;
     size_t train_target = 0; int have_target = 0;
     size_t train_vocab = 32000; size_t train_epochs = 100; float train_lr = 0.5f;
+#ifdef VBS_SELF_TUNE_LR
+    train_lr = (float)VBS_SELF_TUNE_LR;
+#endif
     const char *prompt_text = "The universe is";
     size_t window_mib = 256;
     size_t bench_tokens = 128;
@@ -155,7 +162,8 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--learn") == 0 ||
             strcmp(argv[i], "--train-adapter") == 0 ||
             strcmp(argv[i], "--train-block") == 0 ||
-            strcmp(argv[i], "--train-tiny") == 0) {
+            strcmp(argv[i], "--train-tiny") == 0 ||
+            strcmp(argv[i], "--autonomous-c") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10);
@@ -188,7 +196,7 @@ int main(int argc, const char *argv[]) {
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0)) {
         usage();
         return 64;
     }
@@ -198,6 +206,18 @@ int main(int argc, const char *argv[]) {
         if (!vbs_learn_append(memory_path, prompt_text, correct_text)) { fprintf(stderr, "Error: could not write %s\n", memory_path); return 1; }
         printf("LEARNED: %s -> %s  [file=%s]\n", prompt_text, correct_text, memory_path);
         return 0;
+    }
+    if (strcmp(mode, "--autonomous-c") == 0) {
+        int pattern[12] = {1,2,3,5,1,2,3,5,1,2,3,5};
+        vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
+        printf("autonomous-c: before predict [1,2,3] -> %d\n", vbs_block_predict(blk, (int[]){1,2,3}));
+        double loss = vbs_autonomous_train(blk, pattern, 12, 0.01, 1000);
+        printf("autonomous-c: scheduler lr at epoch 500 = %.4f\n", vbs_scheduler_lr(0.05f, 500));
+        int ctx[3] = {1,2,3};
+        printf("autonomous-c: generate: 1 2 3");
+        for (int step=0; step<9; step++) { int nxt = vbs_block_predict(blk, ctx); printf(" %d", nxt); ctx[0]=ctx[1]; ctx[1]=ctx[2]; ctx[2]=nxt; }
+        printf("\nautonomous-c: final loss=%.4f\n", loss);
+        vbs_block_free(blk); return 0;
     }
     if (strcmp(mode, "--train-tiny") == 0) {
         /* End-to-end tiny LLM: learn a repeating pattern, then generate.
@@ -233,6 +253,7 @@ int main(int argc, const char *argv[]) {
         /* Task: memorize [1,2,3] -> 5, vocab 8, d 16, hidden 32.
          * If backprop is wrong, loss will not go to near 0. */
         vbs_block_t *blk = vbs_block_create(8, 16, 3, 32, 12345u);
+        printf("train-block lr=%.4f (from self_tune.h unless --lr given)\n", train_lr);
         int toks[3] = {1,2,3};
         for (size_t ep=0; ep<train_epochs; ep++) {
             double loss = vbs_block_train_step(blk, toks, 5, train_lr);

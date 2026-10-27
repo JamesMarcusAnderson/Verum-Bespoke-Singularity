@@ -20,7 +20,9 @@ SRC := src/main.c \
        src/vbs_specializer_bridge.c \
        src/vbs_learn.c \
        src/vbs_train.c \
-       src/vbs_block.c
+       src/vbs_block.c \
+       src/vbs_autonomy.c \
+       src/vbs_scheduler.c
 
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -DVBS_ENABLE_METAL=1
@@ -36,7 +38,7 @@ BIN := verum-slice
 
 all: $(BIN)
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(wildcard include/*.h src/*.h)
 	$(CC) $(CFLAGS) $(SRC) $(LDFLAGS) -o $@
 
 clean:
