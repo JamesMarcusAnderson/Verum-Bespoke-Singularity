@@ -107,8 +107,10 @@ jobs:
         run: |
           .\build\Release\verum-slice.exe --help
           $out = .\build\Release\verum-slice.exe --dequant
+          Write-Output $out
           if ($out -notmatch "ALL PASS") { throw "dequant self-check failed" }
           $out = .\build\Release\verum-slice.exe --sample
+          Write-Output $out
           if ($out -notmatch "ALL PASS") { throw "sample self-check failed" }
           .\build\Release\verum-slice.exe --backends
           .\build\Release\verum-slice.exe --autonomous-c
