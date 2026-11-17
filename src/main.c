@@ -124,6 +124,24 @@ static size_t fuse_gen_round(vbs_cpu_model_t *cm, const uint32_t *prompt_ids,
     return n;
 }
 
+/* Parse a comma-separated list of token ids ("1,2,3") into out[0..cap).
+ * Returns the number parsed; 0 if the text is empty or has no numbers.
+ * Single copy: the --loop and --fuse modes used to carry identical blocks.
+ * Uses vbs_strtok_r (vbs_port.h), the engine's own reentrant tokenizer —
+ * POSIX strtok_r does not exist on MSVC (link error LNK2019, first MSVC
+ * run 2026-11-17), so no .c file may call strtok_r directly. */
+static size_t parse_prompt_ids(const char *text, uint32_t *out, size_t cap) {
+    size_t n = 0;
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", text);
+    char *save = NULL;
+    for (char *tok = vbs_strtok_r(buf, ",", &save); tok && n < cap;
+         tok = vbs_strtok_r(NULL, ",", &save)) {
+        out[n++] = (uint32_t)strtoul(tok, NULL, 10);
+    }
+    return n;
+}
+
 int main(int argc, const char *argv[]) {
     /* Model-free diagnostic: handled before the model requirement below,
      * so "./verum-slice --backends" works with a single argument. */
@@ -547,16 +565,7 @@ int main(int argc, const char *argv[]) {
     if (strcmp(mode, "--loop") == 0) {
         /* Recursive loop: live session + unsupervised optimization. */
         uint32_t prompt_ids[64];
-        size_t n_prompt = 0;
-        {
-            char buf[1024];
-            snprintf(buf, sizeof(buf), "%s", prompt_ids_text);
-            char *save = NULL;
-            for (char *tok = strtok_r(buf, ",", &save); tok && n_prompt < 64;
-                 tok = strtok_r(NULL, ",", &save)) {
-                prompt_ids[n_prompt++] = (uint32_t)strtoul(tok, NULL, 10);
-            }
-        }
+        size_t n_prompt = parse_prompt_ids(prompt_ids_text, prompt_ids, 64);
         if (n_prompt == 0) { prompt_ids[0] = 1; n_prompt = 1; }
         if (loop_tokens_per_iter == 0) loop_tokens_per_iter = 8;
         vbs_loop_config_t lcfg;
@@ -709,16 +718,7 @@ int main(int argc, const char *argv[]) {
          * same discipline the loop's benchmark uses. Token sequences from
          * every round must match the first reference round exactly. */
         uint32_t prompt_ids[64];
-        size_t n_prompt = 0;
-        {
-            char buf[1024];
-            snprintf(buf, sizeof(buf), "%s", prompt_ids_text);
-            char *save = NULL;
-            for (char *tok = strtok_r(buf, ",", &save); tok && n_prompt < 64;
-                 tok = strtok_r(NULL, ",", &save)) {
-                prompt_ids[n_prompt++] = (uint32_t)strtoul(tok, NULL, 10);
-            }
-        }
+        size_t n_prompt = parse_prompt_ids(prompt_ids_text, prompt_ids, 64);
         if (n_prompt == 0) { prompt_ids[0] = 1; n_prompt = 1; }
         char ferr[1024] = {0};
         vbs_cpu_model_t *cm = vbs_cpu_open(model_path, 128, ferr, sizeof(ferr));

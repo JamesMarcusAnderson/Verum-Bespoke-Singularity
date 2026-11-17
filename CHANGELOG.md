@@ -10,6 +10,12 @@
   GCC/Clang accept them as an extension, which is why only MSVC failed.
   The table now computes word counts with `sizeof`, a true constant
   expression on every compiler. One error, one line.
+- MSVC link (second failure, same first run): `main.c` called POSIX
+  `strtok_r`, which does not exist on MSVC (link error LNK2019). It now
+  uses `vbs_strtok_r` from `vbs_port.h`, the engine's own reentrant
+  tokenizer — the same one `vbs_cpu_main.c` already used. The two
+  identical prompt-id parsing blocks in `main.c` (--loop and --fuse)
+  are now one helper, `parse_prompt_ids`.
 
 ## v0.10.0 — 2026-11-17 — GGUF proven, Windows target, universal GPU path, recursive self-optimization loop
 
