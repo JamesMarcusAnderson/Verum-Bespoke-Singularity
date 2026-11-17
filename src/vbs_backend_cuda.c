@@ -1,8 +1,8 @@
 #include "vbs_backend.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dlfcn.h>
 #include <stdint.h>
 
 typedef int CUresult;
@@ -57,16 +57,27 @@ typedef struct {
 static vbs_device_t g_cuda_devices[8];
 static vbs_cuda_internal_t g_cuda_internals[8];
 static int g_cuda_dev_count = 0;
+static bool g_cuda_probed = false;
+static bool g_cuda_ready = false;
+static char g_cuda_last_error[256] = "not probed yet";
+
+const char *vbs_cuda_last_error(void) { return g_cuda_last_error; }
 
 #include "../kernels/cuda_kernels.ptx.h"
 
 static bool cuda_init(void) {
-    g_cu.handle = dlopen("libcuda.so.1", RTLD_LAZY);
-    if (!g_cu.handle) g_cu.handle = dlopen("libcuda.so", RTLD_LAZY);
-    if (!g_cu.handle) g_cu.handle = dlopen("nvcuda.dll", RTLD_LAZY);
-    if (!g_cu.handle) return false;
+    if (g_cuda_probed) return g_cuda_ready;
+    g_cuda_probed = true;
+    g_cu.handle = vbs_dlopen("libcuda.so.1", 0);
+    if (!g_cu.handle) g_cu.handle = vbs_dlopen("libcuda.so", 0);
+    if (!g_cu.handle) g_cu.handle = vbs_dlopen("nvcuda.dll", 0);
+    if (!g_cu.handle) {
+        snprintf(g_cuda_last_error, sizeof(g_cuda_last_error),
+                 "CUDA driver not found (libcuda.so.1 missing)");
+        return false;
+    }
 
-#define LOAD_FN(name) g_cu.name = (name##_fn)dlsym(g_cu.handle, #name); if (!g_cu.name) return false;
+#define LOAD_FN(name) g_cu.name = (name##_fn)vbs_dlsym(g_cu.handle, #name); if (!g_cu.name) { snprintf(g_cuda_last_error, sizeof(g_cuda_last_error), "CUDA driver lacks %s", #name); return false; }
     LOAD_FN(cuInit);
     LOAD_FN(cuDeviceGet);
     LOAD_FN(cuDeviceGetCount);
@@ -82,11 +93,18 @@ static bool cuda_init(void) {
     LOAD_FN(cuCtxSynchronize);
 #undef LOAD_FN
 
-    if (g_cu.cuInit(0) != CUDA_SUCCESS) return false;
+    if (g_cu.cuInit(0) != CUDA_SUCCESS) {
+        snprintf(g_cuda_last_error, sizeof(g_cuda_last_error), "cuInit failed");
+        return false;
+    }
 
     int count = 0;
     g_cu.cuDeviceGetCount(&count);
-    if (count <= 0) return false;
+    if (count <= 0) {
+        snprintf(g_cuda_last_error, sizeof(g_cuda_last_error),
+                 "no NVIDIA GPU found by CUDA driver");
+        return false;
+    }
     if (count > 8) count = 8;
 
     for (int i = 0; i < count; i++) {
@@ -106,7 +124,14 @@ static bool cuda_init(void) {
 
         g_cuda_dev_count++;
     }
-    return g_cuda_dev_count > 0;
+    g_cuda_ready = g_cuda_dev_count > 0;
+    if (g_cuda_ready) {
+        snprintf(g_cuda_last_error, sizeof(g_cuda_last_error), "ok");
+    } else {
+        snprintf(g_cuda_last_error, sizeof(g_cuda_last_error),
+                 "no CUDA device initialized (context or PTX module failed)");
+    }
+    return g_cuda_ready;
 }
 
 static size_t cuda_get_device_count(void) { return (size_t)g_cuda_dev_count; }

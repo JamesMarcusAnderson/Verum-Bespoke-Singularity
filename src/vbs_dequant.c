@@ -2,7 +2,7 @@
 //
 // Purpose: the GPU kernels natively execute f32/f16/Q4_0/Q4_1/Q6_K/Q8_0.
 // Every other common GGUF weight format (Q5_0, Q5_1, Q2_K, Q3_K, Q4_K,
-// Q5_K, BF16) can be converted at load time into Q8_0 (compact, native
+// Q5_K, Q8_K, BF16) can be converted at load time into Q8_0 (compact, native
 // kernel) or F16 (exact for 16-bit sources), so any model runs on any
 // backend. Block layouts follow the public GGUF tensor-encoding spec
 // (super-blocks of 256 with nested scale hierarchies); all code here is
@@ -103,6 +103,7 @@ bool vbs_dequant_supported(vbs_ggml_type_t t) {
         case VBS_GGML_TYPE_Q6_K: // no *matvec* kernel path uses it via bridge on all backends
         case VBS_GGML_TYPE_Q8_0:
         case VBS_GGML_TYPE_Q8_1:
+        case VBS_GGML_TYPE_Q8_K:
         case VBS_GGML_TYPE_Q4_0:
         case VBS_GGML_TYPE_Q4_1:
         case VBS_GGML_TYPE_F16:
@@ -110,7 +111,7 @@ bool vbs_dequant_supported(vbs_ggml_type_t t) {
         case VBS_GGML_TYPE_BF16:
             return true;
         default:
-            // IQ* / TQ* / MXFP4 / Q8_K: no reference layout implemented here.
+            // IQ* / TQ* / MXFP4: no reference layout implemented here.
             return false;
     }
 }
@@ -255,11 +256,14 @@ static int deq_q3_k(const uint8_t *b, float *y) {
 }
 
 static int deq_q4_k(const uint8_t *b, float *y) {
-    // { u8 qs[128]; u8 scales[12]; f16 d; f16 dmin }
-    const uint8_t *qs     = b;
-    const uint8_t *scales = b + 128;
-    float d   = vbs_f16_to_f32(((uint16_t *)(b + 140))[0]);
-    float dmn = vbs_f16_to_f32(((uint16_t *)(b + 140))[1]);
+    // { f16 d; f16 dmin; u8 scales[12]; u8 qs[128] } — the super-block
+    // scale/min come FIRST in ggml's block_q4_K (unlike Q2_K/Q3_K/Q6_K,
+    // where they come last); reading them from the tail, as an earlier
+    // version did, decodes garbage (values in the tens of millions).
+    float d   = vbs_f16_to_f32(((uint16_t *)b)[0]);
+    float dmn = vbs_f16_to_f32(((uint16_t *)b)[1]);
+    const uint8_t *scales = b + 4;
+    const uint8_t *qs     = b + 16;
     for (int e = 0; e < 256; e++) {
         int g = e >> 6;            // 64-element group
         int w = e & 63;
@@ -273,12 +277,14 @@ static int deq_q4_k(const uint8_t *b, float *y) {
 }
 
 static int deq_q5_k(const uint8_t *b, float *y) {
-    // { u8 ql[128]; u8 qh[32]; u8 scales[12]; f16 d; f16 dmin }
-    const uint8_t *ql     = b;
-    const uint8_t *qh     = b + 128;
-    const uint8_t *scales = b + 160;
-    float d   = vbs_f16_to_f32(((uint16_t *)(b + 172))[0]);
-    float dmn = vbs_f16_to_f32(((uint16_t *)(b + 172))[1]);
+    // { f16 d; f16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] } — same
+    // d/dmin-first order as Q4_K (see deq_q4_k); the earlier qs-first
+    // layout decoded garbage.
+    float d   = vbs_f16_to_f32(((uint16_t *)b)[0]);
+    float dmn = vbs_f16_to_f32(((uint16_t *)b)[1]);
+    const uint8_t *scales = b + 4;
+    const uint8_t *qh     = b + 16;
+    const uint8_t *ql     = b + 48;
     for (int e = 0; e < 256; e++) {
         int g = e >> 6;
         int w = e & 63;
@@ -291,6 +297,19 @@ static int deq_q5_k(const uint8_t *b, float *y) {
         unpack_scale_min_k4(scales, e >> 5, &sc, &m);
         y[e] = d * (float)sc * (float)nib - dmn * (float)m;
     }
+    return 256;
+}
+
+static int deq_q8_k(const uint8_t *b, float *y) {
+    // { f32 d; i8 qs[256]; i16 bsums[16] } = 292 bytes. Unlike the other
+    // K-quants the super-block scale is a full f32, there are no per-block
+    // scales, and the trailing bsums are dot-product helpers (sums of the
+    // quants in each group of 16) that dequantization does not need.
+    // Value is simply d * q. Layout per ggml block_q8_K.
+    float d;
+    memcpy(&d, b, 4);
+    const int8_t *q = (const int8_t *)(b + 4);
+    for (int i = 0; i < 256; i++) y[i] = d * (float)q[i];
     return 256;
 }
 
@@ -331,6 +350,7 @@ int vbs_dequant_block(vbs_ggml_type_t type, const void *block, float *out_values
         case VBS_GGML_TYPE_Q4_K: return deq_q4_k((const uint8_t *)block, out_values);
         case VBS_GGML_TYPE_Q5_K: return deq_q5_k((const uint8_t *)block, out_values);
         case VBS_GGML_TYPE_Q6_K: return deq_q6_k((const uint8_t *)block, out_values);
+        case VBS_GGML_TYPE_Q8_K: return deq_q8_k((const uint8_t *)block, out_values);
         default: return 0;
     }
 }

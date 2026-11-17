@@ -15,8 +15,11 @@ It does, in one run:
          by vbs_scheduler.c / vbs_autonomy.c, with tests still passing.
          Plus permanent ADDs from this cycle: vbs_autonomy.c, vbs_scheduler.c
 """
-import os, shutil, subprocess, sys, time
+import os, shutil, subprocess, sys, tempfile, time
 ROOT = os.path.dirname(os.path.abspath(__file__))
+# Cross-platform: verum-slice.exe on Windows, verum-slice elsewhere.
+BIN = os.path.join(ROOT, "verum-slice.exe" if os.name == "nt" else "verum-slice")
+MAKE = shutil.which("make") or shutil.which("mingw32-make") or "make"
 BACKUP = os.path.join(ROOT, ".self_backup")
 LOG = os.path.join(ROOT, "self_edit.log")
 
@@ -29,12 +32,12 @@ def run(cmd):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=300)
 
 def test_suite():
-    if run(["make"]).returncode != 0: return False
+    if run([MAKE]).returncode != 0: return False
     for cmd in [
-        ["./verum-slice", "--train-block", "--epochs", "100"],
-        ["./verum-slice", "--train-tiny", "--epochs", "100"],
-        ["./verum-slice", "--train-adapter", "--target-token", "7", "--vocab", "100", "--epochs", "20", "--adapter-out", "/tmp/test-adapter.bin"],
-        ["./verum-slice", "--autonomous-c"],
+        [BIN, "--train-block", "--epochs", "100"],
+        [BIN, "--train-tiny", "--epochs", "100"],
+        [BIN, "--train-adapter", "--target-token", "7", "--vocab", "100", "--epochs", "20", "--adapter-out", os.path.join(tempfile.gettempdir(), "test-adapter.bin")],
+        [BIN, "--autonomous-c"],
     ]:
         r = run(cmd)
         if r.returncode != 0:

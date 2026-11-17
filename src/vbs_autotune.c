@@ -3,24 +3,16 @@
 #endif
 #include "vbs_autotune.h"
 #include "vbs_backend.h"
+#include "vbs_backend_select.h"
 #include "vbs_block.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
 #include <sys/sysctl.h>
-#include <unistd.h>
-#else
-#include <unistd.h>
 #endif
-static double now_sec(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec/1e9; }
-static int gpu_available(const char *label, const vbs_backend_ops_t *ops){
-    if(!ops||!ops->init) return 0;
-    return ops->init() ? 1 : 0;
-}
+static double now_sec(void){ return vbs_now_sec(); }
 int vbs_autotune_detect(vbs_autotune_t *cfg){
     memset(cfg,0,sizeof *cfg);
 #if defined(_WIN32)
@@ -37,13 +29,9 @@ int vbs_autotune_detect(vbs_autotune_t *cfg){
     if(cfg->cores<=0) cfg->cores=1;
     if(cfg->ram_bytes==0) cfg->ram_bytes=1ULL<<30;
     cfg->threads=cfg->cores;
-    /* backend: first available GPU, else CPU */
-    if(gpu_available("CUDA",&g_vbs_cuda_backend)) strcpy(cfg->backend,"CUDA");
-    else if(gpu_available("HIP",&g_vbs_hip_backend)) strcpy(cfg->backend,"HIP");
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-    else if(gpu_available("Metal",&g_vbs_metal_backend)) strcpy(cfg->backend,"Metal");
-#endif
-    else strcpy(cfg->backend,"CPU");
+    /* backend: selected backend (Vulkan -> CUDA -> HIP -> Metal -> CPU),
+     * via the single selection point. */
+    strcpy(cfg->backend, vbs_backend_name(vbs_backend_select()));
     size_t win = cfg->ram_bytes/8/1024/1024;
     if(win<64) win=64;
     if(win>1024) win=1024;

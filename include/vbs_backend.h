@@ -14,7 +14,8 @@ typedef enum {
     VBS_BACKEND_METAL,
     VBS_BACKEND_CUDA,
     VBS_BACKEND_HIP,
-    VBS_BACKEND_CPU
+    VBS_BACKEND_CPU,
+    VBS_BACKEND_VULKAN
 } vbs_backend_type_t;
 
 typedef struct vbs_device vbs_device_t;
@@ -99,6 +100,8 @@ typedef struct vbs_backend_ops {
 
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
 extern const vbs_backend_ops_t g_vbs_hip_backend;
+extern const vbs_backend_ops_t g_vbs_vulkan_backend;
+extern const vbs_backend_ops_t g_vbs_cpu_backend;
 #if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
 extern const vbs_backend_ops_t g_vbs_metal_backend;
 #endif

@@ -4,6 +4,7 @@
 #include "vbs_backend.h"
 #include "vbs_profiler.h"
 #include "vbs_gguf.h"
+#include "vbs_port.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -44,9 +45,8 @@ typedef struct vbs_fabric {
     size_t  pinned_pool_size;
     size_t  pinned_pool_offset;
 
-    // NVMe cold-tier swap file
-    int     nvme_swap_fd;
-    void   *nvme_swap_map;
+    // NVMe cold-tier swap file (mapped read-write/shared; see vbs_port.h)
+    vbs_mmap_t nvme_swap;
     size_t  nvme_swap_size;
     size_t  nvme_swap_offset;
 

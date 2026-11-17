@@ -369,8 +369,11 @@ tokenizer_t *tokenizer_load(const char *path) {
         if (id >= 0 && id < tok->vocab_size) tok->vocab[id].byte_value = b;
     }
 
-    int eos = strmap_get(&tok->text2id, "<|endoftext|>", 13);
-    if (eos < 0) eos = strmap_get(&tok->text2id, "<|im_end|>", 10);
+    /* Chat models stop on <|im_end|>, not <|endoftext|> (which is often the
+       padding / unknown token); plain GPT-2-style tokenizers have no
+       <|im_end|>, so they fall back to <|endoftext|> as before. */
+    int eos = strmap_get(&tok->text2id, "<|im_end|>", 10);
+    if (eos < 0) eos = strmap_get(&tok->text2id, "<|endoftext|>", 13);
     tok->eos_token_id = eos;
     return tok;
 }
@@ -386,12 +389,56 @@ static size_t utf8_len_of(unsigned char c) {
 static size_t segment_len_at(const char *p) {
     unsigned char c = (unsigned char)*p;
     size_t n = 0;
+    if (c == '\'') {
+        /* GPT-2 pre-tokenizer contractions, longest first ('tis -> 't + is,
+           matching the reference regex, which has no word boundary). */
+        static const char *suf[] = {"'re", "'ve", "'ll", "'s", "'t", "'m", "'d"};
+        for (size_t i = 0; i < sizeof(suf) / sizeof(suf[0]); i++) {
+            size_t l = strlen(suf[i]);
+            if (strncmp(p, suf[i], l) == 0) return l;
+        }
+    }
+    if (c == ' ' && p[1] != '\0' && p[1] != ' ' && p[1] != '\t' && p[1] != '\r' && p[1] != '\n') {
+        /* The GPT-2 pre-tokenizer regex attaches one leading space to the
+           following run (" Hello" is one piece, "ĠHello"), so a lone space
+           belongs to the next segment, not its own. A run of 2+ spaces
+           stays a whitespace segment, as in the reference. */
+        return 1 + segment_len_at(p + 1);
+    }
     if (c == '\r' || c == '\n') { while (p[n] == '\r' || p[n] == '\n') n++; return n; }
     if (c == ' ' || c == '\t' || c == '\v' || c == '\f') { while (p[n] == ' ' || p[n] == '\t' || p[n] == '\v' || p[n] == '\f') n++; return n; }
     if (c >= '0' && c <= '9') { while (p[n] >= '0' && p[n] <= '9' && n < 3) n++; return n; }
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { while ((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z')) n++; return n; }
-    if (c >= 0x80) { while (((unsigned char)p[n]) >= 0x80) n += utf8_len_of((unsigned char)p[n]); return n; }
-    while (p[n] >= 0x21 && p[n] <= 0x7E && !((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= '0' && p[n] <= '9'))) n++;
+    /* The reference pre-tokenizer matches Unicode letters (\p{L}+), so a
+       word continues through multi-byte characters ("naïve" is one piece,
+       not "na" + "ï" + "ve"). Treating every multi-byte sequence as a
+       letter is a safe approximation here: BPE can only merge pairs that
+       exist in the merge table, so a stray punctuation mark inside a
+       segment still tokenizes on its own. */
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+        while (1) {
+            unsigned char d = (unsigned char)p[n];
+            if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) n++;
+            else if (d >= 0x80) n += utf8_len_of(d);
+            else break;
+        }
+        return n;
+    }
+    if (c >= 0x80) {
+        while (1) {
+            unsigned char d = (unsigned char)p[n];
+            if (d >= 0x80) n += utf8_len_of(d);
+            else if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) n++;
+            else break;
+        }
+        return n;
+    }
+    while (p[n] >= 0x21 && p[n] <= 0x7E && !((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= '0' && p[n] <= '9'))) {
+        /* Stop before a "<|" so the special-token scan in the encoder sees
+           it at a segment boundary ("?<|im_end|>" must not glue "?<" to
+           the special token). */
+        if (p[n] == '<' && p[n + 1] == '|') break;
+        n++;
+    }
     return n > 0 ? n : 1;
 }
 
@@ -423,6 +470,22 @@ size_t tokenizer_encode(tokenizer_t *tok, const char *text, uint32_t *out_tokens
     size_t written = 0;
     const char *p = text;
     while (*p && written < max_tokens) {
+        /* Added special tokens (<|im_start|>, <|im_end|>, ...) are single
+           vocab entries, unreachable through BPE merges; match them
+           literally before segmenting. An unmatched "<|...|>" falls
+           through to normal segmentation. */
+        if (p[0] == '<' && p[1] == '|') {
+            const char *end = strstr(p, "|>");
+            if (end) {
+                size_t slen = (size_t)(end - p) + 2;
+                int sid = strmap_get(&tok->text2id, p, slen);
+                if (sid >= 0) {
+                    out_tokens[written++] = (uint32_t)sid;
+                    p += slen;
+                    continue;
+                }
+            }
+        }
         size_t seg = segment_len_at(p);
         if (seg == 0) seg = 1;
         uint32_t *tmp = (uint32_t *)malloc(seg * sizeof(uint32_t));
@@ -440,14 +503,47 @@ size_t tokenizer_encode(tokenizer_t *tok, const char *text, uint32_t *out_tokens
     return written;
 }
 
+/* Inverse of the GPT-2 byte-level encoder used in tokenizer_load: every
+ * code point in a vocab string stands for one original byte (U+0120 "Ġ"
+ * is a space, U+010A "Ċ" is a newline, ...). Decoding must run the whole
+ * piece through this map, not just single-byte tokens, or multi-character
+ * pieces come out with literal "Ġ" characters instead of spaces. */
+static int cp_to_byte(uint32_t cp) {
+    if (cp < 256) {
+        int printable = (cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255);
+        return printable ? (int)cp : -1;
+    }
+    /* Non-printable bytes were assigned 256.. in byte order; invert that. */
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        int printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
+        if (!printable) {
+            if (cp == (uint32_t)(256 + n)) return b;
+            n++;
+        }
+    }
+    return -1;
+}
+
+static uint32_t utf8_decode_cp(const unsigned char *s, size_t len, size_t *used) {
+    unsigned char c = s[0];
+    if (c < 0x80) { *used = 1; return c; }
+    if ((c & 0xE0) == 0xC0 && len >= 2) { *used = 2; return ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F); }
+    if ((c & 0xF0) == 0xE0 && len >= 3) { *used = 3; return ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) | (uint32_t)(s[2] & 0x3F); }
+    if ((c & 0xF8) == 0xF0 && len >= 4) { *used = 4; return ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) | ((uint32_t)(s[2] & 0x3F) << 6) | (uint32_t)(s[3] & 0x3F); }
+    *used = 1;
+    return c;
+}
+
 char *tokenizer_decode(tokenizer_t *tok, const uint32_t *tokens, size_t n_tokens) {
     if (!tok) { char *e = (char *)malloc(1); if (e) e[0] = 0; return e; }
     size_t total = 0;
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t id = tokens[i];
         if (id < (uint32_t)tok->vocab_size && tok->vocab[id].text) {
-            size_t add = (tok->vocab[id].byte_value >= 0) ? 1 : tok->vocab[id].len;
-            total += add;
+            /* Decoded output is never longer than the vocab text: every
+               code point maps to at most one byte. */
+            total += tok->vocab[id].len;
         }
     }
     char *r = (char *)malloc(total + 1);
@@ -456,11 +552,20 @@ char *tokenizer_decode(tokenizer_t *tok, const uint32_t *tokens, size_t n_tokens
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t id = tokens[i];
         if (id >= (uint32_t)tok->vocab_size || !tok->vocab[id].text) continue;
-        if (tok->vocab[id].byte_value >= 0) {
-            *o++ = (char)tok->vocab[id].byte_value;
-        } else {
-            memcpy(o, tok->vocab[id].text, tok->vocab[id].len);
-            o += tok->vocab[id].len;
+        const unsigned char *text = (const unsigned char *)tok->vocab[id].text;
+        size_t len = tok->vocab[id].len, pos = 0;
+        while (pos < len) {
+            size_t used = 0;
+            uint32_t cp = utf8_decode_cp(text + pos, len - pos, &used);
+            int b = cp_to_byte(cp);
+            if (b >= 0) {
+                *o++ = (char)b;
+            } else {
+                /* Not a byte-level code point: keep the original bytes. */
+                memcpy(o, text + pos, used);
+                o += used;
+            }
+            pos += used;
         }
     }
     *o = 0;

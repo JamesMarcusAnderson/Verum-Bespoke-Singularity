@@ -1,0 +1,27 @@
+// matvec_q4_k.comp — Q4_K weights, dequantized on the fly (deq_q4k).
+// Each lane covers elements lane, lane+32, ..., lane+224 of every
+// 256-element block. Bindings: 0=w(u32 words over packed bytes),
+// 1=x(f32), 2=y(f32).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(set = 0, binding = 0) readonly buffer W { uint w_words[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+#include "common.glsl"
+#include "matvec_common.glsl"
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint nblocks = pc.cols / 256u;
+    uint row_bytes = nblocks * 144u;
+    float sum = 0.0;
+    for (uint b = 0u; b < nblocks; b++) {
+        uint base = (pc.row_base + row) * row_bytes + b * 144u;
+        for (uint k = 0u; k < 8u; k++) {
+            uint e = lane + 32u * k;
+            sum += deq_q4k(base, e) * x[pc.col_off + b * 256u + e];
+        }
+    }
+    matvec_finish(sum, row);
+}

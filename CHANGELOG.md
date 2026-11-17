@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.10.0 — 2026-11-17 — GGUF proven, Windows target, universal GPU path, recursive self-optimization loop
+
+### Added
+- Real GGUF inference end-to-end on CPU (SmolLM-135M Q8_0 + Q4_K_M
+  verified: "The capital of France is Paris."). Q8_K dequant bit-exact.
+  Five real bugs fixed, including the Q4_K/Q5_K dequant layout being
+  backwards.
+- Windows target: MinGW cross-compile verified (PE32+ runs under Wine,
+  all modes identical); `vbs_port.h` carries every platform difference;
+  CMake MSVC path documented (untested on real Windows).
+- Universal GPU path: Vulkan/SPIR-V backend (21 precompiled kernels)
+  with automatic CPU fallback; HIP ported behind the old interface;
+  backend selection logged (Vulkan > CUDA > HIP > Metal > CPU). Verified
+  on Lavapipe + CPU fallback; real-GPU execution still needs hardware.
+- Recursive self-optimization loop: structured logs → hotspot analysis →
+  generate C11 candidate → compile → benchmark-verify in a forked child
+  → hot-swap between tokens → rollback on regression. Proven on a
+  synthetic model and a real one (avx2 accepted; wrong/slow/broken
+  candidates each rejected by their own gate; rollback proven twice).
+- Two novel mechanisms: model-specialized fused FFN kernel at load time
+  (1.53x on the FFN section, 1.15–1.18x end-to-end on the tiny model,
+  bit-identical output) and per-machine autotune profiles embedded in
+  the binary (`.vbs_tune` section, fingerprint-gated).
+- `make test` now also runs `gguf_e2e_test` + `--backend-test` (78/78
+  with Vulkan, 44/44 with no ICD); `make test-d` runs the loop demo
+  (6 sections).
+
+### Verified
+- `make` clean (0 errors, 4 pre-existing warnings); `make test` and
+  `make test-d` pass.
+- Real inference reproduced: Q8_0, 30.4 tok/s prefill, 18.5 tok/s
+  decode on a shared 1.5-vCPU VM.
+
+### Not yet verified — the v1.0.0 gates
+- GPU backends on real hardware (Vulkan verified on Lavapipe only).
+- MSVC build on a real Windows machine.
+- LLM-authored C11 candidates (the loop's candidate list is the plug-in
+  point); the native-emitter rewrite still blocks `vbs_compile()`-based
+  JIT.
+
 ## v0.9.0 — 2026-11-17 — First official audited release
 
 Audited 2026-11-17: every file in this release was hashed against the live

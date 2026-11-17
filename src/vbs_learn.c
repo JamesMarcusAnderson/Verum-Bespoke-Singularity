@@ -1,8 +1,5 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <strings.h>
 #include "vbs_learn.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +9,7 @@ static int word_in(const char *hay, const char *word, size_t n){
     for(const char *p=hay; *p; ){
         while(*p && !isalnum((unsigned char)*p)) p++;
         const char *s=p; while(*p && isalnum((unsigned char)*p)) p++;
-        if((size_t)(p-s)==n && strncasecmp(s,word,n)==0) return 1;
+        if((size_t)(p-s)==n && vbs_strncasecmp(s,word,n)==0) return 1;
     }
     return 0;
 }
@@ -29,7 +26,7 @@ static double overlap(const char *a, const char *b){
 }
 bool vbs_learn_append(const char *path, const char *prompt, const char *correct){
     FILE *f=fopen(path,"a"); if(!f) return false;
-    char *p=strdup(prompt), *c=strdup(correct);
+    char *p=vbs_strdup(prompt), *c=vbs_strdup(correct);
     if(!p||!c){ if(p) free(p); if(c) free(c); fclose(f); return false; }
     clean(p); clean(c); fprintf(f,"%s\t%s\n",p,c); free(p); free(c); fclose(f); return true;
 }

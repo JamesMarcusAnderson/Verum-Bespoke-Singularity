@@ -1,11 +1,8 @@
 #include "vbs_gguf.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 enum {
     M_U8 = 0, M_I8 = 1, M_U16 = 2, M_I16 = 3, M_U32 = 4, M_I32 = 5,
@@ -85,24 +82,35 @@ static bool skip_val(cursor_t *c, uint32_t t) {
 }
 
 vbs_gguf_model_t *vbs_gguf_open(const char *path, char *err_buf, size_t err_cap) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
+    vbs_mmap_t fm;
+    int mrc;
+    uint64_t file_size;
+    void *map;
+
+    if (!vbs_is_little_endian()) {
+        snprintf(err_buf, err_cap, "GGUF requires a little-endian host");
+        return NULL;
+    }
+    mrc = vbs_mmap_open_ro(path, &fm);
+    if (mrc == VBS_MMAP_ERR_OPEN) {
         snprintf(err_buf, err_cap, "Cannot open GGUF file: %s", path);
         return NULL;
     }
-    struct stat st;
-    if (fstat(fd, &st) || st.st_size < 24) {
+    if (mrc == VBS_MMAP_ERR_SIZE) {
         snprintf(err_buf, err_cap, "Invalid file size for GGUF: %s", path);
-        close(fd);
         return NULL;
     }
-    uint64_t file_size = (uint64_t)st.st_size;
-    void *map = mmap(NULL, (size_t)file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (map == MAP_FAILED) {
+    if (mrc == VBS_MMAP_ERR_MAP) {
         snprintf(err_buf, err_cap, "mmap failed for %s", path);
-        close(fd);
         return NULL;
     }
+    if (fm.size < 24) {
+        snprintf(err_buf, err_cap, "Invalid file size for GGUF: %s", path);
+        vbs_mmap_close(&fm);
+        return NULL;
+    }
+    file_size = fm.size;
+    map = fm.ptr;
 
     cursor_t c = {(const uint8_t *)map, file_size, 0};
     char magic[4];
@@ -111,15 +119,14 @@ vbs_gguf_model_t *vbs_gguf_open(const char *path, char *err_buf, size_t err_cap)
     if (!cur_read(&c, magic, 4) || memcmp(magic, "GGUF", 4) != 0 ||
         !cur_u32(&c, &version) || !cur_u64(&c, &nt) || !cur_u64(&c, &nm)) {
         snprintf(err_buf, err_cap, "Malformed GGUF header");
-        munmap(map, (size_t)file_size);
-        close(fd);
+        vbs_mmap_close(&fm);
         return NULL;
     }
 
     vbs_gguf_model_t *m = (vbs_gguf_model_t *)calloc(1, sizeof(vbs_gguf_model_t));
-    m->path = strdup(path);
-    m->fd = fd;
-    m->map = map;
+    m->path = vbs_strdup(path);
+    m->filemap = fm;
+    m->map = fm.ptr;
     m->file_size = file_size;
     m->version = version;
     m->n_metadata = (size_t)nm;
@@ -223,8 +230,8 @@ void vbs_gguf_close(vbs_gguf_model_t *m) {
         for (size_t i = 0; i < m->n_tensors; i++) free(m->tensors[i].name);
         free(m->tensors);
     }
-    if (m->map && m->map != MAP_FAILED) munmap(m->map, (size_t)m->file_size);
-    if (m->fd >= 0) close(m->fd);
+    vbs_mmap_close(&m->filemap);
+    m->map = NULL;
     free(m->path);
     free(m);
 }
@@ -291,7 +298,7 @@ bool vbs_gguf_copy_packed_tile(
     uint64_t tile_row_bytes = (cc / g.elements_per_block) * g.bytes_per_block;
     uint64_t total_bytes = tile_row_bytes * rc;
     if (total_bytes > cap) {
-        snprintf(err_buf, err_cap, "Packed tile exceeds staging buffer capacity (%llu > %zu)", total_bytes, cap);
+        snprintf(err_buf, err_cap, "Packed tile exceeds staging buffer capacity (%llu > %zu)", (unsigned long long)total_bytes, cap);
         return false;
     }
     uint64_t col_byte_offset = (cs / g.elements_per_block) * g.bytes_per_block;

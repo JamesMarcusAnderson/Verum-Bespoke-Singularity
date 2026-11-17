@@ -17,6 +17,9 @@ Usage: python3 self_improve.py [--iterations 3] [--base-lr 0.05]
 """
 import argparse, json, os, re, shutil, subprocess, sys, time
 ROOT = os.path.dirname(os.path.abspath(__file__))
+# Cross-platform: verum-slice.exe on Windows, verum-slice elsewhere.
+BIN = os.path.join(ROOT, "verum-slice.exe" if os.name == "nt" else "verum-slice")
+MAKE = shutil.which("make") or shutil.which("mingw32-make") or "make"
 TUNE = os.path.join(ROOT, "src", "self_tune.h")
 LOG = os.path.join(ROOT, "self_improve.log")
 STATE = os.path.join(ROOT, "self_state.json")
@@ -31,7 +34,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=300, **kw)
 
 def build():
-    r = run(["make"])
+    r = run([MAKE])
     return r.returncode == 0
 
 def train_block_loss(lr):
@@ -41,7 +44,7 @@ def train_block_loss(lr):
     edit_tune(lr)
     if not build():
         return None
-    r = run(["./verum-slice", "--train-block", "--epochs", "200"])
+    r = run([BIN, "--train-block", "--epochs", "200"])
     if r.returncode != 0:
         return None
     losses = re.findall(r"loss=([0-9.]+)", r.stdout)

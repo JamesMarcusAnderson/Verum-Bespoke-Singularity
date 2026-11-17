@@ -1,13 +1,9 @@
 #include "vbs_profiler.h"
 #include "vbs_backend.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <fcntl.h>
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -22,13 +18,32 @@
 
 extern const vbs_backend_ops_t g_vbs_cuda_backend;
 extern const vbs_backend_ops_t g_vbs_hip_backend;
+extern const vbs_backend_ops_t g_vbs_vulkan_backend;
 #if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
 extern const vbs_backend_ops_t g_vbs_metal_backend;
 #endif
 
 static void detect_cpu(vbs_cpu_profile_t *c) {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    MEMORYSTATUSEX ms;
+    GetSystemInfo(&si);
+    c->logical_cores = (uint32_t)si.dwNumberOfProcessors;
+    c->physical_cores = c->logical_cores;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        c->total_ram_bytes = (uint64_t)ms.ullTotalPhys;
+        c->free_ram_bytes = (uint64_t)ms.ullAvailPhys;
+    } else {
+        c->total_ram_bytes = 16ULL * 1024 * 1024 * 1024;
+        c->free_ram_bytes = 8ULL * 1024 * 1024 * 1024;
+    }
+    c->ram_bandwidth_gbps = 40.0;
+    c->l3_cache_bytes = 32 * 1024 * 1024;
+#else
     c->logical_cores = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
     c->physical_cores = c->logical_cores;
+#endif
 
 #if defined(__APPLE__)
     size_t sz = sizeof(uint64_t);
@@ -56,7 +71,7 @@ static void detect_cpu(vbs_cpu_profile_t *c) {
     }
     c->ram_bandwidth_gbps = 50.0;
     c->l3_cache_bytes = 32 * 1024 * 1024;
-#else
+#elif !defined(_WIN32)
     c->total_ram_bytes = 16ULL * 1024 * 1024 * 1024;
     c->free_ram_bytes = 8ULL * 1024 * 1024 * 1024;
     c->ram_bandwidth_gbps = 40.0;
@@ -81,14 +96,13 @@ static double measure_device_bandwidth_gbps(vbs_device_t *dev, const vbs_backend
     memset(host_src, 0x5A, test_bytes);
     vbs_buffer_t *d_buf = backend->alloc_buffer(dev, test_bytes, false);
     if (!d_buf) { free(host_src); return 0.0; }
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double t0 = vbs_now_sec();
     for (int i = 0; i < 4; i++) backend->copy_to_device(d_buf, host_src, test_bytes);
     backend->synchronize_device(dev);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double t1 = vbs_now_sec();
     backend->free_buffer(d_buf);
     free(host_src);
-    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double elapsed = t1 - t0;
     if (elapsed <= 0.0) return 0.0;
     return ((double)(test_bytes * 4) / 1e9) / elapsed;
 }
@@ -99,12 +113,11 @@ static double benchmark_memcpy_bandwidth(size_t bytes) {
     if (!src || !dst) { free(src); free(dst); return 0.0; }
     memset(src, 0xAB, bytes);
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double t0 = vbs_now_sec();
     for (int i = 0; i < 4; i++) memcpy(dst, src, bytes);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double t1 = vbs_now_sec();
 
-    double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    double elapsed = t1 - t0;
     double gb = (double)(bytes * 4) / 1e9;
 
     free(src); free(dst);
@@ -113,6 +126,28 @@ static double benchmark_memcpy_bandwidth(size_t bytes) {
 
 static void detect_gpus(vbs_system_profile_t *sys) {
     sys->n_gpus = 0;
+
+    if (g_vbs_vulkan_backend.init()) {
+        size_t n = g_vbs_vulkan_backend.get_device_count();
+        for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
+            vbs_device_t *d = g_vbs_vulkan_backend.get_device(i);
+            vbs_gpu_profile_t *g = &sys->gpus[sys->n_gpus++];
+            snprintf(g->name, sizeof(g->name), "%s", d->name);
+            g->type = VBS_BACKEND_VULKAN;
+            g->device = d;
+            g->total_vram_bytes = d->max_working_set_bytes;
+            g->free_vram_bytes = d->max_working_set_bytes * 90 / 100;
+            g->max_alloc_bytes = d->max_buffer_bytes;
+            double bw = measure_device_bandwidth_gbps(d, &g_vbs_vulkan_backend);
+            g->mem_bandwidth_gbps = bw;
+            g->pcie_bandwidth_gbps = bw;
+            /* Vulkan 1.0 properties expose no CU count; the shader
+             * workgroup size (32) is the scheduling unit. */
+            g->sm_count = 0;
+            g->warp_size = 32;
+            g->supports_tensor_cores = false;
+        }
+    }
 
     if (g_vbs_cuda_backend.init()) {
         size_t n = g_vbs_cuda_backend.get_device_count();
@@ -177,10 +212,15 @@ static void detect_gpus(vbs_system_profile_t *sys) {
 
 static void detect_storage(vbs_system_profile_t *sys) {
     sys->n_storage = 0;
+#if defined(_WIN32)
+    char tmp[512];
+    vbs_temp_dir(tmp, sizeof tmp);
+    const char *candidates[] = { tmp, "C:\\", NULL };
+#else
     const char *candidates[] = { "/tmp", "/var/tmp", "/", NULL };
+#endif
     for (int i = 0; candidates[i] && sys->n_storage < 4; i++) {
-        struct stat st;
-        if (stat(candidates[i], &st) == 0) {
+        if (vbs_stat_exists(candidates[i])) {
             vbs_storage_profile_t *s = &sys->storage[sys->n_storage++];
             snprintf(s->mount_path, sizeof(s->mount_path), "%s", candidates[i]);
             s->free_bytes = 100ULL * 1024 * 1024 * 1024;

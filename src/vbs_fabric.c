@@ -1,11 +1,8 @@
 #include "vbs_fabric.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 vbs_fabric_t *vbs_fabric_create(
     const vbs_system_profile_t *sys,
@@ -17,26 +14,22 @@ vbs_fabric_t *vbs_fabric_create(
     vbs_fabric_t *f = (vbs_fabric_t *)calloc(1, sizeof(vbs_fabric_t));
     f->sys = sys;
     f->backend = backend;
+    vbs_mmap_init(&f->nvme_swap);
 
     for (size_t i = 0; i < sys->n_gpus && i < 8; i++) {
         f->vram_budget[i] = sys->gpus[i].free_vram_bytes * 90 / 100;
     }
 
     f->pinned_pool_size = pinned_pool_mib * 1024ULL * 1024ULL;
-    if (posix_memalign(&f->pinned_pool, 4096, f->pinned_pool_size) != 0) {
+    if (vbs_aligned_alloc(&f->pinned_pool, 4096, f->pinned_pool_size) != 0) {
         f->pinned_pool = NULL;
         f->pinned_pool_size = 0;
     }
 
     if (nvme_swap_gib > 0 && nvme_swap_path) {
         f->nvme_swap_size = nvme_swap_gib * 1024ULL * 1024ULL * 1024ULL;
-        f->nvme_swap_fd = open(nvme_swap_path, O_RDWR | O_CREAT, 0600);
-        if (f->nvme_swap_fd >= 0) {
-            if (ftruncate(f->nvme_swap_fd, f->nvme_swap_size) == 0) {
-                f->nvme_swap_map = mmap(NULL, f->nvme_swap_size,
-                    PROT_READ | PROT_WRITE, MAP_SHARED, f->nvme_swap_fd, 0);
-                if (f->nvme_swap_map == MAP_FAILED) f->nvme_swap_map = NULL;
-            }
+        if (vbs_mmap_create_rw(nvme_swap_path, f->nvme_swap_size, &f->nvme_swap) != VBS_MMAP_OK) {
+            f->nvme_swap_size = 0;
         }
     }
 
@@ -55,9 +48,8 @@ void vbs_fabric_free(vbs_fabric_t *f) {
         }
     }
     free(f->blocks);
-    if (f->pinned_pool) free(f->pinned_pool);
-    if (f->nvme_swap_map) munmap(f->nvme_swap_map, f->nvme_swap_size);
-    if (f->nvme_swap_fd > 0) close(f->nvme_swap_fd);
+    if (f->pinned_pool) vbs_aligned_free(f->pinned_pool);
+    vbs_mmap_close(&f->nvme_swap);
     free(f);
 }
 

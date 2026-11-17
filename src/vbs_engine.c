@@ -1,37 +1,17 @@
 #include "vbs_engine.h"
 #include "vbs_specializer.h"
 #include "vbs_specializer_bridge.h"
+#include "vbs_backend_select.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <sys/stat.h>
 
-extern const vbs_backend_ops_t g_vbs_cuda_backend;
-extern const vbs_backend_ops_t g_vbs_hip_backend;
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-extern const vbs_backend_ops_t g_vbs_metal_backend;
-#endif
-
-static const vbs_backend_ops_t *select_gpu_backend(const vbs_system_profile_t *sys) {
-    const char *pref = getenv("VBS_BACKEND");
-    if (pref) {
-        if (strcmp(pref, "cuda") == 0 && g_vbs_cuda_backend.init()) return &g_vbs_cuda_backend;
-        if (strcmp(pref, "hip")  == 0 && g_vbs_hip_backend.init())  return &g_vbs_hip_backend;
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-        if (strcmp(pref, "metal") == 0 && g_vbs_metal_backend.init()) return &g_vbs_metal_backend;
-#endif
-    }
-
-    for (size_t i = 0; i < sys->n_gpus; i++) {
-        if (sys->gpus[i].type == VBS_BACKEND_CUDA && g_vbs_cuda_backend.init())  return &g_vbs_cuda_backend;
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-        if (sys->gpus[i].type == VBS_BACKEND_METAL && g_vbs_metal_backend.init()) return &g_vbs_metal_backend;
-#endif
-        if (sys->gpus[i].type == VBS_BACKEND_HIP && g_vbs_hip_backend.init())   return &g_vbs_hip_backend;
-    }
-    return NULL;
-}
+/* Backend selection lives in vbs_backend_select.c: Vulkan -> CUDA ->
+ * HIP -> Metal -> CPU fallback, with a log line for every attempt.
+ * vbs_backend_select() never returns NULL (CPU always works), so
+ * engine creation no longer fails fatally when no GPU is present. */
 
 vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, size_t err_cap) {
     vbs_gguf_model_t *model = vbs_gguf_open(path, err, err_cap);
@@ -40,13 +20,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     vbs_system_profile_t *sys = vbs_profiler_scan_system();
     vbs_profiler_benchmark_devices(sys);
 
-    const vbs_backend_ops_t *backend = select_gpu_backend(sys);
-    if (!backend) {
-        snprintf(err, err_cap, "Fatal: No supported GPU device detected (CUDA, HIP, or Metal).");
-        vbs_profiler_free_system(sys);
-        vbs_gguf_close(model);
-        return NULL;
-    }
+    const vbs_backend_ops_t *backend = vbs_backend_select();
 
     vbs_engine_t *e = (vbs_engine_t *)calloc(1, sizeof(vbs_engine_t));
     e->model = model;
@@ -63,13 +37,15 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     const char *swap_path = getenv("VBS_SWAP_PATH");
     size_t swap_gib = 0;
     const char *swap_env = getenv("VBS_SWAP_GIB");
+    char swap_default[512];
     if (swap_env) swap_gib = (size_t)atoi(swap_env);
+    vbs_default_swap_path(swap_default, sizeof swap_default);
 
     e->fabric = vbs_fabric_create(
         e->sys_profile, e->backend,
         512,
         swap_gib,
-        swap_path ? swap_path : "/tmp/verum_swap.bin"
+        swap_path ? swap_path : swap_default
     );
 
     // Register all tensors into the fabric
@@ -81,7 +57,13 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     }
 
     e->window_bytes = (window_mib ? window_mib : 256) * 1024 * 1024;
-    e->n_devices = e->sys_profile->n_gpus ? e->sys_profile->n_gpus : 1;
+    /* Device count comes from the SELECTED backend, not the profiler:
+     * the profiler counts GPUs across all backends, but only the
+     * selected backend's devices are usable. (The old code used
+     * sys->n_gpus, which over-counted when two backends both saw a
+     * GPU — the second "device" was an uninitialized struct.) */
+    e->n_devices = backend->get_device_count();
+    if (e->n_devices == 0) e->n_devices = 1;
     e->devices = (vbs_device_t **)calloc(e->n_devices, sizeof(vbs_device_t *));
     e->executors = (vbs_slice_executor_t **)calloc(e->n_devices, sizeof(vbs_slice_executor_t *));
 
@@ -132,6 +114,13 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     uint64_t total_vram = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].total_vram_bytes : 0;
     uint64_t free_vram  = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].free_vram_bytes : 0;
     uint64_t base_vram  = free_vram ? free_vram : total_vram;
+    if (vbs_backend_is_cpu(backend)) {
+        /* CPU fallback: the KV cache lives in RAM, not VRAM. Use free
+         * RAM (falling back to total RAM) as the budget. */
+        uint64_t free_ram = e->sys_profile ? e->sys_profile->cpu.free_ram_bytes : 0;
+        uint64_t total_ram = e->sys_profile ? e->sys_profile->cpu.total_ram_bytes : 0;
+        base_vram = free_ram ? free_ram : total_ram;
+    }
     uint64_t model_bytes = e->model_profile->total_model_bytes;
     uint64_t runtime_bytes = (uint64_t)(2 * embed_dim * sizeof(float)) + (uint64_t)(vocab_size * sizeof(float)) + (uint64_t)scratch_bytes;
     size_t kv_cap = 0;
@@ -140,7 +129,8 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         kv_cap = fit < max_ctx ? fit : max_ctx;
     }
     if (kv_cap == 0) {
-        snprintf(err, err_cap, "No VRAM budget for a KV cache: free/total %llu B, model %llu B, runtime buffers %llu B, %zu B per position",
+        snprintf(err, err_cap, "No %s budget for a KV cache: free/total %llu B, model %llu B, runtime buffers %llu B, %zu B per position",
+                 vbs_backend_is_cpu(backend) ? "RAM" : "VRAM",
                  (unsigned long long)base_vram, (unsigned long long)model_bytes,
                  (unsigned long long)runtime_bytes, kv_pos_bytes);
         vbs_engine_destroy(e);
@@ -194,15 +184,16 @@ bool vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap) {
     char hash[65] = {0};
     vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
 
+    char cache_default[512];
     const char *cache_dir = getenv("VBS_CACHE_DIR");
-    if (!cache_dir) cache_dir = "/tmp/verum_cache";
-    mkdir(cache_dir, 0755);
+    if (!cache_dir) { vbs_default_cache_dir(cache_default, sizeof cache_default); cache_dir = cache_default; }
+    vbs_mkdir(cache_dir);
 
     e->specialized = vbs_specializer_load_cached(hash, cache_dir);
     if (!e->specialized) {
         char src_path[640], bin_path[640];
         snprintf(src_path, sizeof(src_path), "%s/verum_%s.c", cache_dir, hash);
-        snprintf(bin_path, sizeof(bin_path), "%s/verum_%s.so", cache_dir, hash);
+        snprintf(bin_path, sizeof(bin_path), "%s/verum_%s%s", cache_dir, hash, VBS_DYLIB_EXT);
 
         if (!vbs_specializer_emit_source(e->graph, e->sys_profile, e->plan, e->model_profile, src_path)) {
             snprintf(err, err_cap, "Failed emitting bespoke C source for specialization");
@@ -469,13 +460,14 @@ void vbs_engine_recompile(vbs_engine_t *e, char *err_buf, size_t err_cap) {
     if (!e || !e->plan || !e->graph) return;
 
     char src_path[640], bin_path[640], hash[65];
+    char cache_default[512];
     const char *cache_dir = getenv("VBS_CACHE_DIR");
-    if (!cache_dir) cache_dir = "/tmp/verum_cache";
-    mkdir(cache_dir, 0755);
+    if (!cache_dir) { vbs_default_cache_dir(cache_default, sizeof cache_default); cache_dir = cache_default; }
+    vbs_mkdir(cache_dir);
 
     vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
     snprintf(src_path, sizeof(src_path), "%s/verum_%s.c", cache_dir, hash);
-    snprintf(bin_path, sizeof(bin_path), "%s/verum_%s.so", cache_dir, hash);
+    snprintf(bin_path, sizeof(bin_path), "%s/verum_%s%s", cache_dir, hash, VBS_DYLIB_EXT);
 
     if (!vbs_specializer_emit_source(e->graph, e->sys_profile, e->plan, e->model_profile, src_path)) {
         if (err_buf) snprintf(err_buf, err_cap, "Failed to emit mutated source");

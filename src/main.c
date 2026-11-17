@@ -8,6 +8,14 @@
 #include "vbs_cpu.h"
 #include "vbs_dequant.h"
 #include "vbs_sampling.h"
+#include "vbs_port.h"
+#include "vbs_backend_select.h"
+#include "vbs_backend_test.h"
+#include "vbs_hotpath.h"
+#include "vbs_loop.h"
+#include "vbs_fuse.h"
+#include "vbs_tune.h"
+#include "vbs_cc.h"
 #include "self_tune.h"
 #include "tokenizer.h"
 #include <stdio.h>
@@ -16,12 +24,9 @@
 #include <time.h>
 #include <ctype.h>
 #include <math.h>
-#include <unistd.h>
 
 static double get_time_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    return vbs_now_sec();
 }
 
 static void usage(void) {
@@ -30,11 +35,12 @@ static void usage(void) {
         "\n"
         "Usage:\n"
         "  ./verum-slice --backends\n"
+        "  ./verum-slice --backend-test\n"
         "  ./verum-slice --inspect model.gguf\n"
         "  ./verum-slice --compile [--window-mib N] model.gguf\n"
         "  ./verum-slice --benchmark [--tokens N] [--window-mib N] model.gguf\n"
-        "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
-        "  ./verum-slice --cpu --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
+        "  ./verum-slice --generate --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
+        "  ./verum-slice --cpu --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
         "  ./verum-slice --dequant\n"
         "  ./verum-slice --sample [--temperature 0.7] [--top-k 40] [--top-p 0.9] [--seed 12345]\n"
         "  ./verum-slice --learn --prompt \"What is X?\" --correct \"X is Y\" [--memory verum-memory.tsv]\n"
@@ -49,59 +55,23 @@ static void usage(void) {
         "  ./verum-slice --evolve --tokenizer tokenizer.json --prompt \"Hello\" model.gguf\n"
         "  ./verum-slice --autonomy --tokenizer tokenizer.json --prompt \"Hello\" [--tokens N] model.gguf\n"
         "  ./verum-slice --prune --tokenizer tokenizer.json --prompt \"The capital of France is Paris\" model.gguf\n"
+        "  ./verum-slice --loop [--prompt-ids 1,2,3] [--tokens N] [--iterations K] [--loop-poison] model.gguf\n"
+        "  ./verum-slice --hotbench [--tune-out verum-tune.json]\n"
+        "  ./verum-slice --fuse [--cache-dir DIR] [--tokens N] model.gguf\n"
+        "  ./verum-slice --tune-show\n"
     );
 }
 
 /* Additive diagnostic, added without changing any existing mode:
- * reports which GPU backends were compiled in and, by probing each
+ * reports which backends were compiled in and, by probing each
  * backend's own init(), whether a usable device is present right now.
  * It needs no model file and no GPU, so it is safe to run on CI and on
  * a machine with no GPU at all. A backend with no device is reported
  * as "available: no", not as an error, so this mode always exits 0
- * when the report itself was produced. */
-static void print_one_backend(const char *label, const vbs_backend_ops_t *ops) {
-    bool available = false;
-    size_t count = 0;
-    if (ops && ops->init) {
-        available = ops->init();
-        if (available && ops->get_device_count) {
-            count = ops->get_device_count();
-        }
-    }
-    printf("  %s: available: %s, devices: %zu\n", label, available ? "yes" : "no", count);
-    if (available && ops && ops->get_device) {
-        for (size_t i = 0; i < count; i++) {
-            vbs_device_t *dev = ops->get_device(i);
-            if (dev) {
-                printf("    [%zu] %s\n", i, dev->name);
-            }
-        }
-    }
-}
-
+ * when the report itself was produced. The report lives in
+ * vbs_backend_select.c so the order matches engine selection. */
 static int print_backends(void) {
-    printf("=== Backend capability report ===\n");
-#if defined(VBS_ENABLE_CUDA) && VBS_ENABLE_CUDA
-    printf("  CUDA: compiled: yes\n");
-#else
-    printf("  CUDA: compiled: no\n");
-#endif
-#if defined(VBS_ENABLE_HIP) && VBS_ENABLE_HIP
-    printf("  HIP: compiled: yes\n");
-#else
-    printf("  HIP: compiled: no\n");
-#endif
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-    printf("  Metal: compiled: yes\n");
-#else
-    printf("  Metal: compiled: no\n");
-#endif
-    print_one_backend("CUDA", &g_vbs_cuda_backend);
-    print_one_backend("HIP", &g_vbs_hip_backend);
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-    print_one_backend("Metal", &g_vbs_metal_backend);
-#endif
-    printf("===================================\n");
+    vbs_backend_probe_all();
     return 0;
 }
 
@@ -128,6 +98,32 @@ static double evaluate_nll_fitness(const float *logits, size_t vocab_size, uint3
     return 1.0 / (1.0 + (-log_prob));
 }
 
+/* One --fuse generation round: reset the model, feed the prompt, generate
+ * up to n_gen greedy tokens into out_tokens. Returns the token count and
+ * writes the generation-only elapsed seconds to *sec_out (prompt feeding
+ * is excluded; it is identical for both paths). Returns 0 on error. */
+static size_t fuse_gen_round(vbs_cpu_model_t *cm, const uint32_t *prompt_ids,
+                             size_t n_prompt, size_t n_gen, uint32_t *out_tokens,
+                             double *sec_out, char *err, size_t err_cap) {
+    vbs_cpu_reset(cm);
+    for (size_t i = 0; i < n_prompt; i++) {
+        if (!vbs_cpu_step_ex(cm, prompt_ids[i], i + 1 == n_prompt, err, err_cap)) return 0;
+    }
+    double t0 = get_time_sec();
+    size_t n = 0;
+    for (size_t i = 0; i < n_gen; i++) {
+        const float *lg = vbs_cpu_logits(cm);
+        size_t vocab = vbs_cpu_vocab_size(cm);
+        uint32_t best = 0;
+        for (size_t j = 1; j < vocab; j++) if (lg[j] > lg[best]) best = (uint32_t)j;
+        out_tokens[n++] = best;
+        if (best == vbs_cpu_eos_id(cm)) break;
+        if (!vbs_cpu_step(cm, best, err, err_cap)) break;
+    }
+    *sec_out = get_time_sec() - t0;
+    return n;
+}
+
 int main(int argc, const char *argv[]) {
     /* Model-free diagnostic: handled before the model requirement below,
      * so "./verum-slice --backends" works with a single argument. */
@@ -138,6 +134,9 @@ int main(int argc, const char *argv[]) {
         }
         if (strcmp(argv[i], "--backends") == 0) {
             return print_backends();
+        }
+        if (strcmp(argv[i], "--backend-test") == 0) {
+            return vbs_backend_selftest();
         }
     }
 
@@ -164,6 +163,16 @@ int main(int argc, const char *argv[]) {
     size_t window_mib = 256; int have_window = 0;
     size_t bench_tokens = 128;
     size_t max_gen_tokens = 64;
+    /* Recursive-loop / hotbench / fuse options. */
+    const char *prompt_ids_text = "1,2,3";
+    int loop_iterations = 6;
+    size_t loop_tokens_per_iter = 8;
+    const char *loop_log_path = "vbs-loop.jsonl";
+    const char *loop_work_dir = ".verum-loop-work";
+    const char *repo_dir = ".";
+    int loop_poison = 0;
+    const char *tune_out_path = NULL;
+    const char *fuse_cache_dir = ".verum-fuse-cache";
     float sample_temp = 0.0f; int sample_top_k = 0; float sample_top_p = 1.0f; uint64_t sample_seed = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -183,6 +192,10 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[i], "--train-text") == 0 ||
             strcmp(argv[i], "--cpu") == 0 ||
             strcmp(argv[i], "--dequant") == 0 ||
+            strcmp(argv[i], "--loop") == 0 ||
+            strcmp(argv[i], "--hotbench") == 0 ||
+            strcmp(argv[i], "--fuse") == 0 ||
+            strcmp(argv[i], "--tune-show") == 0 ||
             strcmp(argv[i], "--sample") == 0) {
             mode = argv[i];
         } else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
@@ -196,7 +209,12 @@ int main(int argc, const char *argv[]) {
         } else if (strcmp(argv[i], "--window-mib") == 0 && i + 1 < argc) {
             window_mib = (size_t)strtoull(argv[++i], NULL, 10); have_window = 1;
         } else if (strcmp(argv[i], "--tokens") == 0 && i + 1 < argc) {
+            /* --tokens sets both counts: --benchmark/--autonomy read
+               bench_tokens, --generate/--cpu read max_gen_tokens, and
+               before this fix --tokens was silently ignored by the
+               generation modes. */
             bench_tokens = (size_t)strtoull(argv[++i], NULL, 10);
+            max_gen_tokens = bench_tokens;
         } else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) {
             tokenizer_path = argv[++i];
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
@@ -221,12 +239,30 @@ int main(int argc, const char *argv[]) {
             train_epochs = (size_t)strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             train_lr = (float)strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--prompt-ids") == 0 && i + 1 < argc) {
+            prompt_ids_text = argv[++i];
+        } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
+            loop_iterations = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--tokens-per-iter") == 0 && i + 1 < argc) {
+            loop_tokens_per_iter = (size_t)strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--loop-log") == 0 && i + 1 < argc) {
+            loop_log_path = argv[++i];
+        } else if (strcmp(argv[i], "--loop-work") == 0 && i + 1 < argc) {
+            loop_work_dir = argv[++i];
+        } else if (strcmp(argv[i], "--repo") == 0 && i + 1 < argc) {
+            repo_dir = argv[++i];
+        } else if (strcmp(argv[i], "--loop-poison") == 0) {
+            loop_poison = 1;
+        } else if (strcmp(argv[i], "--tune-out") == 0 && i + 1 < argc) {
+            tune_out_path = argv[++i];
+        } else if (strcmp(argv[i], "--cache-dir") == 0 && i + 1 < argc) {
+            fuse_cache_dir = argv[++i];
         } else if (argv[i][0] != '-') {
             model_path = argv[i];
         }
     }
 
-    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0 && strcmp(mode, "--dequant") != 0 && strcmp(mode, "--sample") != 0)) {
+    if (!mode || (!model_path && strcmp(mode, "--learn") != 0 && strcmp(mode, "--train-adapter") != 0 && strcmp(mode, "--train-block") != 0 && strcmp(mode, "--train-tiny") != 0 && strcmp(mode, "--autonomous-c") != 0 && strcmp(mode, "--autotune") != 0 && strcmp(mode, "--train-text") != 0 && strcmp(mode, "--cpu") != 0 && strcmp(mode, "--dequant") != 0 && strcmp(mode, "--hotbench") != 0 && strcmp(mode, "--tune-show") != 0 && strcmp(mode, "--sample") != 0)) {
         usage();
         return 64;
     }
@@ -407,39 +443,84 @@ int main(int argc, const char *argv[]) {
           float y[32]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q8_0, blk, y);
           if (n != 32 || fabsf(y[0] - 0.125f*(int8_t)(-80)) > 1e-6f) { printf("dequant: Q8_0 FAIL n=%d\n", n); fails++; }
           else printf("dequant: Q8_0 OK 32 values\n"); }
-        /* K-quant count check with zero blocks (values 0, count must match) */
-        { uint8_t blk[292] = {0}; float y[256];
-          struct { vbs_ggml_type_t type; const char *name; } ktypes[] = {
-            {VBS_GGML_TYPE_Q2_K, "Q2_K"}, {VBS_GGML_TYPE_Q3_K, "Q3_K"},
-            {VBS_GGML_TYPE_Q4_K, "Q4_K"}, {VBS_GGML_TYPE_Q5_K, "Q5_K"},
-            {VBS_GGML_TYPE_Q6_K, "Q6_K"},
-          }; /* Q8_K: upstream dequant has no reference layout, honestly not supported */
-          for (size_t i = 0; i < sizeof(ktypes)/sizeof(ktypes[0]); i++) {
-            int n = vbs_dequant_block(ktypes[i].type, blk, y);
-            if (n != 256) { printf("dequant: %s FAIL n=%d\n", ktypes[i].name, n); fails++; }
-            else printf("dequant: %s OK 256 values\n", ktypes[i].name);
-          } }
+        /* K-quant known-value checks. A zero block cannot catch a layout
+           error (every field reads 0 either way) — that is how the Q4_K /
+           Q5_K scale-position bug survived until a real model was run.
+           Each block below puts nonzero scales at the type's real offsets
+           and checks exact decoded values. */
+        /* Q2_K: d=2, dmin=0, scales 0x01 (scale 1, min 0), qs[0]=0xE4 */
+        { uint8_t blk[84] = {0}; for (int i = 0; i < 16; i++) blk[i] = 0x01;
+          blk[16] = 0xE4; ((uint16_t*)(blk+80))[0] = vbs_f32_to_f16(2.0f);
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q2_K, blk, y);
+          if (n != 256 || fabsf(y[0]) > 1e-6f || fabsf(y[32] - 2.0f) > 1e-6f ||
+              fabsf(y[64] - 4.0f) > 1e-6f || fabsf(y[96] - 6.0f) > 1e-6f) { printf("dequant: Q2_K FAIL n=%d y32=%f y64=%f\n", n, y[32], y[64]); fails++; }
+          else printf("dequant: Q2_K OK 256 values\n"); }
+        /* Q3_K: d=2, scales 0 (-> -32 each), hmask all set, qs[0]=0xE4 */
+        { uint8_t blk[110] = {0}; for (int i = 0; i < 32; i++) blk[i] = 0xFF;
+          blk[32] = 0xE4; ((uint16_t*)(blk+108))[0] = vbs_f32_to_f16(2.0f);
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q3_K, blk, y);
+          if (n != 256 || fabsf(y[0]) > 1e-6f || fabsf(y[32] + 64.0f) > 1e-6f ||
+              fabsf(y[64] + 128.0f) > 1e-6f) { printf("dequant: Q3_K FAIL n=%d y32=%f\n", n, y[32]); fails++; }
+          else printf("dequant: Q3_K OK 256 values\n"); }
+        /* Q4_K: d=2, dmin=1 FIRST (offset 0), sub-block scales (2,1),(3,0) */
+        { uint8_t blk[144] = {0};
+          ((uint16_t*)blk)[0] = vbs_f32_to_f16(2.0f);
+          ((uint16_t*)blk)[1] = vbs_f32_to_f16(1.0f);
+          blk[4] = 2; blk[8] = 1; blk[5] = 3; blk[9] = 0;
+          blk[16] = 0x21; /* element 0 nibble 1, element 32 nibble 2 */
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q4_K, blk, y);
+          if (n != 256 || fabsf(y[0] - 3.0f) > 1e-6f || fabsf(y[32] - 12.0f) > 1e-6f) { printf("dequant: Q4_K FAIL n=%d y0=%f y32=%f\n", n, y[0], y[32]); fails++; }
+          else printf("dequant: Q4_K OK 256 values\n"); }
+        /* Q5_K: same scales as Q4_K, plus qh high bit on element 0 */
+        { uint8_t blk[176] = {0};
+          ((uint16_t*)blk)[0] = vbs_f32_to_f16(2.0f);
+          ((uint16_t*)blk)[1] = vbs_f32_to_f16(1.0f);
+          blk[4] = 2; blk[8] = 1; blk[5] = 3; blk[9] = 0;
+          blk[16] = 0x01; /* qh[0] bit 0: element 0 gains +16 */
+          blk[48] = 0x21;
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q5_K, blk, y);
+          if (n != 256 || fabsf(y[0] - 67.0f) > 1e-6f || fabsf(y[32] - 12.0f) > 1e-6f) { printf("dequant: Q5_K FAIL n=%d y0=%f y32=%f\n", n, y[0], y[32]); fails++; }
+          else printf("dequant: Q5_K OK 256 values\n"); }
+        /* Q6_K: d=2, scales[0]=3, scales[2]=1, ql[0]=0x21, ql[32]=0x05 */
+        { uint8_t blk[210] = {0};
+          blk[192] = 3; blk[194] = 1; blk[0] = 0x21; blk[32] = 0x05;
+          ((uint16_t*)(blk+208))[0] = vbs_f32_to_f16(2.0f);
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q6_K, blk, y);
+          if (n != 256 || fabsf(y[0] + 186.0f) > 1e-6f || fabsf(y[32] + 54.0f) > 1e-6f) { printf("dequant: Q6_K FAIL n=%d y0=%f y32=%f\n", n, y[0], y[32]); fails++; }
+          else printf("dequant: Q6_K OK 256 values\n"); }
+        /* Q8_K: f32 d=0.25, quants i-128, correct per-16 bsums */
+        { uint8_t blk[292] = {0}; float d = 0.25f; memcpy(blk, &d, 4);
+          for (int i = 0; i < 256; i++) blk[4+i] = (uint8_t)(int8_t)(i-128);
+          for (int j = 0; j < 16; j++) { int s = 0; for (int i = 0; i < 16; i++) s += (int8_t)blk[4+j*16+i]; ((int16_t*)(blk+260))[j] = (int16_t)s; }
+          float y[256]; int n = vbs_dequant_block(VBS_GGML_TYPE_Q8_K, blk, y);
+          if (n != 256 || fabsf(y[0] + 32.0f) > 1e-6f || fabsf(y[128]) > 1e-6f ||
+              fabsf(y[255] - 31.75f) > 1e-6f) { printf("dequant: Q8_K FAIL n=%d y0=%f y255=%f\n", n, y[0], y[255]); fails++; }
+          else printf("dequant: Q8_K OK 256 values\n"); }
         printf("dequant: %s\n", fails ? "FAILURES" : "ALL PASS");
         return fails ? 1 : 0;
     }
     if (strcmp(mode, "--cpu") == 0) {
         if (!tokenizer_path) { fprintf(stderr, "Error: --cpu requires --tokenizer /path/to/tokenizer.json\n"); return 1; }
+        double t_start = get_time_sec();
         tokenizer_t *tok = tokenizer_load(tokenizer_path);
         if (!tok) { fprintf(stderr, "Error: Failed to load tokenizer from %s\n", tokenizer_path); return 1; }
         char cpu_err[512] = {0};
         vbs_cpu_model_t *cm = vbs_cpu_open(model_path, 256, cpu_err, sizeof(cpu_err));
         if (!cm) { fprintf(stderr, "CPU model load failed: %s\n", cpu_err); tokenizer_free(tok); return 1; }
+        double t_load_end = get_time_sec();
         uint32_t prompt_tokens[2048];
         size_t n_prompt = tokenizer_encode(tok, prompt_text, prompt_tokens, 2048);
         for (size_t i = 0; i < n_prompt; i++) {
             if (!vbs_cpu_step_ex(cm, prompt_tokens[i], i + 1 == n_prompt, cpu_err, sizeof(cpu_err))) { fprintf(stderr, "CPU inference failed: %s\n", cpu_err); vbs_cpu_close(cm); tokenizer_free(tok); return 1; }
         }
+        double t_prefill_end = get_time_sec();
         printf("%s", prompt_text); fflush(stdout);
         uint32_t eos = vbs_cpu_eos_id(cm);
         vbs_sampler_t sampler; vbs_sampler_init(&sampler);
         sampler.temperature = sample_temp; sampler.top_k = sample_top_k; sampler.top_p = sample_top_p; sampler.seed = sample_seed;
         uint32_t recent[4096]; size_t n_recent = 0;
         for (size_t i = 0; i < n_prompt && n_recent < 4096; i++) recent[n_recent++] = prompt_tokens[i];
+        size_t n_gen = 0;
         for (size_t i = 0; i < max_gen_tokens; i++) {
             const float *logits = vbs_cpu_logits(cm);
             size_t vocab = vbs_cpu_vocab_size(cm);
@@ -448,9 +529,269 @@ int main(int argc, const char *argv[]) {
             if (best == eos) break;
             char *piece = tokenizer_decode(tok, &best, 1);
             if (piece) { printf("%s", piece); fflush(stdout); free(piece); }
+            n_gen++;
             if (!vbs_cpu_step(cm, best, cpu_err, sizeof(cpu_err))) { fprintf(stderr, "CPU inference failed: %s\n", cpu_err); break; }
         }
+        double t_gen_end = get_time_sec();
+        double load_s = t_load_end - t_start;
+        double prefill_s = t_prefill_end - t_load_end;
+        double gen_s = t_gen_end - t_prefill_end;
+        fprintf(stderr, "cpu: load %.3fs (tokenizer + model, incl. any weight conversion), "
+                "prefill %zu tokens in %.3fs (%.1f tok/s), "
+                "generated %zu tokens in %.3fs (%.1f tok/s)\n",
+                load_s,
+                n_prompt, prefill_s, n_prompt / (prefill_s > 0 ? prefill_s : 1e-9),
+                n_gen, gen_s, n_gen / (gen_s > 0 ? gen_s : 1e-9));
         printf("\n"); vbs_cpu_close(cm); tokenizer_free(tok); return 0;
+    }
+    if (strcmp(mode, "--loop") == 0) {
+        /* Recursive loop: live session + unsupervised optimization. */
+        uint32_t prompt_ids[64];
+        size_t n_prompt = 0;
+        {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", prompt_ids_text);
+            char *save = NULL;
+            for (char *tok = strtok_r(buf, ",", &save); tok && n_prompt < 64;
+                 tok = strtok_r(NULL, ",", &save)) {
+                prompt_ids[n_prompt++] = (uint32_t)strtoul(tok, NULL, 10);
+            }
+        }
+        if (n_prompt == 0) { prompt_ids[0] = 1; n_prompt = 1; }
+        if (loop_tokens_per_iter == 0) loop_tokens_per_iter = 8;
+        vbs_loop_config_t lcfg;
+        memset(&lcfg, 0, sizeof(lcfg));
+        lcfg.model_path = model_path;
+        lcfg.prompt = prompt_ids;
+        lcfg.n_prompt = n_prompt;
+        lcfg.n_tokens = bench_tokens;
+        lcfg.max_iterations = loop_iterations;
+        lcfg.tokens_per_iter = loop_tokens_per_iter;
+        lcfg.log_path = loop_log_path;
+        lcfg.work_dir = loop_work_dir;
+        lcfg.repo_dir = repo_dir;
+        lcfg.poison = loop_poison;
+        vbs_loop_result_t res;
+        if (vbs_loop_run(&lcfg, &res) != 0) {
+            fprintf(stderr, "loop failed\n");
+            return 1;
+        }
+        printf("loop tokens:");
+        for (size_t i = 0; i < res.n_tokens_generated; i++) printf(" %u", res.tokens[i]);
+        printf("\n");
+        vbs_loop_result_free(&res);
+        return 0;
+    }
+    if (strcmp(mode, "--hotbench") == 0) {
+        /* Benchmark every hot-kernel variant at fixed shapes (the tiny
+         * model's shapes: 1408x512, 512x512, 256x512) and report the
+         * fastest correct variant per type. Candidates are benched in an
+         * isolated child, exactly like the loop does. */
+        vbs_bench_shape_t shapes[3] = { {1408, 512}, {512, 512}, {256, 512} };
+        double ref_ns[VBS_HOT_NTYPES] = {0};
+        double dummy[VBS_HOT_NTYPES] = {0};
+        int dummy_wins[VBS_HOT_NTYPES] = {0};
+        bool correct = false;
+        char berr[1024] = {0};
+        printf("hotbench: shapes 1408x512, 512x512, 256x512 (min ns/call over 7 samples, worst shape)\n");
+        printf("hotbench: each candidate is timed interleaved with builtin-ref in the same child;\n");
+        printf("hotbench: the ratio + paired wins are the trustworthy numbers on a contended machine.\n");
+        printf("%-16s", "variant");
+        for (int t = 0; t < VBS_HOT_NTYPES; t++) printf(" %12s", vbs_hot_type_name(t));
+        printf("  correct\n");
+        if (vbs_loop_bench_in_child(NULL, NULL, shapes, 3, 0x1Fu, ref_ns, dummy, dummy_wins, &correct, berr, sizeof(berr)) != 0) {
+            fprintf(stderr, "hotbench: builtin bench failed: %s\n", berr);
+            return 1;
+        }
+        printf("%-16s", "builtin-ref");
+        for (int t = 0; t < VBS_HOT_NTYPES; t++) printf(" %12.0f", ref_ns[t]);
+        printf("  %s\n", correct ? "yes" : "NO");
+        vbs_tune_profile_t prof;
+        vbs_tune_profile_init(&prof);
+        double best_ratio[VBS_HOT_NTYPES];
+        for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+            snprintf(prof.best[t], sizeof(prof.best[t]), "builtin-ref");
+            prof.best_ns[t] = ref_ns[t];
+            best_ratio[t] = 1.0;
+        }
+        char work[512];
+        snprintf(work, sizeof(work), "%s", ".verum-hotbench-work");
+        {
+            char cmd[1400];
+            snprintf(cmd, sizeof(cmd), "mkdir -p %s", work);
+            if (system(cmd) != 0) { /* non-fatal; compile will fail loudly */ }
+        }
+        for (size_t ci = 0; ci < vbs_loop_candidate_count(); ci++) {
+            const vbs_candidate_t *cand = vbs_loop_candidate(ci);
+            if (cand->needs_avx2 && !vbs_hot_cpu_has_avx2()) {
+                printf("%-16s skipped (host lacks AVX2)\n", cand->name);
+                continue;
+            }
+            char src[1200], so[1200], inc1[1200], inc2[1200];
+            snprintf(src, sizeof(src), "%s/src/hotkernels/%s", repo_dir, cand->src_file);
+            snprintf(so, sizeof(so), "%s/cand_%s.so", work, cand->name);
+            snprintf(inc1, sizeof(inc1), "-I%s/include", repo_dir);
+            snprintf(inc2, sizeof(inc2), "-I%s/src/hotkernels", repo_dir);
+            const char *extra[3];
+            size_t n_extra = 0;
+            extra[n_extra++] = inc1;
+            extra[n_extra++] = inc2;
+            if (cand->extra_flag) extra[n_extra++] = cand->extra_flag;
+            char cerr[1024] = {0};
+            if (vbs_cc_compile_so(NULL, src, so, extra, n_extra, cerr, sizeof(cerr)) != 0) {
+                printf("%-16s COMPILE FAILED\n", cand->name);
+                continue;
+            }
+            double ns[VBS_HOT_NTYPES] = {0};
+            double base_ns[VBS_HOT_NTYPES] = {0};
+            int wins[VBS_HOT_NTYPES] = {0};
+            uint32_t mask = 0;
+            for (int t = 0; t < VBS_HOT_NTYPES; t++)
+                if (cand->optimizes[t]) mask |= (uint32_t)(1u << t);
+            int brc = vbs_loop_bench_in_child(so, NULL, shapes, 3, mask, ns, base_ns, wins, &correct, berr, sizeof(berr));
+            if (brc == -2) {
+                printf("%-16s CRASHED in bench\n", cand->name);
+                continue;
+            }
+            if (brc != 0) {
+                printf("%-16s BENCH FAILED: %s\n", cand->name, berr);
+                continue;
+            }
+            printf("%-16s", cand->name);
+            for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+                if (mask & (1u << t)) printf(" %12.0f", ns[t]);
+                else printf(" %12s", "-");
+            }
+            printf("  %s", correct ? "yes" : "NO");
+            if (correct) {
+                printf("  speedup vs builtin:");
+                for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+                    if (cand->optimizes[t] && ns[t] > 0) printf(" %s=%.2fx(%d/7)", vbs_hot_type_name(t), base_ns[t] / ns[t], wins[t]);
+                }
+            }
+            printf("\n");
+            if (correct) {
+                for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+                    /* Best is by ratio measured in the same child run,
+                     * with paired-win evidence scaled to the win size
+                     * (same two-tier rule as the loop's accept gate). */
+                    double ratio = (base_ns[t] > 0 && ns[t] > 0) ? ns[t] / base_ns[t] : 1.0;
+                    int enough_wins = (ratio < 0.80) ? (wins[t] >= 4) : (wins[t] >= 5);
+                    if (cand->optimizes[t] && ratio < 0.98 && enough_wins && ratio < best_ratio[t]) {
+                        snprintf(prof.best[t], sizeof(prof.best[t]), "%s", cand->name);
+                        prof.best_ns[t] = ns[t];
+                        best_ratio[t] = ratio;
+                    }
+                }
+            }
+        }
+        printf("best per type:");
+        for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+            printf(" %s=%s(%.0fns)", vbs_hot_type_name(t), prof.best[t], prof.best_ns[t]);
+        }
+        printf("\n");
+        if (tune_out_path) {
+            if (vbs_tune_write_json(&prof, tune_out_path)) {
+                printf("tune profile written to %s (fingerprint %s)\n", tune_out_path, prof.fingerprint);
+            } else {
+                fprintf(stderr, "hotbench: could not write %s\n", tune_out_path);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (strcmp(mode, "--fuse") == 0) {
+        /* Fused FFN: build/load the model-specialized fused kernel, then
+         * interleave reference and fused generation rounds on the same
+         * prompt (3 each) and compare the MINIMUM round time of each
+         * side. Single-shot timing on a shared VM is too noisy to resolve
+         * a ~15% end-to-end effect: min-of-3 interleaved rounds is the
+         * same discipline the loop's benchmark uses. Token sequences from
+         * every round must match the first reference round exactly. */
+        uint32_t prompt_ids[64];
+        size_t n_prompt = 0;
+        {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), "%s", prompt_ids_text);
+            char *save = NULL;
+            for (char *tok = strtok_r(buf, ",", &save); tok && n_prompt < 64;
+                 tok = strtok_r(NULL, ",", &save)) {
+                prompt_ids[n_prompt++] = (uint32_t)strtoul(tok, NULL, 10);
+            }
+        }
+        if (n_prompt == 0) { prompt_ids[0] = 1; n_prompt = 1; }
+        char ferr[1024] = {0};
+        vbs_cpu_model_t *cm = vbs_cpu_open(model_path, 128, ferr, sizeof(ferr));
+        if (!cm) { fprintf(stderr, "fuse: model open failed: %s\n", ferr); return 1; }
+        size_t n_gen = bench_tokens;
+        uint32_t *ref_tokens = (uint32_t *)calloc(n_gen, sizeof(uint32_t));
+        uint32_t *round_tokens = (uint32_t *)calloc(n_gen, sizeof(uint32_t));
+        if (!ref_tokens || !round_tokens) { free(ref_tokens); free(round_tokens); vbs_cpu_close(cm); return 1; }
+        /* Build/load the fused kernel first; reference rounds disable it
+         * via vbs_fuse_set_enabled(false) without unloading. */
+        if (!vbs_fuse_build_and_load(model_path, fuse_cache_dir, ferr, sizeof(ferr))) {
+            fprintf(stderr, "fuse: %s\n", ferr);
+            free(ref_tokens); free(round_tokens); vbs_cpu_close(cm); return 1;
+        }
+        printf("fuse: kernel %s (cache %s, build %.2fs, verify max rel err %.3g)\n",
+               vbs_fuse_loaded_path(), vbs_fuse_cache_hit() ? "HIT" : "MISS",
+               vbs_fuse_build_seconds(), vbs_fuse_verify_max_rel_err());
+        const int rounds = 3;
+        double ref_min = -1.0, fused_min = -1.0;
+        size_t n_ref = 0;
+        int same = 1;
+        for (int r = 0; r < rounds; r++) {
+            double sec = 0;
+            vbs_fuse_set_enabled(false);
+            size_t n = fuse_gen_round(cm, prompt_ids, n_prompt, n_gen,
+                                      round_tokens, &sec, ferr, sizeof(ferr));
+            if (n == 0) { fprintf(stderr, "fuse: reference round failed: %s\n", ferr); same = 0; break; }
+            if (r == 0) { n_ref = n; memcpy(ref_tokens, round_tokens, n * sizeof(uint32_t)); }
+            else if (n != n_ref || memcmp(ref_tokens, round_tokens, n_ref * sizeof(uint32_t)) != 0) same = 0;
+            if (ref_min < 0 || sec < ref_min) ref_min = sec;
+            printf("fuse: round %d reference: %zu tokens in %.3fs (%.1f tok/s)\n",
+                   r + 1, n, sec, n / (sec > 0 ? sec : 1e-9));
+            vbs_fuse_set_enabled(true);
+            n = fuse_gen_round(cm, prompt_ids, n_prompt, n_gen,
+                               round_tokens, &sec, ferr, sizeof(ferr));
+            if (n == 0) { fprintf(stderr, "fuse: fused round failed: %s\n", ferr); same = 0; break; }
+            if (n != n_ref || memcmp(ref_tokens, round_tokens, n_ref * sizeof(uint32_t)) != 0) same = 0;
+            if (fused_min < 0 || sec < fused_min) fused_min = sec;
+            printf("fuse: round %d fused:     %zu tokens in %.3fs (%.1f tok/s)\n",
+                   r + 1, n, sec, n / (sec > 0 ? sec : 1e-9));
+        }
+        vbs_fuse_set_enabled(true);
+        printf("fuse: token sequences %s; speedup %.2fx (min of %d interleaved rounds each)\n",
+               same ? "IDENTICAL" : "DIFFER (check numerics)",
+               (ref_min > 0 && fused_min > 0) ? ref_min / fused_min : 0.0, rounds);
+        free(ref_tokens); free(round_tokens);
+        vbs_cpu_close(cm);
+        return same ? 0 : 1;
+    }
+    if (strcmp(mode, "--tune-show") == 0) {
+        char fp[192] = "";
+        vbs_tune_fingerprint(fp, sizeof(fp));
+        printf("tune: machine fingerprint %s\n", fp);
+        printf("tune: avx2=%s avx512f=%s\n",
+               vbs_hot_cpu_has_avx2() ? "yes" : "no",
+               vbs_hot_cpu_has_avx512f() ? "yes" : "no");
+        vbs_tune_profile_t prof;
+        char terr[512] = {0};
+        if (!vbs_tune_load_embedded(&prof, terr, sizeof(terr))) {
+            printf("tune: %s\n", terr);
+            printf("tune: run --hotbench --tune-out profile.json, then tools/vbs_tune_embed.sh to embed one\n");
+            return 0;
+        }
+        printf("tune: embedded profile fingerprint %s (%s)\n",
+               prof.fingerprint,
+               vbs_tune_matches_machine(&prof) ? "MATCHES this machine" : "MISMATCH — ignored");
+        printf("tune: generated_unix %llu\n", (unsigned long long)prof.generated_unix);
+        for (int t = 0; t < VBS_HOT_NTYPES; t++) {
+            printf("tune:   %-5s best=%s %.0f ns\n",
+                   vbs_hot_type_name(t),
+                   prof.best[t][0] ? prof.best[t] : "(unknown)", prof.best_ns[t]);
+        }
+        return 0;
     }
     /* Any PC, any config: if the user did not give --window-mib, autotune
        this machine first and use its window/backend. Override with --window-mib. */
@@ -807,7 +1148,7 @@ int main(int argc, const char *argv[]) {
         size_t best_snapshot_bytes = 0;
         double global_best_fitness = -1e9;
         double global_best_acc = -1.0;
-        srand((unsigned)(time(NULL) ^ (unsigned)getpid()));
+        srand((unsigned)(time(NULL) ^ (unsigned)vbs_getpid()));
 
         printf("=== INITIATING EVOLUTIONARY SINGULARITY ===\n");
         int rc = 0;

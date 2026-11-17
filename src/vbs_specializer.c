@@ -1,18 +1,9 @@
 #include "vbs_specializer.h"
 #include "vbs_sha256.h"
+#include "vbs_port.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <dlfcn.h>
-
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
-}
 
 void vbs_specializer_compute_hash(
     const vbs_graph_t *graph,
@@ -44,15 +35,10 @@ void vbs_specializer_compute_hash(
     out_hex[64] = '\0';
 }
 
-static bool file_exists(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0;
-}
-
 vbs_specialized_binary_t *vbs_specializer_load_cached(const char *hash, const char *cache_dir) {
     char bin_path[640];
-    snprintf(bin_path, sizeof(bin_path), "%s/verum_%s.so", cache_dir, hash);
-    if (!file_exists(bin_path)) return NULL;
+    snprintf(bin_path, sizeof(bin_path), "%s/verum_%s%s", cache_dir, hash, VBS_DYLIB_EXT);
+    if (!vbs_stat_exists(bin_path)) return NULL;
     return vbs_specializer_load(bin_path, hash);
 }
 
@@ -391,20 +377,69 @@ bool vbs_specializer_emit_source(
     return true;
 }
 
+#if defined(_WIN32)
+/* Import library for the running exe: <dir>/foo.exe -> <dir>/libfoo.dll.a.
+ * The exe is built with -Wl,--export-all-symbols -Wl,--out-implib (see the
+ * Makefile `mingw` target), so the .dll.a sits next to it. Linking the DLL
+ * against the import library — not the exe itself — is what works: ld
+ * refuses to link a DLL against an exe's CRT startup objects. Returns 0 and
+ * fills out on success, -1 if the path cannot be derived or the file is
+ * absent (caller then compiles without it and the load will fail cleanly). */
+static int exe_import_lib_path(char *out, size_t cap) {
+    char exe[1024];
+    size_t len, base, end;
+    if (vbs_exe_path(exe, sizeof exe) != 0) return -1;
+    len = strlen(exe);
+    base = len;
+    while (base > 0 && exe[base - 1] != '\\' && exe[base - 1] != '/') base--;
+    end = len;
+    if (end - base > 4) {
+        const char *ext = exe + end - 4;
+        if ((ext[0] == '.' && (ext[1] == 'e' || ext[1] == 'E') &&
+             (ext[2] == 'x' || ext[2] == 'X') && (ext[3] == 'e' || ext[3] == 'E')))
+            end -= 4;
+    }
+    if (base + 3 + (end - base) + 6 + 1 > cap) return -1;
+    snprintf(out, cap, "%.*slib%.*s.dll.a", (int)base, exe, (int)(end - base), exe + base);
+    return vbs_stat_exists(out) ? 0 : -1;
+}
+#endif
+
 bool vbs_specializer_compile(const char *src_path, const char *bin_path, const vbs_system_profile_t *sys, double *out_sec) {
     (void)sys;
     char cmd[2048];
-    double t0 = now_sec();
+    double t0 = vbs_now_sec();
+#if defined(_WIN32)
+    /* Windows: MinGW gcc (or a MinGW-targeting clang) builds a DLL, linked
+     * against the exe's import library so the bridge symbols the generated
+     * code calls (vbs_bridge_get_block_dptr, ...) resolve at load time.
+     * No MinGW compiler on PATH means no specialization. */
+    const char *compiler = NULL;
+    char implib[1200];
+    if (system("where gcc >nul 2>&1") == 0) compiler = "gcc";
+    else if (system("where clang >nul 2>&1") == 0) compiler = "clang";
+    if (!compiler) { *out_sec = vbs_now_sec() - t0; return false; }
+    /* NOTE: the compiler token is deliberately UNQUOTED. system() runs
+     * `cmd /c <string>`, and cmd.exe strips a leading quote plus the last
+     * quote on the line when the string starts with one — `"gcc" -O3 ...`
+     * becomes the bogus command `gcc" -O3 ...`. Bare `gcc`/`clang` (from
+     * PATH, never containing spaces) is safe; the paths stay quoted. */
+    if (exe_import_lib_path(implib, sizeof implib) == 0)
+        snprintf(cmd, sizeof(cmd), "%s -O3 -shared -o \"%s\" \"%s\" \"%s\" 2>&1", compiler, bin_path, src_path, implib);
+    else
+        snprintf(cmd, sizeof(cmd), "%s -O3 -shared -o \"%s\" \"%s\" 2>&1", compiler, bin_path, src_path);
+#else
     const char *compiler = (system("command -v clang >/dev/null 2>&1") == 0) ? "clang" : "gcc";
     snprintf(cmd, sizeof(cmd), "%s -O3 -fomit-frame-pointer -flto -shared -fPIC -o %s %s 2>&1", compiler, bin_path, src_path);
+#endif
     int rc = system(cmd);
-    *out_sec = now_sec() - t0;
+    *out_sec = vbs_now_sec() - t0;
     return rc == 0;
 }
 
 vbs_specialized_binary_t *vbs_specializer_load(const char *bin_path, const char *hash) {
-    double t0 = now_sec();
-    void *h = dlopen(bin_path, RTLD_NOW | RTLD_LOCAL);
+    double t0 = vbs_now_sec();
+    void *h = vbs_dlopen(bin_path, 1);
     if (!h) return NULL;
 
     vbs_specialized_binary_t *b = (vbs_specialized_binary_t *)calloc(1, sizeof(*b));
@@ -412,17 +447,16 @@ vbs_specialized_binary_t *vbs_specializer_load(const char *bin_path, const char 
     snprintf(b->binary_path, sizeof(b->binary_path), "%s", bin_path);
     snprintf(b->specialization_hash, sizeof(b->specialization_hash), "%s", hash);
 
-    b->init_fn        = (void (*)(void *, void *))dlsym(h, "verum_init");
-    b->forward_fn     = (void (*)(const uint32_t *, size_t, float *))dlsym(h, "verum_forward");
-    b->reset_cache_fn = (void (*)(void))dlsym(h, "verum_reset_cache");
-    b->shutdown_fn    = (void (*)(void))dlsym(h, "verum_shutdown");
+    b->init_fn        = (void (*)(void *, void *))vbs_dlsym(h, "verum_init");
+    b->forward_fn     = (void (*)(const uint32_t *, size_t, float *))vbs_dlsym(h, "verum_forward");
+    b->reset_cache_fn = (void (*)(void))vbs_dlsym(h, "verum_reset_cache");
+    b->shutdown_fn    = (void (*)(void))vbs_dlsym(h, "verum_shutdown");
 
-    struct stat st;
-    if (stat(bin_path, &st) == 0) b->binary_size = (size_t)st.st_size;
-    b->load_time_sec = now_sec() - t0;
+    vbs_stat_size(bin_path, &b->binary_size);
+    b->load_time_sec = vbs_now_sec() - t0;
 
     if (!b->init_fn || !b->forward_fn) {
-        dlclose(h);
+        vbs_dlclose(h);
         free(b);
         return NULL;
     }
@@ -432,7 +466,7 @@ vbs_specialized_binary_t *vbs_specializer_load(const char *bin_path, const char 
 void vbs_specializer_free(vbs_specialized_binary_t *b) {
     if (!b) return;
     if (b->shutdown_fn) b->shutdown_fn();
-    if (b->loaded_handle) dlclose(b->loaded_handle);
+    if (b->loaded_handle) vbs_dlclose(b->loaded_handle);
     free(b);
 }
 

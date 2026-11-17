@@ -1,0 +1,19 @@
+// embed_q8_0.comp — Q8_0 row lookup, dequantized on the fly.
+// Block (34 B): f16 d, 32 x i8. Mirrors deq_q8_0() in vbs_dequant.c.
+// Bindings: 0=w(u32 words over packed bytes), 1=out(f32). Push: token, dim.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer W { uint w_words[]; };
+layout(set = 0, binding = 1) buffer O { float o[]; };
+layout(push_constant) uniform PC { uint token; uint dim; } pc;
+#include "common.glsl"
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.dim) return;
+    uint row_bytes = (pc.dim / 32u) * 34u;
+    uint base = pc.token * row_bytes + (i / 32u) * 34u;
+    float d = load_f16(base);
+    int q = load_i8(base + 2u + (i % 32u));
+    o[i] = d * float(q);
+}

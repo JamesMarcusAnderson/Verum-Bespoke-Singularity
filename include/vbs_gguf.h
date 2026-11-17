@@ -1,6 +1,7 @@
 #ifndef VBS_GGUF_H
 #define VBS_GGUF_H
 
+#include "vbs_port.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -74,8 +75,8 @@ typedef struct {
 
 typedef struct {
     char *path;
-    int fd;
-    void *map;
+    vbs_mmap_t filemap; /* owns the file mapping (fd/HANDLEs); map mirrors it */
+    void *map;          /* == filemap.ptr; kept so readers need no change */
     uint64_t file_size;
     uint32_t version;
     uint32_t alignment;

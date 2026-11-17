@@ -1,4 +1,5 @@
 #include "vbs_cpu.h"
+#include "vbs_port.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -55,7 +56,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Token input exceeds context limit\n"); free(line); free(prompt); free(generated); vbs_cpu_close(m); return 64;
     }
     char *save = NULL;
-    for (char *p = strtok_r(line, " \t\r\n", &save); p; p = strtok_r(NULL, " \t\r\n", &save)) {
+    for (char *p = vbs_strtok_r(line, " \t\r\n", &save); p; p = vbs_strtok_r(NULL, " \t\r\n", &save)) {
         unsigned long long v;
         if (!number(p, &v) || v > UINT32_MAX || v >= vbs_cpu_vocab_size(m) || n_prompt >= (size_t)ctx) {
             fprintf(stderr, "Invalid or too many prompt token IDs\n"); free(line); free(prompt); free(generated); vbs_cpu_close(m); return 64;

@@ -1,0 +1,25 @@
+// rope.comp — rotary position embedding, in place on x.
+// Mirrors the CUDA `rope` kernel (theta honored, not a fixed base).
+// One invocation per element pair. Binding: 0=x(f32, in/out).
+// Push: pos, head_dim, n_heads, theta.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint head_dim; uint n_heads; float theta;
+} pc;
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint pairs_per_head = pc.head_dim / 2u;
+    uint total = pairs_per_head * pc.n_heads;
+    if (pair >= total) return;
+    uint head = pair / pairs_per_head;
+    uint p = pair % pairs_per_head;
+    uint i = 2u * p;
+    float angle = float(pc.pos) * pow(pc.theta, -float(i) / float(pc.head_dim));
+    float c = cos(angle), s = sin(angle);
+    uint base = head * pc.head_dim + i;
+    float x0 = x[base], x1 = x[base + 1u];
+    x[base]      = x0 * c - x1 * s;
+    x[base + 1u] = x0 * s + x1 * c;
+}

@@ -9,3 +9,28 @@ DerivedData/
 
 # Built binary
 verum-slice
+verum-slice.exe
+vbs-cpu
+vbs-cpu.exe
+gguf_e2e_test
+libvbs_hot_ref.so
+*.so
+*.dll
+*.dll.a
+verum-slice-tuned
+
+# Demo / loop / fuse working state
+.verum-demo/
+.verum-loop-work/
+.verum-fuse-cache/
+.verum-hotbench-work/
+vbs-loop.jsonl
+.vbs_loop_bench_*.txt
+daemon.log
+daemon_state.json
+
+# Autotune / autonomy run outputs
+verum-autotune.json
+autonomous.bin
+autonomous-best.txt
+verum-memory.tsv

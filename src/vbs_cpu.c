@@ -1,5 +1,8 @@
 #include "vbs_cpu.h"
 #include "vbs_gguf.h"
+#include "vbs_dequant.h"
+#include "vbs_hotpath.h"
+#include "vbs_fuse.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +20,16 @@ typedef struct {
 struct vbs_cpu_model {
     vbs_gguf_model_t *gguf;
     const vbs_tensor_t *embed, *out_norm, *out;
+    /* Shadow copies of weight tensors whose stored type the scalar kernels
+       cannot read directly (K-quants, Q5_0/1, Q8_1, BF16): dequantized to
+       Q8_0 once at load, so any dequantizable model runs. shadow[i] is the
+       converted tensor descriptor, shadow_src[i] the original GGUF tensor
+       it came from (for dedup when output is tied to the embedding),
+       shadow_data[i] the converted bytes. */
+    vbs_tensor_t *shadow;
+    const vbs_tensor_t **shadow_src;
+    void **shadow_data;
+    size_t n_shadow, shadow_cap;
     cpu_layer_t *layers;
     size_t n_layers, n_heads, n_kv_heads, head_dim, emb, kv_dim, ffn, vocab;
     size_t context, position;
@@ -91,8 +104,17 @@ static bool supported_weight(vbs_ggml_type_t type) {
            type == VBS_GGML_TYPE_Q8_0;
 }
 
+/* Base address of a tensor's bytes: the converted buffer for shadow
+   tensors, the mmap'd file for native ones. */
+static const uint8_t *tensor_base(const vbs_cpu_model_t *m, const vbs_tensor_t *t) {
+    if (m->shadow && t >= m->shadow && t < m->shadow + m->n_shadow) {
+        return (const uint8_t *)m->shadow_data[t - m->shadow];
+    }
+    return (const uint8_t *)m->gguf->map + t->data_offset;
+}
+
 static const uint8_t *row_data(const vbs_cpu_model_t *m, const vbs_tensor_t *t, size_t row) {
-    return (const uint8_t *)m->gguf->map + t->data_offset + row * t->packed_row_bytes;
+    return tensor_base(m, t) + row * t->packed_row_bytes;
 }
 
 /* GGML Q4 blocks pack elements 0..15 in low nibbles and 16..31 high. */
@@ -138,19 +160,11 @@ static float dot_row(const vbs_cpu_model_t *m, const vbs_tensor_t *t, size_t row
 
 /* Like GGML's CPU matmul, quantize each activation block once to Q8. This
  * introduces small rounding error but avoids a costly per-element float
- * dequantization for every row and matches GGML's quantized dot semantics. */
-static void matrix(vbs_cpu_model_t *m, const vbs_tensor_t *t, const float *x, float *y) {
-    for (size_t i = 0; i < (size_t)t->columns; i++) {
-        if (!isfinite(x[i])) {
-            for (size_t r = 0; r < (size_t)t->rows; r++) y[r] = NAN;
-            return;
-        }
-    }
-    if (t->type == VBS_GGML_TYPE_F32 || t->type == VBS_GGML_TYPE_F16) {
-        for (size_t r = 0; r < (size_t)t->rows; r++) y[r] = dot_row(m, t, r, x);
-        return;
-    }
-    size_t nblocks = (size_t)t->columns / 32;
+ * dequantization for every row and matches GGML's quantized dot semantics.
+ * Factored out of matrix() so the fused FFN kernel can quantize once and
+ * reuse the result for both the gate and up projections. */
+static void quantize_q8(vbs_cpu_model_t *m, const float *x, size_t cols) {
+    size_t nblocks = cols / 32;
     for (size_t b = 0; b < nblocks; b++) {
         float amax = 0.0f;
         for (size_t i = 0; i < 32; i++) if (fabsf(x[b * 32 + i]) > amax) amax = fabsf(x[b * 32 + i]);
@@ -165,33 +179,43 @@ static void matrix(vbs_cpu_model_t *m, const vbs_tensor_t *t, const float *x, fl
         m->q8_d[b] = f16_to_f32(f32_to_f16(d));
         m->q8_sum[b] = f16_to_f32(f32_to_f16((float)sum * d));
     }
-    for (size_t r = 0; r < (size_t)t->rows; r++) {
-        const uint8_t *p = row_data(m, t, r);
-        float sum = 0.0f;
-        for (size_t b = 0; b < nblocks; b++) {
-            const int8_t *xq = m->q8_input + b * 32;
-            if (t->type == VBS_GGML_TYPE_Q8_0) {
-                const uint8_t *blk = p + b * 34;
-                const int8_t *wq = (const int8_t *)(const void *)(blk + 2);
-                int dot = 0;
-                for (size_t i = 0; i < 32; i++) dot += (int)wq[i] * xq[i];
-                sum += f16_to_f32(read_u16(blk)) * m->q8_d[b] * (float)dot;
-            } else {
-                bool q41 = t->type == VBS_GGML_TYPE_Q4_1;
-                const uint8_t *blk = p + b * (q41 ? 20 : 18);
-                const uint8_t *wq = blk + (q41 ? 4 : 2);
-                int dot = 0;
-                for (size_t i = 0; i < 16; i++) {
-                    int lo = (int)(wq[i] & 15u) - (q41 ? 0 : 8);
-                    int hi = (int)(wq[i] >> 4) - (q41 ? 0 : 8);
-                    dot += lo * xq[i] + hi * xq[i + 16];
-                }
-                sum += f16_to_f32(read_u16(blk)) * m->q8_d[b] * (float)dot;
-                if (q41) sum += f16_to_f32(read_u16(blk + 2)) * m->q8_sum[b];
-            }
+}
+
+static void matrix(vbs_cpu_model_t *m, const vbs_tensor_t *t, const float *x, float *y) {
+    for (size_t i = 0; i < (size_t)t->columns; i++) {
+        if (!isfinite(x[i])) {
+            for (size_t r = 0; r < (size_t)t->rows; r++) y[r] = NAN;
+            return;
         }
-        y[r] = sum;
     }
+    /* The hot path runs through the versioned kernel table (vbs_hotpath.h):
+     * builtin reference kernels by default, swappable between tokens by the
+     * recursive loop. Semantics are identical to the old inline loops. */
+    const uint8_t *w0 = row_data(m, t, 0);
+    size_t rows = (size_t)t->rows, cols = (size_t)t->columns;
+    switch (t->type) {
+        case VBS_GGML_TYPE_F32:
+            vbs_hot_matvec_f32((const float *)(const void *)w0, rows, cols, x, y);
+            return;
+        case VBS_GGML_TYPE_F16:
+            vbs_hot_matvec_f16((const uint16_t *)(const void *)w0, rows, cols, x, y);
+            return;
+        case VBS_GGML_TYPE_Q8_0:
+            quantize_q8(m, x, cols);
+            vbs_hot_matvec_q8_0(w0, rows, cols, m->q8_input, m->q8_d, y);
+            return;
+        case VBS_GGML_TYPE_Q4_0:
+            quantize_q8(m, x, cols);
+            vbs_hot_matvec_q4_0(w0, rows, cols, m->q8_input, m->q8_d, y);
+            return;
+        case VBS_GGML_TYPE_Q4_1:
+            quantize_q8(m, x, cols);
+            vbs_hot_matvec_q4_1(w0, rows, cols, m->q8_input, m->q8_d, m->q8_sum, y);
+            return;
+        default:
+            break; /* unreachable: vbs_cpu_open rejects other types */
+    }
+    for (size_t r = 0; r < rows; r++) y[r] = dot_row(m, t, r, x);
 }
 
 static void row_to_float(const vbs_cpu_model_t *m, const vbs_tensor_t *t, size_t row, float *out) {
@@ -263,10 +287,72 @@ static bool check_tensor(const vbs_tensor_t *t, size_t rows, size_t cols, bool i
         snprintf(err, cap, "Unexpected shape for tensor %s", name); return false;
     }
     if (is_norm ? (t->type != VBS_GGML_TYPE_F32 && t->type != VBS_GGML_TYPE_F16)
-                : !supported_weight(t->type)) {
+                : (!supported_weight(t->type) && !vbs_dequant_supported(t->type))) {
         snprintf(err, cap, "Unsupported tensor type %d for %s", (int)t->type, name); return false;
     }
     return true;
+}
+
+/* If t's stored type has no scalar kernel, dequantize it once to Q8_0 and
+   record a shadow tensor describing the converted copy; otherwise do
+   nothing. Returns false only on allocation/conversion failure. A tensor
+   already converted (tied output/embedding) reuses its shadow.
+   Target choice, measured on SmolLM-135M Q4_K_M (2026-11-17): Q8_0
+   decodes at 11.7 tok/s vs 1.2 tok/s for an F16 target, because the F16
+   scalar dot converts every element per use while Q8_0 runs the integer
+   dot; Q8_0 also halves the shadow memory. Accuracy cost vs an exact
+   float64 reference: mean |logit| error 0.52 (Q8_0) vs 0.11 (F16) — the
+   same order as llama.cpp's own 0.28 on this file — with identical
+   argmax, identical top-10 set, and identical generated text on the
+   test prompt. F16 stays available by changing the target constant
+   below if a future accuracy-sensitive use wants it.
+   NOTE: this may realloc the shadow arrays, so callers must NOT hold
+   pointers into them across calls; repoint fields afterwards with
+   shadow_for(), once all conversions are done. */
+static bool maybe_convert(vbs_cpu_model_t *m, const vbs_tensor_t *t,
+                          char *err, size_t cap) {
+    if (!t || supported_weight(t->type)) return true;
+    for (size_t i = 0; i < m->n_shadow; i++) {
+        if (m->shadow_src[i] == t) return true;
+    }
+    if (m->n_shadow == m->shadow_cap) {
+        size_t ncap = m->shadow_cap ? m->shadow_cap * 2 : 16;
+        vbs_tensor_t *ns = (vbs_tensor_t *)realloc(m->shadow, ncap * sizeof(*ns));
+        if (!ns) { snprintf(err, cap, "Out of memory converting tensor %s", t->name ? t->name : "?"); return false; }
+        m->shadow = ns;
+        const vbs_tensor_t **nsrc = (const vbs_tensor_t **)realloc(m->shadow_src, ncap * sizeof(*nsrc));
+        if (!nsrc) { snprintf(err, cap, "Out of memory converting tensor %s", t->name ? t->name : "?"); return false; }
+        m->shadow_src = nsrc;
+        void **ndata = (void **)realloc(m->shadow_data, ncap * sizeof(*ndata));
+        if (!ndata) { snprintf(err, cap, "Out of memory converting tensor %s", t->name ? t->name : "?"); return false; }
+        m->shadow_data = ndata;
+        m->shadow_cap = ncap;
+    }
+    const void *src = (const uint8_t *)m->gguf->map + t->data_offset;
+    vbs_ggml_type_t out_type = VBS_GGML_TYPE_F16;
+    uint64_t row_bytes = 0, total_bytes = 0;
+    void *buf = vbs_dequant_tensor(t, src, VBS_GGML_TYPE_Q8_0, 1.0f,
+                                   &out_type, &row_bytes, &total_bytes, err, cap);
+    if (!buf) return false;
+    size_t i = m->n_shadow++;
+    m->shadow[i] = *t;
+    m->shadow[i].type = out_type;
+    m->shadow[i].packed_row_bytes = row_bytes;
+    m->shadow[i].byte_length = total_bytes;
+    m->shadow[i].data_offset = 0; /* unused for shadows; tensor_base routes by pointer */
+    m->shadow_src[i] = t;
+    m->shadow_data[i] = buf;
+    return true;
+}
+
+/* After all conversions, resolve a tensor to its shadow (if it has one)
+   or itself. Only call once the shadow array will not grow again. */
+static const vbs_tensor_t *shadow_for(const vbs_cpu_model_t *m, const vbs_tensor_t *t) {
+    if (!t || supported_weight(t->type)) return t;
+    for (size_t i = 0; i < m->n_shadow; i++) {
+        if (m->shadow_src[i] == t) return &m->shadow[i];
+    }
+    return t;
 }
 
 static const vbs_tensor_t *layer_tensor(const vbs_gguf_model_t *g, size_t l, const char *suffix,
@@ -419,6 +505,26 @@ vbs_cpu_model_t *vbs_cpu_open(const char *path, size_t context, char *err, size_
             snprintf(err, cap, "Unsupported extra tensor: %s", m->gguf->tensors[i].name); goto fail;
         }
     }
+    /* Convert weights the scalar kernels cannot read (K-quants, Q5_0/1,
+       Q8_1, BF16) to Q8_0 shadows. Phase 1 builds every shadow; phase 2
+       repoints the fields, once the shadow array can no longer move. */
+    if (!maybe_convert(m, m->embed, err, cap) || !maybe_convert(m, m->out, err, cap)) goto fail;
+    for (size_t i = 0; i < m->n_layers; i++) {
+        cpu_layer_t *l = &m->layers[i];
+        if (!maybe_convert(m, l->q, err, cap) || !maybe_convert(m, l->k, err, cap) ||
+            !maybe_convert(m, l->v, err, cap) || !maybe_convert(m, l->ao, err, cap) ||
+            !maybe_convert(m, l->gate, err, cap) || !maybe_convert(m, l->up, err, cap) ||
+            !maybe_convert(m, l->down, err, cap)) goto fail;
+    }
+    m->embed = shadow_for(m, m->embed);
+    m->out = shadow_for(m, m->out);
+    for (size_t i = 0; i < m->n_layers; i++) {
+        cpu_layer_t *l = &m->layers[i];
+        l->q = shadow_for(m, l->q); l->k = shadow_for(m, l->k);
+        l->v = shadow_for(m, l->v); l->ao = shadow_for(m, l->ao);
+        l->gate = shadow_for(m, l->gate); l->up = shadow_for(m, l->up);
+        l->down = shadow_for(m, l->down);
+    }
     size_t cache_n, t;
     size_t max_quant = m->emb > m->ffn ? m->emb : m->ffn;
     m->q8_input = (int8_t *)calloc(max_quant, sizeof(*m->q8_input));
@@ -444,6 +550,10 @@ fail:
 
 void vbs_cpu_close(vbs_cpu_model_t *m) {
     if (!m) return;
+    if (m->shadow_data) {
+        for (size_t i = 0; i < m->n_shadow; i++) free(m->shadow_data[i]);
+    }
+    free(m->shadow); free(m->shadow_src); free(m->shadow_data);
     free(m->layers); free(m->cache_k); free(m->cache_v); free(m->x); free(m->norm);
     free(m->q); free(m->k); free(m->v); free(m->att); free(m->tmp); free(m->gate);
     free(m->up); free(m->hidden); free(m->scores); free(m->logits);
@@ -502,8 +612,19 @@ bool vbs_cpu_step_ex(vbs_cpu_model_t *m, uint32_t token, bool compute_logits, ch
         matrix(m, l->ao, m->att, m->tmp);
         for (size_t i = 0; i < m->emb; i++) m->x[i] += m->tmp[i];
         rms_norm(m, l->fn, m->x, m->norm);
-        matrix(m, l->gate, m->norm, m->gate); matrix(m, l->up, m->norm, m->up);
-        for (size_t i = 0; i < m->ffn; i++) m->hidden[i] = (m->gate[i] / (1.0f + expf(-m->gate[i]))) * m->up[i];
+        /* Fused FFN: when a verified model-specialized kernel is loaded for
+         * this model's dims and quant type, gate+up+SiLU run as one pass
+         * over the shared Q8 activations. Otherwise the reference path. */
+        vbs_fused_ffn_fn fused = (l->gate->type == l->up->type)
+            ? vbs_fuse_lookup(l->gate->type, m->emb, m->ffn) : NULL;
+        if (fused) {
+            quantize_q8(m, m->norm, m->emb);
+            fused(row_data(m, l->gate, 0), row_data(m, l->up, 0),
+                  m->ffn, m->emb, m->q8_input, m->q8_d, m->q8_sum, m->hidden);
+        } else {
+            matrix(m, l->gate, m->norm, m->gate); matrix(m, l->up, m->norm, m->up);
+            for (size_t i = 0; i < m->ffn; i++) m->hidden[i] = (m->gate[i] / (1.0f + expf(-m->gate[i]))) * m->up[i];
+        }
         matrix(m, l->down, m->hidden, m->tmp);
         for (size_t i = 0; i < m->emb; i++) m->x[i] += m->tmp[i];
     }

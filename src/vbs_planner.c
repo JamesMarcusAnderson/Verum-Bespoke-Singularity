@@ -147,10 +147,10 @@ vbs_execution_plan_t *vbs_planner_build(
     plan->estimated_memory_pressure =
         (double)mp->total_model_bytes / (double)total_capacity;
 
-    snprintf(plan->strategy_summary, sizeof(plan->strategy_summary),
-        "VRAM-resident: %zu ops | Host-streamed: %zu ops | NVMe-streamed: %zu ops",
-        0UL, 0UL, 0UL);
-
+    /* NOTE: an earlier placeholder snprintf here wrote "0 ops" counts that
+     * the real snprintf below unconditionally overwrote, and its 0UL args
+     * mismatched %zu on LLP64 (Windows: unsigned long is 32-bit, size_t is
+     * 64-bit). Deleted as dead code rather than fixed in place. */
     size_t in_vram = 0, in_host = 0, in_nvme = 0;
     for (size_t i = 0; i < plan->n_plans; i++) {
         switch (plan->plans[i].strategy) {

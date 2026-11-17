@@ -19,7 +19,7 @@ typedef struct {
     char binary_path[640];
 
     // The compiled artifact
-    void *loaded_handle;              // dlopen handle
+    void *loaded_handle;              // dynamic-library handle (dlopen / LoadLibrary)
     size_t binary_size;
     bool  was_cached;                 // true if we hit the cache
     double compile_time_sec;
@@ -62,7 +62,7 @@ bool vbs_specializer_emit_source(
     const char *out_source_path
 );
 
-// Compile the emitted source into a .so/.dylib with the system compiler
+// Compile the emitted source into a .so/.dylib/.dll with the system compiler
 bool vbs_specializer_compile(
     const char *source_path,
     const char *binary_path,

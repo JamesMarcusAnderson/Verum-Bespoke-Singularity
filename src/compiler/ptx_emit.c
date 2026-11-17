@@ -59,15 +59,9 @@ static const char *ptx_type(ast_type_t t)
     }
 }
 
-static const char *ptx_reg_prefix(ast_type_t t)
-{
-    if (t.ptr_depth > 0) return "%rd";
-    switch (t.kind) {
-        case AST_TY_FLOAT:  return "%f";
-        case AST_TY_DOUBLE: return "%fd";
-        default:            return "%r";
-    }
-}
+/* (Phase C: ptx_reg_prefix was dead code; removed so the newly compiled
+ * compiler set builds warning-free. Restore it if a future emitter
+ * needs register prefixes.) */
 
 /* -------------------------------------------------------------------------- */
 /* Expression emitter                                                          */
@@ -82,10 +76,13 @@ static void emit_expr_ptx(pbuf_t *b, ast_node_t *n, const char *dst_reg)
         case AST_INT_LIT:
             pb_fmt(b, "    mov.s32 %s, %lld;\n", dst_reg, n->u.int_val);
             break;
-        case AST_FLOAT_LIT:
-            pb_fmt(b, "    mov.f32 %s, 0f%08X;\n", dst_reg,
-                   *(unsigned int *)&n->u.float_val);
+        case AST_FLOAT_LIT: {
+            /* memcpy, not a punned dereference (strict aliasing). */
+            uint32_t bits;
+            memcpy(&bits, &n->u.float_val, sizeof(bits));
+            pb_fmt(b, "    mov.f32 %s, 0f%08X;\n", dst_reg, bits);
             break;
+        }
         case AST_VAR_REF:
             pb_fmt(b, "    mov.s32 %s, %%%s;\n", dst_reg, n->u.var.name);
             break;
