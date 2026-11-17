@@ -38,7 +38,7 @@ CFLAGS += -DVBS_ENABLE_CUDA=1 -DVBS_ENABLE_HIP=1
 
 BIN := verum-slice
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(BIN)
 
@@ -47,3 +47,9 @@ $(BIN): $(SRC) $(wildcard include/*.h src/*.h)
 
 clean:
 	rm -f $(BIN) *.o
+
+test: $(BIN)
+	./$(BIN) --help > /dev/null 2>&1
+	./$(BIN) --dequant | grep -q "ALL PASS"
+	./$(BIN) --sample | grep -q "ALL PASS"
+	@echo "make test: all model-free self-checks passed"
