@@ -44,6 +44,10 @@ jobs:
         run: |
           ./verum-slice --help || ./verum-slice || true
 
+      - name: Run Audit Test Suite
+        run: |
+          make test
+
       - name: Run Architecture Contract Tests
         run: |
           python3 -c "
@@ -51,3 +55,60 @@ jobs:
           assert os.path.exists('verum-slice'), 'Binary missing'
           print('>> Binary compiled and linked successfully.')
           "
+
+  # Windows, cross-compiled from Linux with MinGW-w64, then run under Wine.
+  # Verifies the MinGW target (`make mingw`) and the Windows code paths
+  # (file mapping, dynamic loading, timers) without a Windows runner.
+  windows-mingw:
+    name: Windows cross-compile (MinGW) + Wine run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install MinGW + Wine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 wine64
+
+      - name: Cross-compile verum-slice.exe
+        run: |
+          make mingw
+          file verum-slice.exe
+
+      - name: Run model-free self-checks under Wine
+        # Ubuntu ships no `wine64` command; the `wine` wrapper dispatches to
+        # the 64-bit loader when WINEARCH=win64 (no wine32 needed).
+        run: |
+          export WINEDEBUG=-all WINEARCH=win64
+          wine ./verum-slice.exe --help
+          wine ./verum-slice.exe --dequant | grep -q "ALL PASS"
+          wine ./verum-slice.exe --sample | grep -q "ALL PASS"
+          wine ./verum-slice.exe --backends
+          wine ./verum-slice.exe --autonomous-c
+
+  # Windows, native MSVC build via CMake. This job is the first MSVC run of
+  # the engine (it cannot run on a Linux dev machine); if it goes red, the
+  # MinGW target above is still the supported Windows build.
+  windows-msvc:
+    name: Windows native (MSVC via CMake)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure (Visual Studio generator)
+        run: cmake -S . -B build
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Run model-free self-checks
+        run: |
+          .\build\Release\verum-slice.exe --help
+          $out = .\build\Release\verum-slice.exe --dequant
+          if ($out -notmatch "ALL PASS") { throw "dequant self-check failed" }
+          $out = .\build\Release\verum-slice.exe --sample
+          if ($out -notmatch "ALL PASS") { throw "sample self-check failed" }
+          .\build\Release\verum-slice.exe --backends
+          .\build\Release\verum-slice.exe --autonomous-c
