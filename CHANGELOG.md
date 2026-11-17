@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- MSVC build (first run 2026-11-17, CI job `windows-msvc`): the Vulkan
+  SPIR-V kernel table initialized `n_words` from the `vbs_spv_*_words`
+  variables, which are `static const size_t` — not constant expressions
+  in C, so MSVC rejected the file-scope initializer (error C2099).
+  GCC/Clang accept them as an extension, which is why only MSVC failed.
+  The table now computes word counts with `sizeof`, a true constant
+  expression on every compiler. One error, one line.
+
 ## v0.10.0 — 2026-11-17 — GGUF proven, Windows target, universal GPU path, recursive self-optimization loop
 
 ### Added

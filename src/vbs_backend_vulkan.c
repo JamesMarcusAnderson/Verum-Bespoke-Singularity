@@ -547,7 +547,13 @@ typedef struct {
     size_t n_words;
 } vbs_spv_entry_t;
 
-#define VBS_SPV_ENTRY(nm) { #nm, vbs_spv_##nm, vbs_spv_##nm##_words }
+/* NOTE: n_words is computed with sizeof, not the vbs_spv_*_words
+ * variables from vulkan_kernels.spv.h. Those are `static const size_t`
+ * variables, which are NOT constant expressions in C — so they cannot
+ * initialize a file-scope table. GCC/Clang accept them as an extension;
+ * MSVC rejects them (error C2099, first MSVC run 2026-11-17). sizeof
+ * is a true constant expression on every compiler. */
+#define VBS_SPV_ENTRY(nm) { #nm, vbs_spv_##nm, sizeof(vbs_spv_##nm) / sizeof(uint32_t) }
 static const vbs_spv_entry_t g_spv_table[] = {
     VBS_SPV_ENTRY(add),
     VBS_SPV_ENTRY(silu_mul),
