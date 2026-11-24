@@ -1,0 +1,66 @@
+// attention_gqa.comp — grouped-query attention, one invocation per
+// Q head. Online softmax over positions: the running maximum and
+// denominator are rescaled as each new score arrives, so no second
+// pass over the sequence is needed. Each Q head reads the KV head
+// it shares (kv_head = q_head / group size); the KV cache is packed
+// f16; the scale multiplies the score. The backend folds the layer
+// slice into `cache_off` (in f16 elements) before dispatch.
+// Bindings: 0=q (f32), 1=kc (u32 packed f16), 2=vc (u32 packed f16),
+// 3=out (f32). Push: seq_len, n_q_heads, n_kv_heads, head_dim,
+// scale, cache_off. head_dim is capped at 512 (no real model
+// exceeds 256); the backend refuses larger head_dim at dispatch.
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KC { uint kc[]; };
+layout(set = 0, binding = 2) readonly buffer VC { uint vc[]; };
+layout(set = 0, binding = 3) buffer O { float o[]; };
+layout(push_constant) uniform PC {
+    uint seq_len; uint n_q_heads; uint n_kv_heads;
+    uint head_dim; float scale; uint cache_off;
+} pc;
+#define VBS_HEAD_DIM_MAX 512u
+
+// One f16 element out of a packed-u32 KV cache word: an even element
+// index is the low half, an odd index the high half.
+float cache_half(uint word, uint index) {
+    vec2 halves = unpackHalf2x16(word);
+    return (index & 1u) == 0u ? halves.x : halves.y;
+}
+
+void main() {
+    uint head = gl_GlobalInvocationID.x;
+    if (head >= pc.n_q_heads) return;
+    if (pc.head_dim == 0u || pc.head_dim > VBS_HEAD_DIM_MAX) return;
+    if (pc.n_kv_heads == 0u || pc.seq_len == 0u) return;
+    uint group = pc.n_q_heads / pc.n_kv_heads;
+    uint kv_head = head / group;
+
+    float acc[VBS_HEAD_DIM_MAX];
+    for (uint d = 0u; d < pc.head_dim; d++) acc[d] = 0.0;
+    float running_max = -3.4028235e38; // -FLT_MAX
+    float running_sum = 0.0;
+
+    for (uint s = 0u; s < pc.seq_len; s++) {
+        uint cache_base = pc.cache_off + (s * pc.n_kv_heads + kv_head) * pc.head_dim;
+        float dot = 0.0;
+        for (uint d = 0u; d < pc.head_dim; d++) {
+            uint index = cache_base + d;
+            dot += q[head * pc.head_dim + d] * cache_half(kc[index >> 1], index);
+        }
+        float score = dot * pc.scale;
+        float new_max = max(running_max, score);
+        float rescale = exp(running_max - new_max);
+        float weight = exp(score - new_max);
+        running_sum = running_sum * rescale + weight;
+        running_max = new_max;
+        for (uint d = 0u; d < pc.head_dim; d++) {
+            uint index = cache_base + d;
+            acc[d] = acc[d] * rescale + weight * cache_half(vc[index >> 1], index);
+        }
+    }
+
+    float inv_sum = 1.0 / running_sum;
+    for (uint d = 0u; d < pc.head_dim; d++)
+        o[head * pc.head_dim + d] = acc[d] * inv_sum;
+}

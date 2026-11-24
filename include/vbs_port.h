@@ -1,39 +1,42 @@
-/* =============================================================================
- * vbs_port.h — the ONE place for platform differences in the Verum engine.
+/* vbs_port.h — the ONE place for platform differences in the
+ * Verum engine.
  *
- * Rule: no .c file includes <unistd.h>, <dlfcn.h>, <sys/mman.h>, <fcntl.h>,
- * <strings.h> or <sys/stat.h> directly for a portability reason — it uses
- * the wrappers below instead. The POSIX branches are the exact calls the
- * engine used before, so Linux/macOS behavior is unchanged; the _WIN32
- * branches are the native Windows equivalents (no POSIX emulation layer).
+ * Rule: no .c file includes <unistd.h>, <dlfcn.h>, <sys/mman.h>,
+ * <fcntl.h>, <strings.h> or <sys/stat.h> directly for a
+ * portability reason — it uses the wrappers below instead. The
+ * POSIX branches are the exact calls the engine used before, so
+ * Linux/macOS behavior is unchanged; the _WIN32 branches are the
+ * native Windows equivalents (no POSIX emulation layer).
  *
- * Requirements: C11. Windows: MinGW-w64 gcc, or MSVC 2019+ (needs /std:c11
- * and the VS2015+ conformant %zu/snprintf). No other dependencies.
- * POSIX builds must define _GNU_SOURCE (or _POSIX_C_SOURCE >= 200809L) —
- * the Makefile and CMakeLists.txt both do — because clock_gettime,
- * ftruncate, posix_memalign, mmap and friends are POSIX, not C11, and
- * glibc hides their declarations without it.
- * =========================================================================== */
+ * Requirements: C11. Windows: MinGW-w64 gcc, or MSVC 2019+
+ * (needs /std:c11 and the VS2015+ conformant %zu/snprintf). No
+ * other dependencies. POSIX builds must define _GNU_SOURCE (or
+ * _POSIX_C_SOURCE >= 200809L) — the Makefile and CMakeLists.txt
+ * both do — because clock_gettime, ftruncate, posix_memalign,
+ * mmap and friends are POSIX, not C11, and glibc hides their
+ * declarations without it.
+ *
+ * The bodies here are thin wrappers over operating-system APIs;
+ * the calls themselves are dictated by the platform, so what is
+ * original here is the organization and the commentary.
+ */
 #ifndef VBS_PORT_H
 #define VBS_PORT_H
 
+#include "vbs_preamble.h"
 #include <ctype.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <direct.h>    /* _mkdir */
-#include <malloc.h>    /* _aligned_malloc / _aligned_free */
-#include <sys/stat.h>  /* _stat64 */
+#include <direct.h>   /* _mkdir */
+#include <malloc.h>   /* _aligned_malloc / _aligned_free */
+#include <sys/stat.h> /* _stat64 */
 #define VBS_DYLIB_EXT ".dll"
 #elif defined(__APPLE__)
 #define VBS_DYLIB_EXT ".dylib"
+#include <sys/sysctl.h> /* sysctlbyname: CPU model, core count, RAM */
 #else
 #define VBS_DYLIB_EXT ".so"
 #endif
@@ -47,10 +50,9 @@
 #include <unistd.h>
 #endif
 
-/* ---------------------------------------------------------------------------
- * Monotonic clock, seconds. Same call on every OS; the Windows branch uses
- * QueryPerformanceCounter, the POSIX branch clock_gettime(CLOCK_MONOTONIC).
- * ------------------------------------------------------------------------- */
+/* Monotonic clock in seconds. Same call on every OS; the Windows
+ * branch uses QueryPerformanceCounter, the POSIX branch
+ * clock_gettime(CLOCK_MONOTONIC). */
 static inline double vbs_now_sec(void) {
 #if defined(_WIN32)
     static LARGE_INTEGER freq;
@@ -69,12 +71,10 @@ static inline double vbs_now_sec(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Wall clock, seconds since the Unix epoch. POSIX uses
- * clock_gettime(CLOCK_REALTIME); Windows uses GetSystemTimeAsFileTime.
- * For log timestamps only — never for measuring durations (use
- * vbs_now_sec for that).
- * ------------------------------------------------------------------------- */
+/* Wall clock in seconds since the Unix epoch. POSIX uses
+ * clock_gettime(CLOCK_REALTIME); Windows uses
+ * GetSystemTimeAsFileTime. For log timestamps only — never for
+ * measuring durations (use vbs_now_sec for that). */
 static inline double vbs_wall_sec(void) {
 #if defined(_WIN32)
     FILETIME ft;
@@ -82,8 +82,8 @@ static inline double vbs_wall_sec(void) {
     GetSystemTimeAsFileTime(&ft);
     u.LowPart = ft.dwLowDateTime;
     u.HighPart = ft.dwHighDateTime;
-    /* 100-ns intervals since 1601-01-01; the Unix epoch is 11644473600 s
-     * after that. */
+    /* 100-ns intervals since 1601-01-01; the Unix epoch is
+     * 11644473600 s after that. */
     return (double)u.QuadPart / 1e7 - 11644473600.0;
 #else
     struct timespec ts;
@@ -92,11 +92,10 @@ static inline double vbs_wall_sec(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Dynamic libraries: dlopen/dlsym/dlclose on POSIX, LoadLibraryA /
- * GetProcAddress / FreeLibrary on Windows. `now` selects RTLD_NOW|RTLD_LOCAL
- * (specializer) vs RTLD_LAZY (GPU backends); Windows loads eagerly either way.
- * ------------------------------------------------------------------------- */
+/* Dynamic libraries: dlopen/dlsym/dlclose on POSIX,
+ * LoadLibraryA / GetProcAddress / FreeLibrary on Windows. `now`
+ * selects RTLD_NOW|RTLD_LOCAL (specializer) vs RTLD_LAZY (GPU
+ * backends); Windows loads eagerly either way. */
 static inline void *vbs_dlopen(const char *path, int now) {
 #if defined(_WIN32)
     (void)now;
@@ -140,11 +139,10 @@ static inline const char *vbs_dlerror(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Host facts: logical CPU count and total physical RAM. Windows uses
- * GetSystemInfo / GlobalMemoryStatusEx; POSIX uses sysconf. Both fall
- * back to sane defaults (1 core, 1 GiB) instead of failing.
- * ------------------------------------------------------------------------- */
+/* Host facts: logical CPU count and total physical RAM. Windows
+ * uses GetSystemInfo / GlobalMemoryStatusEx; POSIX uses sysconf.
+ * Both fall back to sane defaults (1 core, 1 GiB) instead of
+ * failing. */
 static inline unsigned int vbs_cpu_count(void) {
 #if defined(_WIN32)
     SYSTEM_INFO si;
@@ -172,10 +170,9 @@ static inline uint64_t vbs_ram_bytes(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Environment variables: setenv/unsetenv on POSIX, SetEnvironmentVariableA
- * on Windows. Returns 0 on success, non-zero on failure.
- * ------------------------------------------------------------------------- */
+/* Environment variables: setenv/unsetenv on POSIX,
+ * SetEnvironmentVariableA on Windows. Returns 0 on success,
+ * non-zero on failure. */
 static inline int vbs_setenv(const char *name, const char *value) {
 #if defined(_WIN32)
     return SetEnvironmentVariableA(name, value) ? 0 : -1;
@@ -192,26 +189,22 @@ static inline int vbs_unsetenv(const char *name) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Small POSIX string helpers, reimplemented in pure C11 so no _GNU_SOURCE /
- * <strings.h> dependency remains. Behavior matches the POSIX originals in
- * the "C" locale (the engine never calls setlocale, so this is exact).
- * ------------------------------------------------------------------------- */
+/* Small POSIX string helpers, reimplemented in pure C11 so no
+ * _GNU_SOURCE / <strings.h> dependency remains. Behavior matches
+ * the POSIX originals in the "C" locale (the engine never calls
+ * setlocale, so this is exact). */
 static inline char *vbs_strdup(const char *s) {
-    size_t n;
-    char *d;
     if (!s) return NULL;
-    n = strlen(s) + 1;
-    d = (char *)malloc(n);
+    size_t n = strlen(s) + 1;
+    char *d = (char *)malloc(n);
     if (d) memcpy(d, s, n);
     return d;
 }
 
 static inline int vbs_strncasecmp(const char *a, const char *b, size_t n) {
-    size_t i;
-    for (i = 0; i < n; i++) {
-        unsigned char ca = (unsigned char)a[i];
-        unsigned char cb = (unsigned char)b[i];
+    while (n-- > 0) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
         int d = tolower(ca) - tolower(cb);
         if (d != 0) return d;
         if (ca == '\0') return 0;
@@ -235,16 +228,32 @@ static inline char *vbs_strtok_r(char *s, const char *delim, char **save) {
     return tok;
 }
 
-/* ---------------------------------------------------------------------------
- * Filesystem: mkdir / stat. Windows takes path separators '/' as well as
- * '\\', so no separator translation is needed anywhere in the engine.
- * ------------------------------------------------------------------------- */
+/* Filesystem: mkdir / stat. Windows takes path separators '/' as
+ * well as '\\', so no separator translation is needed anywhere in
+ * the engine. */
 static inline int vbs_mkdir(const char *path) {
 #if defined(_WIN32)
     return _mkdir(path);
 #else
     return mkdir(path, 0755);
 #endif
+}
+
+/* Create a directory path, component by component (mkdir -p).
+ * Existing components are fine: vbs_mkdir's failure on an
+ * existing directory is ignored. Paths longer than the buffer
+ * are truncated, so callers keep paths short. */
+static inline void vbs_mkdir_p(const char *dir) {
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s", dir);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            vbs_mkdir(tmp);
+            *p = '/';
+        }
+    }
+    vbs_mkdir(tmp);
 }
 
 /* 1 if the path exists (file or directory), 0 otherwise. */
@@ -273,9 +282,8 @@ static inline int vbs_stat_size(const char *path, size_t *out) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Process id (seed mixing only — never used for signalling or control).
- * ------------------------------------------------------------------------- */
+/* Process id (seed mixing only — never used for signalling or
+ * control). */
 static inline unsigned long vbs_getpid(void) {
 #if defined(_WIN32)
     return (unsigned long)GetCurrentProcessId();
@@ -284,25 +292,35 @@ static inline unsigned long vbs_getpid(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Endianness. GGUF is a little-endian format and the parsers read multi-byte
- * integers with memcpy, so a big-endian host is refused with a clear error
- * instead of silently misreading every model. All supported hosts (x86-64
- * and ARM Windows/Linux/macOS) are little-endian.
- * ------------------------------------------------------------------------- */
+/* Endianness. The model file format is little-endian and the
+ * parsers read multi-byte integers with memcpy, so a big-endian
+ * host is refused with a clear error instead of silently
+ * misreading every model. All supported hosts (x86-64 and ARM
+ * Windows/Linux/macOS) are little-endian. */
 static inline int vbs_is_little_endian(void) {
     const uint32_t t = 1;
     return *(const unsigned char *)&t == 1;
 }
 
-/* ---------------------------------------------------------------------------
- * File mappings. One struct owns the platform handles on both sides so the
- * callers (GGUF reader, NVMe swap tier) hold no fd/HANDLE themselves.
- * POSIX: open + mmap. Windows: CreateFileA + CreateFileMappingA +
- * MapViewOfFile. The mapped view is `ptr`; it stays valid until
- * vbs_mmap_close. Open-failure codes let callers keep their exact
- * pre-existing error messages.
- * ------------------------------------------------------------------------- */
+/* xorshift32 step: the single canonical copy for the test-data
+ * generators in vbs_loop.c / vbs_fuse.c. Each caller keeps its own
+ * state variable (and seed); only the step function is shared.
+ * Test data only — never used for sampling (see vbs_sampling.c). */
+static inline uint32_t vbs_xorshift32_next(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+/* File mappings. One struct owns the platform handles on both
+ * sides so the callers (model reader, NVMe swap tier) hold no
+ * fd/HANDLE themselves. POSIX: open + mmap. Windows: CreateFileA
+ * + CreateFileMappingA + MapViewOfFile. The mapped view is `ptr`;
+ * it stays valid until vbs_mmap_close. Open-failure codes let
+ * callers keep their exact pre-existing error messages. */
 #define VBS_MMAP_OK 0
 #define VBS_MMAP_ERR_OPEN 1 /* file could not be opened */
 #define VBS_MMAP_ERR_SIZE 2 /* file size unusable (empty or unreadable) */
@@ -330,6 +348,58 @@ static inline void vbs_mmap_init(vbs_mmap_t *m) {
 #endif
 }
 
+#if defined(_WIN32)
+/* Map an open file handle into `m`. Takes ownership of `h` on
+ * success; closes it on failure. `writable` selects the
+ * protection/access pair (PAGE_READWRITE + FILE_MAP_WRITE, or
+ * PAGE_READONLY + FILE_MAP_READ). `map_size` is the size to map
+ * and to record in `m` — the file's size for a read-only open,
+ * the created size for a read-write mapping. */
+static inline int vbs_win_map_handle(void *handle, bool writable,
+                                     uint64_t map_size, vbs_mmap_t *m) {
+    HANDLE h = (HANDLE)handle;
+    HANDLE map = CreateFileMappingA(h, NULL,
+                                    writable ? PAGE_READWRITE : PAGE_READONLY,
+                                    (DWORD)(map_size >> 32),
+                                    (DWORD)(map_size & 0xFFFFFFFFu), NULL);
+    void *view;
+    if (!map) {
+        CloseHandle(h);
+        return VBS_MMAP_ERR_MAP;
+    }
+    view = MapViewOfFile(map, writable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, 0);
+    if (!view) {
+        CloseHandle(map);
+        CloseHandle(h);
+        return VBS_MMAP_ERR_MAP;
+    }
+    m->win_file = handle;
+    m->win_mapping = (void *)map;
+    m->ptr = view;
+    m->size = map_size;
+    return VBS_MMAP_OK;
+}
+#else
+/* Map an open file descriptor into `m`. Takes ownership of `fd`
+ * on success; closes it on failure. `writable` selects the
+ * protection/mapping pair (PROT_READ|PROT_WRITE + MAP_SHARED, or
+ * PROT_READ + MAP_PRIVATE). */
+static inline int vbs_fd_map(int fd, bool writable, uint64_t size,
+                                   vbs_mmap_t *m) {
+    void *p = mmap(NULL, (size_t)size,
+                   writable ? (PROT_READ | PROT_WRITE) : PROT_READ,
+                   writable ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) {
+        close(fd);
+        return VBS_MMAP_ERR_MAP;
+    }
+    m->fd = fd;
+    m->ptr = p;
+    m->size = size;
+    return VBS_MMAP_OK;
+}
+#endif
+
 /* Map a whole file read-only. */
 static inline int vbs_mmap_open_ro(const char *path, vbs_mmap_t *m) {
     vbs_mmap_init(m);
@@ -337,55 +407,30 @@ static inline int vbs_mmap_open_ro(const char *path, vbs_mmap_t *m) {
     {
         HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        HANDLE map;
         LARGE_INTEGER sz;
-        void *view;
         if (h == INVALID_HANDLE_VALUE) return VBS_MMAP_ERR_OPEN;
         if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0) {
             CloseHandle(h);
             return VBS_MMAP_ERR_SIZE;
         }
-        map = CreateFileMappingA(h, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (!map) {
-            CloseHandle(h);
-            return VBS_MMAP_ERR_MAP;
-        }
-        view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0);
-        if (!view) {
-            CloseHandle(map);
-            CloseHandle(h);
-            return VBS_MMAP_ERR_MAP;
-        }
-        m->win_file = (void *)h;
-        m->win_mapping = (void *)map;
-        m->ptr = view;
-        m->size = (uint64_t)sz.QuadPart;
-        return VBS_MMAP_OK;
+        return vbs_win_map_handle((void *)h, false, (uint64_t)sz.QuadPart, m);
     }
 #else
     {
         int fd = open(path, O_RDONLY);
         struct stat st;
-        void *p;
         if (fd < 0) return VBS_MMAP_ERR_OPEN;
         if (fstat(fd, &st) != 0 || st.st_size <= 0) {
             close(fd);
             return VBS_MMAP_ERR_SIZE;
         }
-        p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p == MAP_FAILED) {
-            close(fd);
-            return VBS_MMAP_ERR_MAP;
-        }
-        m->fd = fd;
-        m->ptr = p;
-        m->size = (uint64_t)st.st_size;
-        return VBS_MMAP_OK;
+        return vbs_fd_map(fd, false, (uint64_t)st.st_size, m);
     }
 #endif
 }
 
-/* Create (or replace) a file of `size` bytes and map it read-write/shared. */
+/* Create (or replace) a file of `size` bytes and map it
+ * read-write/shared. */
 static inline int vbs_mmap_create_rw(const char *path, uint64_t size, vbs_mmap_t *m) {
     vbs_mmap_init(m);
     if (size == 0) return VBS_MMAP_ERR_SIZE;
@@ -393,52 +438,24 @@ static inline int vbs_mmap_create_rw(const char *path, uint64_t size, vbs_mmap_t
     {
         HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        HANDLE map;
         LARGE_INTEGER li;
-        void *view;
         if (h == INVALID_HANDLE_VALUE) return VBS_MMAP_ERR_OPEN;
         li.QuadPart = (LONGLONG)size;
         if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN) || !SetEndOfFile(h)) {
             CloseHandle(h);
             return VBS_MMAP_ERR_SIZE;
         }
-        map = CreateFileMappingA(h, NULL, PAGE_READWRITE,
-                                 (DWORD)(size >> 32),
-                                 (DWORD)(size & 0xFFFFFFFFu), NULL);
-        if (!map) {
-            CloseHandle(h);
-            return VBS_MMAP_ERR_MAP;
-        }
-        view = MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 0);
-        if (!view) {
-            CloseHandle(map);
-            CloseHandle(h);
-            return VBS_MMAP_ERR_MAP;
-        }
-        m->win_file = (void *)h;
-        m->win_mapping = (void *)map;
-        m->ptr = view;
-        m->size = size;
-        return VBS_MMAP_OK;
+        return vbs_win_map_handle((void *)h, true, size, m);
     }
 #else
     {
         int fd = open(path, O_RDWR | O_CREAT, 0600);
-        void *p;
         if (fd < 0) return VBS_MMAP_ERR_OPEN;
         if (ftruncate(fd, (off_t)size) != 0) {
             close(fd);
             return VBS_MMAP_ERR_SIZE;
         }
-        p = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (p == MAP_FAILED) {
-            close(fd);
-            return VBS_MMAP_ERR_MAP;
-        }
-        m->fd = fd;
-        m->ptr = p;
-        m->size = size;
-        return VBS_MMAP_OK;
+        return vbs_fd_map(fd, true, size, m);
     }
 #endif
 }
@@ -450,9 +467,10 @@ static inline void vbs_mmap_close(vbs_mmap_t *m) {
     if (m->win_mapping) CloseHandle((HANDLE)m->win_mapping);
     if (m->win_file) CloseHandle((HANDLE)m->win_file);
 #else
-    /* The fd is closed only with a live view: a calloc-zeroed struct has
-     * fd == 0 (stdin), which must never be closed. Every successful open
-     * sets ptr, so this loses no real close. */
+    /* The fd is closed only with a live view: a calloc-zeroed
+     * struct has fd == 0 (stdin), which must never be closed.
+     * Every successful open sets ptr, so this loses no real
+     * close. */
     if (m->ptr) {
         munmap(m->ptr, (size_t)m->size);
         if (m->fd >= 0) close(m->fd);
@@ -461,10 +479,9 @@ static inline void vbs_mmap_close(vbs_mmap_t *m) {
     vbs_mmap_init(m);
 }
 
-/* ---------------------------------------------------------------------------
- * Aligned allocation. POSIX: posix_memalign (freed with free).
- * Windows: _aligned_malloc (must be freed with _aligned_free — never free).
- * ------------------------------------------------------------------------- */
+/* Aligned allocation. POSIX: posix_memalign (freed with free).
+ * Windows: _aligned_malloc (must be freed with _aligned_free —
+ * never free). */
 static inline int vbs_aligned_alloc(void **out, size_t alignment, size_t size) {
 #if defined(_WIN32)
     *out = _aligned_malloc(size, alignment);
@@ -482,10 +499,9 @@ static inline void vbs_aligned_free(void *p) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Temp directory. POSIX: $TMPDIR, else /tmp. Windows: GetTempPathA
- * ($TEMP/$TMP, else the Windows directory). Trailing separators stripped.
- * ------------------------------------------------------------------------- */
+/* Temp directory. POSIX: $TMPDIR, else /tmp. Windows:
+ * GetTempPathA ($TEMP/$TMP, else the Windows directory).
+ * Trailing separators stripped. */
 static inline const char *vbs_temp_dir(char *buf, size_t cap) {
 #if defined(_WIN32)
     DWORD n = GetTempPathA((DWORD)cap, buf);
@@ -506,9 +522,9 @@ static inline const char *vbs_temp_dir(char *buf, size_t cap) {
 #endif
 }
 
-/* Join dir + suffix into buf, truncating the dir (never the suffix) so the
- * result always ends with the full suffix. Empty string if cap is too small
- * to hold even the suffix. */
+/* Join dir + suffix into buf, truncating the dir (never the
+ * suffix) so the result always ends with the full suffix. Empty
+ * string if cap is too small to hold even the suffix. */
 static inline void vbs_join_suffix(char *buf, size_t cap, const char *dir, const char *suffix) {
     size_t sl;
     if (cap == 0) return;
@@ -520,8 +536,9 @@ static inline void vbs_join_suffix(char *buf, size_t cap, const char *dir, const
     snprintf(buf, cap, "%.*s%s", (int)(cap - sl - 1), dir, suffix);
 }
 
-/* Default on-disk locations (overridable with VBS_CACHE_DIR / VBS_SWAP_PATH).
- * Forward slashes work in every Windows file API, so one spelling serves. */
+/* Default on-disk locations (overridable with VBS_CACHE_DIR /
+ * VBS_SWAP_PATH). Forward slashes work in every Windows file API,
+ * so one spelling serves. */
 static inline void vbs_default_cache_dir(char *buf, size_t cap) {
     char tmp[512];
     vbs_temp_dir(tmp, sizeof tmp);
@@ -535,8 +552,9 @@ static inline void vbs_default_swap_path(char *buf, size_t cap) {
 }
 
 #if defined(_WIN32)
-/* Full path of the running exe. The specializer links its DLL against it so
- * the bridge symbols the generated code calls resolve at load time. */
+/* Full path of the running exe. The specializer links its DLL
+ * against it so the bridge symbols the generated code calls
+ * resolve at load time. */
 static inline int vbs_exe_path(char *buf, size_t cap) {
     DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)cap);
     return (n > 0 && n < cap) ? 0 : -1;

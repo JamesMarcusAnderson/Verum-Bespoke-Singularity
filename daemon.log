@@ -1,0 +1,168 @@
+2026-11-17 15:39:58 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-17 15:39:58 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-17 15:39:58 --- cycle 1 ---
+2026-11-17 15:39:58 no new memory (lines=0)
+2026-11-17 15:39:58 autotune rc=0 autotune: saved config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 15:39:58 autonomous-c rc=0 autonomous-c: final loss=0.0098
+2026-11-17 15:40:15 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 0 rollbacks
+2026-11-17 15:40:15 sleep 1s
+2026-11-17 15:40:16 --- cycle 2 ---
+2026-11-17 15:40:16 no new memory (lines=0)
+2026-11-17 15:40:16 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 15:40:16 autonomous-c rc=0 autonomous-c: final loss=0.0094
+2026-11-17 15:40:35 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-17 15:40:35 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-17 21:56:51 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-17 21:56:51 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-17 21:56:51 --- cycle 1 ---
+2026-11-17 21:56:51 no new memory (lines=0)
+2026-11-17 21:56:51 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 21:56:51 autonomous-c rc=0 autonomous-c: final loss=0.0090
+2026-11-17 21:57:07 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 0 rollbacks
+2026-11-17 21:57:07 sleep 1s
+2026-11-17 21:57:08 --- cycle 2 ---
+2026-11-17 21:57:08 no new memory (lines=0)
+2026-11-17 21:57:08 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 21:57:08 autonomous-c rc=0 autonomous-c: final loss=0.0087
+2026-11-17 21:57:28 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 0 rollbacks
+2026-11-17 21:57:28 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-17 16:00:54 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-17 16:00:54 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-17 16:00:54 --- cycle 1 ---
+2026-11-17 16:00:54 no new memory (lines=0)
+2026-11-17 16:00:54 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 16:00:54 autonomous-c rc=0 autonomous-c: final loss=0.0083
+2026-11-17 16:01:11 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 0 rollbacks
+2026-11-17 16:01:11 sleep 1s
+2026-11-17 16:01:12 --- cycle 2 ---
+2026-11-17 16:01:12 no new memory (lines=0)
+2026-11-17 16:01:12 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 16:01:12 autonomous-c rc=0 autonomous-c: final loss=0.0080
+2026-11-17 16:01:29 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 0 rollbacks
+2026-11-17 16:01:29 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-17 23:33:21 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-17 23:33:21 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-17 23:33:21 --- cycle 1 ---
+2026-11-17 23:33:21 no new memory (lines=0)
+2026-11-17 23:33:21 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 23:33:21 autonomous-c rc=0 autonomous-c: final loss=0.0078
+2026-11-17 23:33:39 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 1 rollbacks
+2026-11-17 23:33:39 sleep 1s
+2026-11-17 23:33:40 --- cycle 2 ---
+2026-11-17 23:33:40 no new memory (lines=0)
+2026-11-17 23:33:40 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 23:33:40 autonomous-c rc=0 autonomous-c: final loss=0.0075
+2026-11-17 23:33:56 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-17 23:33:56 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-17 23:55:45 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-17 23:55:45 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-17 23:55:45 --- cycle 1 ---
+2026-11-17 23:55:45 no new memory (lines=0)
+2026-11-17 23:55:45 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 23:55:45 autonomous-c rc=0 autonomous-c: final loss=0.0072
+2026-11-17 23:56:01 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-17 23:56:01 sleep 1s
+2026-11-17 23:56:02 --- cycle 2 ---
+2026-11-17 23:56:02 no new memory (lines=0)
+2026-11-17 23:56:02 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-17 23:56:02 autonomous-c rc=0 autonomous-c: final loss=0.0070
+2026-11-17 23:56:20 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 1 rollbacks
+2026-11-17 23:56:20 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:05:16 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:05:16 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:05:16 --- cycle 1 ---
+2026-11-18 00:05:16 no new memory (lines=0)
+2026-11-18 00:05:16 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-18 00:05:16 autonomous-c rc=0 autonomous-c: final loss=0.0068
+2026-11-18 00:05:33 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:05:33 sleep 1s
+2026-11-18 00:05:34 --- cycle 2 ---
+2026-11-18 00:05:34 no new memory (lines=0)
+2026-11-18 00:05:34 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=CPU threads=4 window=991 MiB)
+2026-11-18 00:05:34 autonomous-c rc=0 autonomous-c: final loss=0.0066
+2026-11-18 00:05:51 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:05:51 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:28:27 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:28:27 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:28:27 --- cycle 1 ---
+2026-11-18 00:28:27 no new memory (lines=0)
+2026-11-18 00:28:27 autotune rc=0 autotune: saved config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:28:27 autonomous-c rc=0 autonomous-c: final loss=0.0064
+2026-11-18 00:28:45 loop rc=0 [loop] done: 2 iterations, 2 accepted, 0 rejected, 2 swaps, 1 rollbacks
+2026-11-18 00:28:45 sleep 1s
+2026-11-18 00:28:46 --- cycle 2 ---
+2026-11-18 00:28:46 no new memory (lines=0)
+2026-11-18 00:28:46 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:28:47 autonomous-c rc=0 autonomous-c: final loss=0.0062
+2026-11-18 00:29:05 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:29:05 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:32:58 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:32:58 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:32:58 --- cycle 1 ---
+2026-11-18 00:32:58 no new memory (lines=0)
+2026-11-18 00:32:58 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:32:58 autonomous-c rc=0 autonomous-c: final loss=0.0060
+2026-11-18 00:33:14 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:33:14 sleep 1s
+2026-11-18 00:33:15 --- cycle 2 ---
+2026-11-18 00:33:15 no new memory (lines=0)
+2026-11-18 00:33:15 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:33:15 autonomous-c rc=0 autonomous-c: final loss=0.0059
+2026-11-18 00:33:32 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:33:32 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:42:50 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:42:50 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:42:50 --- cycle 1 ---
+2026-11-18 00:42:50 no new memory (lines=0)
+2026-11-18 00:42:50 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:42:50 autonomous-c rc=0 autonomous-c: final loss=0.0057
+2026-11-18 00:43:07 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:43:07 sleep 1s
+2026-11-18 00:43:08 --- cycle 2 ---
+2026-11-18 00:43:08 no new memory (lines=0)
+2026-11-18 00:43:08 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:43:08 autonomous-c rc=0 autonomous-c: final loss=0.0056
+2026-11-18 00:43:25 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:43:25 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:47:42 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:47:42 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:47:42 --- cycle 1 ---
+2026-11-18 00:47:42 no new memory (lines=0)
+2026-11-18 00:47:42 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:47:42 autonomous-c rc=0 autonomous-c: final loss=0.0054
+2026-11-18 00:47:59 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:47:59 sleep 1s
+2026-11-18 00:48:00 --- cycle 2 ---
+2026-11-18 00:48:00 no new memory (lines=0)
+2026-11-18 00:48:00 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:48:00 autonomous-c rc=0 autonomous-c: final loss=0.0053
+2026-11-18 00:48:17 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:48:17 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:49:42 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:49:42 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:49:42 --- cycle 1 ---
+2026-11-18 00:49:42 no new memory (lines=0)
+2026-11-18 00:49:42 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:49:42 autonomous-c rc=0 autonomous-c: final loss=0.0051
+2026-11-18 00:49:59 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:49:59 sleep 1s
+2026-11-18 00:50:00 --- cycle 2 ---
+2026-11-18 00:50:00 no new memory (lines=0)
+2026-11-18 00:50:00 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:50:00 autonomous-c rc=0 autonomous-c: final loss=0.0050
+2026-11-18 00:50:16 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:50:16 === VERUM DAEMON DONE after 2 cycles ===
+2026-11-18 00:55:43 === VERUM DAEMON START (automated, no human trigger per cycle) ===
+2026-11-18 00:55:43 watching /home/hatch/workspace/Verum-Bespoke-Singularity/verum-memory.tsv initial_lines=0
+2026-11-18 00:55:43 --- cycle 1 ---
+2026-11-18 00:55:43 no new memory (lines=0)
+2026-11-18 00:55:43 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:55:43 autonomous-c rc=0 autonomous-c: final loss=0.0049
+2026-11-18 00:55:59 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:55:59 sleep 1s
+2026-11-18 00:56:00 --- cycle 2 ---
+2026-11-18 00:56:00 no new memory (lines=0)
+2026-11-18 00:56:00 autotune rc=0 autotune: reused config -> verum-autotune.json (backend=Vulkan threads=4 window=991 MiB)
+2026-11-18 00:56:00 autonomous-c rc=0 autonomous-c: final loss=0.0048
+2026-11-18 00:56:17 loop rc=0 [loop] done: 2 iterations, 1 accepted, 1 rejected, 1 swaps, 0 rollbacks
+2026-11-18 00:56:17 === VERUM DAEMON DONE after 2 cycles ===

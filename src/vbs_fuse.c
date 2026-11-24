@@ -11,29 +11,26 @@
 #include <string.h>
 #include <time.h>
 
-static double now_sec(void) {
-    return vbs_now_sec();
-}
-
 static vbs_fused_ffn_fn g_fn = NULL;
 static bool g_enabled = true;
 static void *g_handle = NULL;
-static vbs_ggml_type_t g_type = VBS_GGML_TYPE_F32;
+static vbs_model_type_t g_type = VBS_MODEL_TYPE_F32;
 static size_t g_emb = 0, g_ffn = 0;
 static bool g_cache_hit = false;
 static char g_path[1024] = "";
 static double g_build_sec = 0.0;
 static double g_verify_max_rel_err = 0.0;
 
-vbs_fused_ffn_fn vbs_fuse_lookup(vbs_ggml_type_t type, size_t emb, size_t ffn) {
+vbs_fused_ffn_fn vbs_fuse_lookup(vbs_model_type_t type, size_t emb, size_t ffn) {
     if (!g_fn || !g_enabled) return NULL;
     if (type != g_type || emb != g_emb || ffn != g_ffn) return NULL;
     return g_fn;
 }
 
-/* Enable/disable the loaded kernel without unloading it. Used by the
- * --fuse benchmark to interleave reference and fused rounds on the same
- * model so both are measured under the same machine conditions. */
+/* Enable/disable the loaded kernel without unloading it. Used by
+ * the --fuse benchmark to interleave reference and fused rounds
+ * on the same model so both are measured under the same machine
+ * conditions. */
 void vbs_fuse_set_enabled(bool on) { g_enabled = on; }
 
 bool vbs_fuse_cache_hit(void) { return g_cache_hit; }
@@ -53,19 +50,6 @@ static bool file_exists(const char *p) {
     return vbs_stat_exists(p) != 0;
 }
 
-static void mkdir_p(const char *dir) {
-    char tmp[1024];
-    snprintf(tmp, sizeof(tmp), "%s", dir);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            vbs_mkdir(tmp);
-            *p = '/';
-        }
-    }
-    vbs_mkdir(tmp);
-}
-
 static bool sha256_file(const char *path, char *hex_out, size_t hex_cap) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -81,6 +65,13 @@ static bool sha256_file(const char *path, char *hex_out, size_t hex_cap) {
     for (int i = 0; i < 32; i++) sprintf(hex_out + i * 2, "%02x", digest[i]);
     hex_out[64] = '\0';
     return true;
+}
+
+/* Bytes per 32-element block for the fused types. */
+static size_t fuse_stride(vbs_model_type_t type) {
+    if (type == VBS_MODEL_TYPE_Q8_0) return 34;
+    if (type == VBS_MODEL_TYPE_Q4_0) return 18;
+    return 20; /* Q4_1 */
 }
 
 /* --- Code generation --- */
@@ -111,13 +102,48 @@ static const char *fuse_prelude =
     "    float out; memcpy(&out, &bits, sizeof(out)); return out;\n"
     "}\n\n";
 
-static bool emit_source(const char *path, vbs_ggml_type_t type, size_t emb, size_t ffn) {
+/* Emit the per-block inner loop for Q8_0 weights. */
+static void emit_q8_body(FILE *f) {
+    fprintf(f,
+        "            const int8_t *gw = (const int8_t *)(g + b * F_STRIDE + 2);\n"
+        "            const int8_t *uw = (const int8_t *)(u + b * F_STRIDE + 2);\n"
+        "            int dg = 0, du = 0;\n"
+        "            for (size_t i = 0; i < 32; i++) { dg += (int)gw[i] * (int)x[i]; du += (int)uw[i] * (int)x[i]; }\n"
+        "            gs += f16_to_f32(r16(g + b * F_STRIDE)) * qd[b] * (float)dg;\n"
+        "            us += f16_to_f32(r16(u + b * F_STRIDE)) * qd[b] * (float)du;\n");
+}
+
+/* Emit the per-block inner loop for Q4_0/Q4_1 weights. Q4_1
+ * nibbles are unsigned with a separate min term; Q4_0 nibbles
+ * are offset by 8. */
+static void emit_q4_body(FILE *f, bool q41) {
+    int nib_off = q41 ? 4 : 2;
+    int bias = q41 ? 0 : 8;
+    fprintf(f,
+        "            const uint8_t *gw = g + b * F_STRIDE + %d;\n"
+        "            const uint8_t *uw = u + b * F_STRIDE + %d;\n"
+        "            int dg = 0, du = 0;\n"
+        "            for (size_t i = 0; i < 16; i++) {\n"
+        "                int xa = (int)x[i], xb = (int)x[i + 16];\n"
+        "                dg += ((int)(gw[i] & 15u) - %d) * xa + ((int)(gw[i] >> 4) - %d) * xb;\n"
+        "                du += ((int)(uw[i] & 15u) - %d) * xa + ((int)(uw[i] >> 4) - %d) * xb;\n"
+        "            }\n"
+        "            gs += f16_to_f32(r16(g + b * F_STRIDE)) * qd[b] * (float)dg;\n"
+        "            us += f16_to_f32(r16(u + b * F_STRIDE)) * qd[b] * (float)du;\n",
+        nib_off, nib_off, bias, bias, bias, bias);
+    if (q41) {
+        fprintf(f,
+            "            gs += f16_to_f32(r16(g + b * F_STRIDE + 2)) * qsum[b];\n"
+            "            us += f16_to_f32(r16(u + b * F_STRIDE + 2)) * qsum[b];\n");
+    }
+}
+
+static bool emit_source(const char *path, vbs_model_type_t type, size_t emb, size_t ffn) {
     FILE *f = fopen(path, "w");
     if (!f) return false;
     size_t nblocks = emb / 32;
-    size_t stride = (type == VBS_GGML_TYPE_Q8_0) ? 34
-                  : (type == VBS_GGML_TYPE_Q4_0) ? 18 : 20;
-    int q41 = (type == VBS_GGML_TYPE_Q4_1);
+    size_t stride = fuse_stride(type);
+    bool q41 = (type == VBS_MODEL_TYPE_Q4_1);
     fprintf(f, "%s", fuse_prelude);
     fprintf(f, "#define F_EMB %zu\n#define F_FFN %zu\n#define F_NBLOCKS %zu\n#define F_STRIDE %zu\n\n",
             emb, ffn, nblocks, stride);
@@ -135,34 +161,8 @@ static bool emit_source(const char *path, vbs_ggml_type_t type, size_t emb, size
         "        float gs = 0.0f, us = 0.0f;\n"
         "        for (size_t b = 0; b < F_NBLOCKS; b++) {\n"
         "            const int8_t *x = xq + b * 32;\n");
-    if (type == VBS_GGML_TYPE_Q8_0) {
-        fprintf(f,
-            "            const int8_t *gw = (const int8_t *)(g + b * F_STRIDE + 2);\n"
-            "            const int8_t *uw = (const int8_t *)(u + b * F_STRIDE + 2);\n"
-            "            int dg = 0, du = 0;\n"
-            "            for (size_t i = 0; i < 32; i++) { dg += (int)gw[i] * (int)x[i]; du += (int)uw[i] * (int)x[i]; }\n"
-            "            gs += f16_to_f32(r16(g + b * F_STRIDE)) * qd[b] * (float)dg;\n"
-            "            us += f16_to_f32(r16(u + b * F_STRIDE)) * qd[b] * (float)du;\n");
-    } else {
-        fprintf(f,
-            "            const uint8_t *gw = g + b * F_STRIDE + %d;\n"
-            "            const uint8_t *uw = u + b * F_STRIDE + %d;\n"
-            "            int dg = 0, du = 0;\n"
-            "            for (size_t i = 0; i < 16; i++) {\n"
-            "                int xa = (int)x[i], xb = (int)x[i + 16];\n"
-            "                dg += ((int)(gw[i] & 15u) - %d) * xa + ((int)(gw[i] >> 4) - %d) * xb;\n"
-            "                du += ((int)(uw[i] & 15u) - %d) * xa + ((int)(uw[i] >> 4) - %d) * xb;\n"
-            "            }\n"
-            "            gs += f16_to_f32(r16(g + b * F_STRIDE)) * qd[b] * (float)dg;\n"
-            "            us += f16_to_f32(r16(u + b * F_STRIDE)) * qd[b] * (float)du;\n",
-            q41 ? 4 : 2, q41 ? 4 : 2,
-            q41 ? 0 : 8, q41 ? 0 : 8, q41 ? 0 : 8, q41 ? 0 : 8);
-        if (q41) {
-            fprintf(f,
-                "            gs += f16_to_f32(r16(g + b * F_STRIDE + 2)) * qsum[b];\n"
-                "            us += f16_to_f32(r16(u + b * F_STRIDE + 2)) * qsum[b];\n");
-        }
-    }
+    if (type == VBS_MODEL_TYPE_Q8_0) emit_q8_body(f);
+    else emit_q4_body(f, q41);
     fprintf(f,
         "        }\n"
         "        hidden[r] = (gs / (1.0f + expf(-gs))) * us;\n"
@@ -175,82 +175,90 @@ static bool emit_source(const char *path, vbs_ggml_type_t type, size_t emb, size
 /* --- Numeric verification against the reference FFN path --- */
 
 static uint32_t rng_state = 0x12345678u;
-static uint32_t rng_next(void) {
-    rng_state ^= rng_state << 13;
-    rng_state ^= rng_state >> 17;
-    rng_state ^= rng_state << 5;
-    return rng_state;
+/* Test-data randoms use vbs_xorshift32_next(&rng_state) from vbs_port.h. */
+
+typedef struct {
+    uint8_t *gw, *uw;
+    int8_t *xq;
+    float *qd, *qsum;
+    float *ref_gate, *ref_up, *ref_hidden, *got;
+} verify_ws_t;
+
+static void verify_ws_free(verify_ws_t *w) {
+    free(w->gw); free(w->uw); free(w->xq); free(w->qd); free(w->qsum);
+    free(w->ref_gate); free(w->ref_up); free(w->ref_hidden); free(w->got);
 }
 
-static bool verify_fused(vbs_fused_ffn_fn fn, vbs_ggml_type_t type, size_t emb, size_t ffn,
+static bool verify_fused(vbs_fused_ffn_fn fn, vbs_model_type_t type, size_t emb, size_t ffn,
                          double *max_rel_err) {
     size_t nblocks = emb / 32;
-    size_t stride = (type == VBS_GGML_TYPE_Q8_0) ? 34
-                  : (type == VBS_GGML_TYPE_Q4_0) ? 18 : 20;
+    size_t stride = fuse_stride(type);
     size_t wbytes = ffn * nblocks * stride;
-    uint8_t *gw = (uint8_t *)malloc(wbytes);
-    uint8_t *uw = (uint8_t *)malloc(wbytes);
-    int8_t *xq = (int8_t *)malloc(emb);
-    float *qd = (float *)malloc(nblocks * sizeof(float));
-    float *qsum = (float *)malloc(nblocks * sizeof(float));
-    float *ref_gate = (float *)malloc(ffn * sizeof(float));
-    float *ref_up = (float *)malloc(ffn * sizeof(float));
-    float *ref_hidden = (float *)malloc(ffn * sizeof(float));
-    float *got = (float *)malloc(ffn * sizeof(float));
-    if (!gw || !uw || !xq || !qd || !qsum || !ref_gate || !ref_up || !ref_hidden || !got) {
-        free(gw); free(uw); free(xq); free(qd); free(qsum);
-        free(ref_gate); free(ref_up); free(ref_hidden); free(got);
+    verify_ws_t w;
+    memset(&w, 0, sizeof(w));
+    w.gw = (uint8_t *)malloc(wbytes);
+    w.uw = (uint8_t *)malloc(wbytes);
+    w.xq = (int8_t *)malloc(emb);
+    w.qd = (float *)malloc(nblocks * sizeof(float));
+    w.qsum = (float *)malloc(nblocks * sizeof(float));
+    w.ref_gate = (float *)malloc(ffn * sizeof(float));
+    w.ref_up = (float *)malloc(ffn * sizeof(float));
+    w.ref_hidden = (float *)malloc(ffn * sizeof(float));
+    w.got = (float *)malloc(ffn * sizeof(float));
+    if (!w.gw || !w.uw || !w.xq || !w.qd || !w.qsum ||
+        !w.ref_gate || !w.ref_up || !w.ref_hidden || !w.got) {
+        verify_ws_free(&w);
         return false;
     }
     /* Random packed weights with sane f16 scales (0x3c00 = 1.0, 0x3800 = 0.5). */
     for (size_t i = 0; i < wbytes; i++) {
-        gw[i] = (uint8_t)(rng_next() & 0xff);
-        uw[i] = (uint8_t)(rng_next() & 0xff);
+        w.gw[i] = (uint8_t)(vbs_xorshift32_next(&rng_state) & 0xff);
+        w.uw[i] = (uint8_t)(vbs_xorshift32_next(&rng_state) & 0xff);
     }
     for (size_t r = 0; r < ffn; r++) {
         for (size_t b = 0; b < nblocks; b++) {
-            uint8_t *g = gw + r * nblocks * stride + b * stride;
-            uint8_t *u = uw + r * nblocks * stride + b * stride;
+            uint8_t *g = w.gw + r * nblocks * stride + b * stride;
+            uint8_t *u = w.uw + r * nblocks * stride + b * stride;
             g[0] = 0x00; g[1] = 0x3c; /* d = 1.0 */
             u[0] = 0x00; u[1] = 0x38; /* d = 0.5 */
-            if (type == VBS_GGML_TYPE_Q4_1) {
+            if (type == VBS_MODEL_TYPE_Q4_1) {
                 g[2] = 0x00; g[3] = 0x34; /* min = 0.25 */
                 u[2] = 0x00; u[3] = 0x30; /* min = 0.125 */
             }
         }
     }
-    for (size_t i = 0; i < emb; i++) xq[i] = (int8_t)((int)(rng_next() % 255) - 127);
+    for (size_t i = 0; i < emb; i++)
+        w.xq[i] = (int8_t)((int)(vbs_xorshift32_next(&rng_state) % 255) - 127);
     for (size_t b = 0; b < nblocks; b++) {
-        qd[b] = 0.01f;
-        qsum[b] = 0.5f;
+        w.qd[b] = 0.01f;
+        w.qsum[b] = 0.5f;
     }
 
     const vbs_hot_kernels_t *ref = vbs_hot_builtin();
-    if (type == VBS_GGML_TYPE_Q8_0) {
-        ref->matvec_q8_0(gw, ffn, emb, xq, qd, ref_gate);
-        ref->matvec_q8_0(uw, ffn, emb, xq, qd, ref_up);
-    } else if (type == VBS_GGML_TYPE_Q4_0) {
-        ref->matvec_q4_0(gw, ffn, emb, xq, qd, ref_gate);
-        ref->matvec_q4_0(uw, ffn, emb, xq, qd, ref_up);
+    if (type == VBS_MODEL_TYPE_Q8_0) {
+        ref->matvec_q8_0(w.gw, ffn, emb, w.xq, w.qd, w.ref_gate);
+        ref->matvec_q8_0(w.uw, ffn, emb, w.xq, w.qd, w.ref_up);
+    } else if (type == VBS_MODEL_TYPE_Q4_0) {
+        ref->matvec_q4_0(w.gw, ffn, emb, w.xq, w.qd, w.ref_gate);
+        ref->matvec_q4_0(w.uw, ffn, emb, w.xq, w.qd, w.ref_up);
     } else {
-        ref->matvec_q4_1(gw, ffn, emb, xq, qd, qsum, ref_gate);
-        ref->matvec_q4_1(uw, ffn, emb, xq, qd, qsum, ref_up);
+        ref->matvec_q4_1(w.gw, ffn, emb, w.xq, w.qd, w.qsum, w.ref_gate);
+        ref->matvec_q4_1(w.uw, ffn, emb, w.xq, w.qd, w.qsum, w.ref_up);
     }
     for (size_t i = 0; i < ffn; i++) {
-        ref_hidden[i] = (ref_gate[i] / (1.0f + expf(-ref_gate[i]))) * ref_up[i];
+        w.ref_hidden[i] = (w.ref_gate[i] / (1.0f + expf(-w.ref_gate[i]))) * w.ref_up[i];
     }
-    fn(gw, uw, ffn, emb, xq, qd, qsum, got);
+    fn(w.gw, w.uw, ffn, emb, w.xq, w.qd, w.qsum, w.got);
 
     double worst = 0.0;
     for (size_t i = 0; i < ffn; i++) {
-        double denom = fabs((double)ref_hidden[i]);
+        double denom = fabs((double)w.ref_hidden[i]);
         if (denom < 1e-6) denom = 1e-6;
-        double rel = fabs((double)got[i] - (double)ref_hidden[i]) / denom;
+        double rel = fabs((double)w.got[i] - (double)w.ref_hidden[i]) / denom;
         if (rel > worst) worst = rel;
     }
     *max_rel_err = worst;
-    free(gw); free(uw); free(xq); free(qd); free(qsum);
-    free(ref_gate); free(ref_up); free(ref_hidden); free(got);
+    verify_ws_free(&w);
     return worst < 1e-4;
 }
 
@@ -258,30 +266,30 @@ static bool verify_fused(vbs_fused_ffn_fn fn, vbs_ggml_type_t type, size_t emb, 
 
 bool vbs_fuse_build_and_load(const char *model_path, const char *cache_dir,
                              char *err, size_t err_cap) {
-    double t0 = now_sec();
+    double t0 = vbs_now_sec();
     g_cache_hit = false;
     g_verify_max_rel_err = 0.0;
 
     char gerr[512] = {0};
-    vbs_gguf_model_t *g = vbs_gguf_open(model_path, gerr, sizeof(gerr));
+    vbs_model_t *g = vbs_model_open(model_path, gerr, sizeof(gerr));
     if (!g) {
         snprintf(err, err_cap, "fuse: cannot open model: %s", gerr);
         return false;
     }
     uint32_t emb = 0, ffn = 0;
-    bool ok = vbs_gguf_get_uint32_metadata(g, "llama.embedding_length", &emb) &&
-              vbs_gguf_get_uint32_metadata(g, "llama.feed_forward_length", &ffn);
-    const vbs_tensor_t *gate = vbs_gguf_get_tensor(g, "blk.0.ffn_gate.weight");
-    const vbs_tensor_t *up = vbs_gguf_get_tensor(g, "blk.0.ffn_up.weight");
+    bool ok = vbs_model_get_uint32_metadata(g, "llama.embedding_length", &emb) &&
+              vbs_model_get_uint32_metadata(g, "llama.feed_forward_length", &ffn);
+    const vbs_tensor_t *gate = vbs_model_get_tensor(g, "blk.0.ffn_gate.weight");
+    const vbs_tensor_t *up = vbs_model_get_tensor(g, "blk.0.ffn_up.weight");
     if (!ok || !gate || !up || gate->type != up->type ||
-        (gate->type != VBS_GGML_TYPE_Q8_0 && gate->type != VBS_GGML_TYPE_Q4_0 &&
-         gate->type != VBS_GGML_TYPE_Q4_1)) {
+        (gate->type != VBS_MODEL_TYPE_Q8_0 && gate->type != VBS_MODEL_TYPE_Q4_0 &&
+         gate->type != VBS_MODEL_TYPE_Q4_1)) {
         snprintf(err, err_cap, "fuse: model lacks matching quantized gate/up weights");
-        vbs_gguf_close(g);
+        vbs_model_close(g);
         return false;
     }
-    vbs_ggml_type_t type = gate->type;
-    vbs_gguf_close(g);
+    vbs_model_type_t type = gate->type;
+    vbs_model_close(g);
 
     char hash[65];
     if (!sha256_file(model_path, hash, sizeof(hash))) {
@@ -292,11 +300,11 @@ bool vbs_fuse_build_and_load(const char *model_path, const char *cache_dir,
     vbs_tune_fingerprint(fp, sizeof(fp));
     char key[256];
     snprintf(key, sizeof(key), "%.16s_%s_%ux%u_%.8s", hash,
-             vbs_hot_type_name(type == VBS_GGML_TYPE_Q8_0 ? 0
-                               : type == VBS_GGML_TYPE_Q4_0 ? 1 : 2),
+             vbs_hot_type_name(type == VBS_MODEL_TYPE_Q8_0 ? 0
+                               : type == VBS_MODEL_TYPE_Q4_0 ? 1 : 2),
              emb, ffn, fp);
     if (!cache_dir || !*cache_dir) cache_dir = ".verum-fuse-cache";
-    mkdir_p(cache_dir);
+    vbs_mkdir_p(cache_dir);
     char src_path[1024], so_path[1024];
     snprintf(src_path, sizeof(src_path), "%s/fused_%s.c", cache_dir, key);
     snprintf(so_path, sizeof(so_path), "%s/fused_%s.so", cache_dir, key);
@@ -308,9 +316,10 @@ bool vbs_fuse_build_and_load(const char *model_path, const char *cache_dir,
             snprintf(err, err_cap, "fuse: cannot write generated source to %s", src_path);
             return false;
         }
-        /* -march=native lets the compiler auto-vectorize for THIS machine;
-         * the machine fingerprint in the cache key makes the .so
-         * non-portable by construction, so it can never load elsewhere. */
+        /* -march=native lets the compiler auto-vectorize for THIS
+         * machine; the machine fingerprint in the cache key makes
+         * the .so non-portable by construction, so it can never
+         * load elsewhere. */
         const char *native_args[] = {"-march=native", "-lm"};
         const char *plain_args[] = {"-lm"};
         char cerr[2048] = {0};
@@ -350,6 +359,6 @@ bool vbs_fuse_build_and_load(const char *model_path, const char *cache_dir,
     g_emb = emb;
     g_ffn = ffn;
     snprintf(g_path, sizeof(g_path), "%s", so_path);
-    g_build_sec = now_sec() - t0;
+    g_build_sec = vbs_now_sec() - t0;
     return true;
 }

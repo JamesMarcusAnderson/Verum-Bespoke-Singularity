@@ -1,8 +1,9 @@
 # Verum-Bespoke-Singularity — CMake build.
 #
-# The Makefile is the primary build; this file exists so Windows users can
-# build with MSVC (no MinGW needed) and so any CMake-based workflow works.
-# Same sources, same flags, same C11 standard as the Makefile.
+# The Makefile is the primary build; this file exists so Windows users
+# can build with MSVC (no MinGW needed) and so any CMake-based workflow
+# works. Same sources, same defines, same C11 standard as the Makefile;
+# keep the source list in step with the Makefile when adding files.
 #
 #   Linux/macOS:  cmake -S . -B build && cmake --build build
 #   Windows MSVC: cmake -S . -B build   (Visual Studio generator, VS2019+)
@@ -12,9 +13,9 @@
 #                       -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc
 #                 cmake --build build-mingw
 #
-# MSVC status: documented, untested on a real Windows machine — the
-# windows-msvc CI job is the first MSVC run. MinGW via CMake is verified
-# (cross-compiled and run under Wine); see PORTABLE.md.
+# MSVC status: the windows-msvc CI job builds this file on real Windows.
+# MinGW via CMake is verified (cross-compiled and run under Wine);
+# see PORTABLE.md.
 
 cmake_minimum_required(VERSION 3.16)
 project(verum-slice C)
@@ -26,30 +27,37 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(VBS_SRC
     src/main.c
     src/tokenizer.c
-    src/vbs_gguf.c
+    src/vbs_model.c
     src/vbs_graph.c
-    src/vbs_backend_cuda.c
-    src/vbs_backend_hip.c
-    src/vbs_backend_vulkan.c
+    src/vbs_cpu.c
+    src/vbs_dequant.c
+    src/vbs_sampling.c
     src/vbs_backend_cpu.c
+    src/vbs_backend_gpu.c
+    src/vbs_gpu_vendors.c
+    src/driver/vbs_drv.c
+    src/driver/vbs_drv_turing_enc.c
+    src/driver/vbs_drv_turing.c
+    src/driver/vbs_drv_rdna2_enc.c
+    src/driver/vbs_drv_rdna2.c
+    src/driver/vbs_drv_alchemist_enc.c
+    src/driver/vbs_drv_alchemist.c
+    src/driver/vbs_backend_native.c
     src/vbs_backend_select.c
     src/vbs_backend_test.c
-    src/vbs_slice_executor.c
-    src/vbs_engine.c
-    src/vbs_profiler.c
-    src/vbs_fabric.c
-    src/vbs_planner.c
     src/vbs_specializer.c
     src/vbs_specializer_bridge.c
+    src/vbs_engine.c
+    src/vbs_slice_executor.c
+    src/vbs_fabric.c
+    src/vbs_planner.c
+    src/vbs_profiler.c
     src/vbs_learn.c
     src/vbs_train.c
     src/vbs_block.c
     src/vbs_autonomy.c
     src/vbs_scheduler.c
     src/vbs_autotune.c
-    src/vbs_cpu.c
-    src/vbs_dequant.c
-    src/vbs_sampling.c
     src/vbs_hotpath.c
     src/vbs_cc.c
     src/vbs_loop.c
@@ -59,25 +67,16 @@ set(VBS_SRC
     src/compiler/parser.c
     src/compiler/typecheck.c
     src/compiler/driver.c
-    src/compiler/ptx_emit.c
-    src/compiler/ptx_validate.c
-    src/compiler/msl_emit.c
-    src/compiler/spirv_emit.c
-    src/compiler/spirv_validate.c
-    src/compiler/gcn_emit.c
-    src/compiler/gcn_validate.c
-    src/compiler/native_emit_stub.c
+    src/compiler/emit_vendors.c
+    src/compiler/kernel_emit.c
+    src/compiler/kernel_validate.c
 )
-
-if(APPLE)
-    list(APPEND VBS_SRC src/vbs_backend_metal.c)
-endif()
 
 add_executable(verum-slice ${VBS_SRC})
 target_include_directories(verum-slice PRIVATE include)
 
-# Same defines as the Makefile. _GNU_SOURCE exposes clock_gettime/strtok_r
-# on glibc; harmless on MSVC/MinGW.
+# Same defines as the Makefile. _GNU_SOURCE exposes clock_gettime and
+# the reentrant string helpers on glibc; harmless on MSVC/MinGW.
 target_compile_definitions(verum-slice PRIVATE
     _GNU_SOURCE
     VBS_ENABLE_CUDA=1

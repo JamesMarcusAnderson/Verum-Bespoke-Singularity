@@ -1,0 +1,25 @@
+// rope.comp — rotary position embedding, applied in place to x.
+// One invocation per element pair; the rotation angle uses the
+// caller's theta (not a fixed base). Binding: 0=x (f32, in/out).
+// Push: pos, head_dim, n_heads, theta.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint head_dim; uint n_heads; float theta;
+} pc;
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint pairs_per_head = pc.head_dim / 2u;
+    if (pair >= pairs_per_head * pc.n_heads) return;
+    uint head = pair / pairs_per_head;
+    uint slot = 2u * (pair % pairs_per_head);
+    float angle = float(pc.pos) * pow(pc.theta, -float(slot) / float(pc.head_dim));
+    float c = cos(angle);
+    float s = sin(angle);
+    uint at = head * pc.head_dim + slot;
+    float first = x[at];
+    float second = x[at + 1u];
+    x[at] = first * c - second * s;
+    x[at + 1u] = first * s + second * c;
+}

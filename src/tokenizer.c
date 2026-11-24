@@ -1,3 +1,8 @@
+/* tokenizer.c — BPE tokenizer for tokenizer.json files
+ * (HuggingFace format): a minimal JSON reader, a vocabulary map,
+ * a merge table, the GPT-2 byte-level encoder, and the GPT-2
+ * pre-tokenizer segmentation rules.
+ */
 #include "tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,20 +11,34 @@
 #include <limits.h>
 #include <ctype.h>
 
-typedef struct { const char *p, *end; } jr_t;
+/* --- Minimal JSON reader over a memory buffer --- */
 
-static void jr_ws(jr_t *r) {
-    while (r->p < r->end && (*r->p == ' ' || *r->p == '\t' || *r->p == '\n' || *r->p == '\r')) r->p++;
+typedef struct {
+    const char *p, *end;
+} json_reader_t;
+
+static void json_skip_ws(json_reader_t *r) {
+    while (r->p < r->end &&
+           (*r->p == ' ' || *r->p == '\t' || *r->p == '\n' || *r->p == '\r'))
+        r->p++;
 }
 
-static int jr_ch(jr_t *r, char c) {
-    jr_ws(r);
-    if (r->p < r->end && *r->p == c) { r->p++; return 1; }
+/* Consume `c` after whitespace; 1 if it was there. */
+static int json_expect(json_reader_t *r, char c) {
+    json_skip_ws(r);
+    if (r->p < r->end && *r->p == c) {
+        r->p++;
+        return 1;
+    }
     return 0;
 }
 
+/* Encode one code point as UTF-8; returns the byte count. */
 static int utf8_encode_cp(uint32_t cp, char *out) {
-    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
     if (cp < 0x800) {
         out[0] = (char)(0xC0 | (cp >> 6));
         out[1] = (char)(0x80 | (cp & 0x3F));
@@ -38,25 +57,29 @@ static int utf8_encode_cp(uint32_t cp, char *out) {
     return 4;
 }
 
-static int hexval(char c) {
+static int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
 
-static uint32_t jr_hex4(jr_t *r) {
+/* Read up to 4 hex digits (a \u escape); stops at the first
+ * non-hex character. */
+static uint32_t json_hex4(json_reader_t *r) {
     uint32_t v = 0;
     for (int i = 0; i < 4 && r->p < r->end; i++, r->p++) {
-        int d = hexval(*r->p);
+        int d = hex_digit(*r->p);
         if (d < 0) break;
         v = v * 16 + (uint32_t)d;
     }
     return v;
 }
 
-static char *jr_string(jr_t *r, size_t *out_len) {
-    if (!jr_ch(r, '"')) return NULL;
+/* Read a JSON string, decoding escapes into UTF-8. Returns a
+ * malloc'd NUL-terminated buffer (length in *out_len), or NULL. */
+static char *json_string(json_reader_t *r, size_t *out_len) {
+    if (!json_expect(r, '"')) return NULL;
     size_t cap = 64, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) return NULL;
@@ -64,7 +87,10 @@ static char *jr_string(jr_t *r, size_t *out_len) {
         if (len + 8 > cap) {
             cap *= 2;
             char *nb = (char *)realloc(buf, cap);
-            if (!nb) { free(buf); return NULL; }
+            if (!nb) {
+                free(buf);
+                return NULL;
+            }
             buf = nb;
         }
         char c = *r->p++;
@@ -80,12 +106,15 @@ static char *jr_string(jr_t *r, size_t *out_len) {
                 case 'r':  buf[len++] = '\r'; break;
                 case 't':  buf[len++] = '\t'; break;
                 case 'u': {
-                    if (r->end - r->p < 4) { free(buf); return NULL; }
-                    uint32_t cp = jr_hex4(r);
+                    if (r->end - r->p < 4) {
+                        free(buf);
+                        return NULL;
+                    }
+                    uint32_t cp = json_hex4(r);
                     if (cp >= 0xD800 && cp <= 0xDBFF &&
                         r->end - r->p >= 6 && r->p[0] == '\\' && r->p[1] == 'u') {
                         r->p += 2;
-                        uint32_t lo = jr_hex4(r);
+                        uint32_t lo = json_hex4(r);
                         if (lo >= 0xDC00 && lo <= 0xDFFF)
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                     }
@@ -97,59 +126,71 @@ static char *jr_string(jr_t *r, size_t *out_len) {
             buf[len++] = c;
         }
     }
-    if (r->p >= r->end) { free(buf); return NULL; }
+    if (r->p >= r->end) {
+        free(buf);
+        return NULL;
+    }
     r->p++;
     buf[len] = 0;
     if (out_len) *out_len = len;
     return buf;
 }
 
-static void jr_skip_value(jr_t *r);
+static void json_skip_value(json_reader_t *r);
 
-static void jr_skip_array(jr_t *r) {
-    if (!jr_ch(r, '[')) return;
+static void json_skip_array(json_reader_t *r) {
+    if (!json_expect(r, '[')) return;
     while (r->p < r->end && *r->p != ']') {
-        jr_skip_value(r);
-        jr_ws(r);
+        json_skip_value(r);
+        json_skip_ws(r);
         if (r->p < r->end && *r->p == ',') r->p++;
     }
-    jr_ch(r, ']');
+    json_expect(r, ']');
 }
 
-static void jr_skip_object(jr_t *r) {
-    if (!jr_ch(r, '{')) return;
+static void json_skip_object(json_reader_t *r) {
+    if (!json_expect(r, '{')) return;
     while (r->p < r->end && *r->p != '}') {
         size_t kl;
-        char *k = jr_string(r, &kl);
+        char *k = json_string(r, &kl);
         free(k);
-        jr_ch(r, ':');
-        jr_skip_value(r);
-        jr_ws(r);
+        json_expect(r, ':');
+        json_skip_value(r);
+        json_skip_ws(r);
         if (r->p < r->end && *r->p == ',') r->p++;
     }
-    jr_ch(r, '}');
+    json_expect(r, '}');
 }
 
-static void jr_skip_value(jr_t *r) {
-    jr_ws(r);
+static void json_skip_value(json_reader_t *r) {
+    json_skip_ws(r);
     if (r->p >= r->end) return;
     switch (*r->p) {
-        case '"': { size_t l; char *s = jr_string(r, &l); free(s); break; }
-        case '[': jr_skip_array(r); break;
-        case '{': jr_skip_object(r); break;
+        case '"': {
+            size_t l;
+            char *s = json_string(r, &l);
+            free(s);
+            break;
+        }
+        case '[': json_skip_array(r); break;
+        case '{': json_skip_object(r); break;
         default:
-            while (r->p < r->end && !isspace((unsigned char)*r->p) && !strchr(",]}", *r->p)) r->p++;
+            while (r->p < r->end && !isspace((unsigned char)*r->p) &&
+                   !strchr(",]}", *r->p))
+                r->p++;
     }
 }
 
-static uint64_t fnv1a(const char *s, size_t n) {
+/* --- Hash maps (open addressing, linear probing) --- */
+
+static uint64_t fnv1a_hash(const char *s, size_t n) {
     uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ULL; }
+    for (size_t i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
     return h;
 }
-
-typedef struct { char *key; size_t len; int id; } strslot_t;
-typedef struct { strslot_t *slots; size_t cap; } strmap_t;
 
 static size_t pow2_at_least(size_t n) {
     size_t c = 64;
@@ -157,18 +198,31 @@ static size_t pow2_at_least(size_t n) {
     return c;
 }
 
-static void strmap_init(strmap_t *m, size_t expected) {
+/* String -> id map (vocabulary lookup). */
+typedef struct {
+    char *key;
+    size_t len;
+    int id;
+} str_slot_t;
+
+typedef struct {
+    str_slot_t *slots;
+    size_t cap;
+} str_map_t;
+
+static void str_map_init(str_map_t *m, size_t expected) {
     m->cap = pow2_at_least(expected * 2 + 16);
-    m->slots = (strslot_t *)calloc(m->cap, sizeof(strslot_t));
+    m->slots = (str_slot_t *)calloc(m->cap, sizeof(str_slot_t));
     for (size_t i = 0; i < m->cap; i++) m->slots[i].id = -1;
 }
 
-static void strmap_put(strmap_t *m, const char *key, size_t len, int id) {
-    uint64_t h = fnv1a(key, len);
-    size_t idx = (size_t)(h & (m->cap - 1));
+/* First definition wins: a duplicate key is ignored. */
+static void str_map_put(str_map_t *m, const char *key, size_t len, int id) {
+    size_t idx = (size_t)(fnv1a_hash(key, len) & (m->cap - 1));
     for (size_t probe = 0; probe < m->cap; probe++) {
         if (m->slots[idx].key == NULL) break;
-        if (m->slots[idx].len == len && memcmp(m->slots[idx].key, key, len) == 0) return;
+        if (m->slots[idx].len == len && memcmp(m->slots[idx].key, key, len) == 0)
+            return;
         idx = (idx + 1) & (m->cap - 1);
     }
     if (m->slots[idx].key != NULL) return;
@@ -181,9 +235,8 @@ static void strmap_put(strmap_t *m, const char *key, size_t len, int id) {
     m->slots[idx].id = id;
 }
 
-static int strmap_get(const strmap_t *m, const char *key, size_t len) {
-    uint64_t h = fnv1a(key, len);
-    size_t idx = (size_t)(h & (m->cap - 1));
+static int str_map_get(const str_map_t *m, const char *key, size_t len) {
+    size_t idx = (size_t)(fnv1a_hash(key, len) & (m->cap - 1));
     while (m->slots[idx].key != NULL) {
         if (m->slots[idx].len == len && memcmp(m->slots[idx].key, key, len) == 0)
             return m->slots[idx].id;
@@ -192,17 +245,27 @@ static int strmap_get(const strmap_t *m, const char *key, size_t len) {
     return -1;
 }
 
-typedef struct { uint64_t key; int rank; uint32_t merged; } mslot_t;
-typedef struct { mslot_t *slots; size_t cap; } mergemap_t;
+/* (token, token) -> merged token map, keyed by rank. */
+typedef struct {
+    uint64_t key;
+    int rank;
+    uint32_t merged;
+} merge_slot_t;
+
+typedef struct {
+    merge_slot_t *slots;
+    size_t cap;
+} merge_map_t;
+
 #define MERGE_EMPTY UINT64_MAX
 
-static void mergemap_init(mergemap_t *m, size_t expected) {
+static void merge_map_init(merge_map_t *m, size_t expected) {
     m->cap = pow2_at_least(expected * 2 + 16);
-    m->slots = (mslot_t *)calloc(m->cap, sizeof(mslot_t));
+    m->slots = (merge_slot_t *)calloc(m->cap, sizeof(merge_slot_t));
     for (size_t i = 0; i < m->cap; i++) m->slots[i].key = MERGE_EMPTY;
 }
 
-static void mergemap_put(mergemap_t *m, uint32_t a, uint32_t b, int rank, uint32_t merged) {
+static void merge_map_put(merge_map_t *m, uint32_t a, uint32_t b, int rank, uint32_t merged) {
     uint64_t k = ((uint64_t)a << 32) | (uint64_t)b;
     size_t idx = (size_t)((k * 11400714819323198485ULL) & (m->cap - 1));
     for (size_t probe = 0; probe < m->cap; probe++) {
@@ -215,7 +278,7 @@ static void mergemap_put(mergemap_t *m, uint32_t a, uint32_t b, int rank, uint32
     m->slots[idx].merged = merged;
 }
 
-static int mergemap_get(const mergemap_t *m, uint32_t a, uint32_t b, uint32_t *merged) {
+static int merge_map_get(const merge_map_t *m, uint32_t a, uint32_t b, uint32_t *merged) {
     uint64_t k = ((uint64_t)a << 32) | (uint64_t)b;
     size_t idx = (size_t)((k * 11400714819323198485ULL) & (m->cap - 1));
     while (m->slots[idx].key != MERGE_EMPTY) {
@@ -228,13 +291,19 @@ static int mergemap_get(const mergemap_t *m, uint32_t a, uint32_t b, uint32_t *m
     return -1;
 }
 
-typedef struct { char *text; size_t len; int byte_value; } vocab_entry_t;
+/* --- Vocabulary --- */
+
+typedef struct {
+    char *text;
+    size_t len;
+    int byte_value;
+} vocab_entry_t;
 
 struct tokenizer_t {
     vocab_entry_t *vocab;
     int vocab_size, vocab_cap;
-    strmap_t text2id;
-    mergemap_t merges;
+    str_map_t text2id;
+    merge_map_t merges;
     int byte_to_token[256];
     int eos_token_id;
 };
@@ -249,56 +318,67 @@ static void vocab_put(tokenizer_t *tok, int id, const char *text, size_t len) {
     tok->vocab[id].len = len;
     tok->vocab[id].byte_value = -1;
     if (id >= tok->vocab_size) tok->vocab_size = id + 1;
-    strmap_put(&tok->text2id, text, len, id);
+    str_map_put(&tok->text2id, text, len, id);
 }
 
-static int parse_vocab_object(jr_t *r, tokenizer_t *tok) {
-    if (!jr_ch(r, '{')) return 0;
+static int parse_vocab_object(json_reader_t *r, tokenizer_t *tok) {
+    if (!json_expect(r, '{')) return 0;
     while (r->p < r->end && *r->p != '}') {
         size_t tl;
-        char *text = jr_string(r, &tl);
+        char *text = json_string(r, &tl);
         if (!text) break;
-        jr_ch(r, ':');
-        jr_ws(r);
+        json_expect(r, ':');
+        json_skip_ws(r);
         long long id = strtoll(r->p, (char **)&r->p, 10);
         vocab_put(tok, (int)id, text, tl);
         free(text);
-        jr_ws(r);
+        json_skip_ws(r);
         if (r->p < r->end && *r->p == ',') r->p++;
     }
-    jr_ch(r, '}');
+    json_expect(r, '}');
     return 1;
 }
 
-static int parse_merges_array(jr_t *r, tokenizer_t *tok) {
-    if (!jr_ch(r, '[')) return 0;
+static int parse_merges_array(json_reader_t *r, tokenizer_t *tok) {
+    if (!json_expect(r, '[')) return 0;
     int rank = 0;
     while (r->p < r->end && *r->p != ']') {
         size_t ml;
-        char *m = jr_string(r, &ml);
+        char *m = json_string(r, &ml);
         if (!m) break;
         const char *sp = (const char *)memchr(m, ' ', ml);
         if (sp && sp > m && sp < m + ml - 1) {
             size_t la = (size_t)(sp - m), lb = ml - la - 1;
-            int id_a = strmap_get(&tok->text2id, m, la);
-            int id_b = strmap_get(&tok->text2id, sp + 1, lb);
+            int id_a = str_map_get(&tok->text2id, m, la);
+            int id_b = str_map_get(&tok->text2id, sp + 1, lb);
             char *mt = (char *)malloc(la + lb + 1);
-            if (!mt) { free(m); break; }
+            if (!mt) {
+                free(m);
+                break;
+            }
             memcpy(mt, m, la);
             memcpy(mt + la, sp + 1, lb);
             mt[la + lb] = 0;
-            int id_m = strmap_get(&tok->text2id, mt, la + lb);
+            int id_m = str_map_get(&tok->text2id, mt, la + lb);
             free(mt);
             if (id_a >= 0 && id_b >= 0 && id_m >= 0)
-                mergemap_put(&tok->merges, (uint32_t)id_a, (uint32_t)id_b, rank, (uint32_t)id_m);
+                merge_map_put(&tok->merges, (uint32_t)id_a, (uint32_t)id_b,
+                              rank, (uint32_t)id_m);
             rank++;
         }
         free(m);
-        jr_ws(r);
+        json_skip_ws(r);
         if (r->p < r->end && *r->p == ',') r->p++;
     }
-    jr_ch(r, ']');
+    json_expect(r, ']');
     return 1;
+}
+
+/* The GPT-2 byte encoder maps bytes to code points: printable
+ * bytes keep their own code point; the rest are assigned 256, 257,
+ * ... in byte order. */
+static int byte_is_printable(int b) {
+    return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
 }
 
 tokenizer_t *tokenizer_load(const char *path) {
@@ -306,77 +386,95 @@ tokenizer_t *tokenizer_load(const char *path) {
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long flen = ftell(f);
-    if (flen <= 0) { fclose(f); return NULL; }
+    if (flen <= 0) {
+        fclose(f);
+        return NULL;
+    }
     fseek(f, 0, SEEK_SET);
     char *buf = (char *)malloc((size_t)flen + 1);
-    if (!buf) { fclose(f); return NULL; }
-    if (fread(buf, 1, (size_t)flen, f) != (size_t)flen) { fclose(f); free(buf); return NULL; }
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    if (fread(buf, 1, (size_t)flen, f) != (size_t)flen) {
+        fclose(f);
+        free(buf);
+        return NULL;
+    }
     buf[flen] = 0;
     fclose(f);
 
     tokenizer_t *tok = (tokenizer_t *)calloc(1, sizeof(tokenizer_t));
-    if (!tok) { free(buf); return NULL; }
+    if (!tok) {
+        free(buf);
+        return NULL;
+    }
     tok->vocab_cap = 200000;
     tok->vocab = (vocab_entry_t *)calloc((size_t)tok->vocab_cap, sizeof(vocab_entry_t));
-    if (!tok->vocab) { free(buf); free(tok); return NULL; }
+    if (!tok->vocab) {
+        free(buf);
+        free(tok);
+        return NULL;
+    }
     for (int i = 0; i < tok->vocab_cap; i++) tok->vocab[i].byte_value = -1;
-    strmap_init(&tok->text2id, (size_t)tok->vocab_cap);
-    mergemap_init(&tok->merges, 160000);
+    str_map_init(&tok->text2id, (size_t)tok->vocab_cap);
+    merge_map_init(&tok->merges, 160000);
     tok->eos_token_id = -1;
 
-    jr_t r = { buf, buf + flen };
-    jr_ch(&r, '{');
+    json_reader_t r = { buf, buf + flen };
+    json_expect(&r, '{');
     while (r.p < r.end && *r.p != '}') {
         size_t kl;
-        char *key = jr_string(&r, &kl);
+        char *key = json_string(&r, &kl);
         if (!key) break;
-        jr_ch(&r, ':');
+        json_expect(&r, ':');
         if (strcmp(key, "model") == 0) {
-            jr_ch(&r, '{');
+            json_expect(&r, '{');
             while (r.p < r.end && *r.p != '}') {
                 size_t ikl;
-                char *ik = jr_string(&r, &ikl);
+                char *ik = json_string(&r, &ikl);
                 if (!ik) break;
-                jr_ch(&r, ':');
+                json_expect(&r, ':');
                 if (strcmp(ik, "vocab") == 0) parse_vocab_object(&r, tok);
                 else if (strcmp(ik, "merges") == 0) parse_merges_array(&r, tok);
-                else jr_skip_value(&r);
+                else json_skip_value(&r);
                 free(ik);
-                jr_ws(&r);
+                json_skip_ws(&r);
                 if (r.p < r.end && *r.p == ',') r.p++;
             }
-            jr_ch(&r, '}');
+            json_expect(&r, '}');
         } else {
-            jr_skip_value(&r);
+            json_skip_value(&r);
         }
         free(key);
-        jr_ws(&r);
+        json_skip_ws(&r);
         if (r.p < r.end && *r.p == ',') r.p++;
     }
     free(buf);
 
+    /* Build the byte -> token table from the byte encoder. */
     for (int i = 0; i < 256; i++) tok->byte_to_token[i] = -1;
     int n = 0;
     for (int b = 0; b < 256; b++) {
-        uint32_t cp;
-        int printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-        if (printable) cp = (uint32_t)b;
-        else cp = (uint32_t)(256 + n++);
+        uint32_t cp = byte_is_printable(b) ? (uint32_t)b : (uint32_t)(256 + n++);
         char u8[4];
         int l = utf8_encode_cp(cp, u8);
-        int id = strmap_get(&tok->text2id, u8, (size_t)l);
+        int id = str_map_get(&tok->text2id, u8, (size_t)l);
         tok->byte_to_token[b] = id;
         if (id >= 0 && id < tok->vocab_size) tok->vocab[id].byte_value = b;
     }
 
-    /* Chat models stop on <|im_end|>, not <|endoftext|> (which is often the
-       padding / unknown token); plain GPT-2-style tokenizers have no
-       <|im_end|>, so they fall back to <|endoftext|> as before. */
-    int eos = strmap_get(&tok->text2id, "<|im_end|>", 10);
-    if (eos < 0) eos = strmap_get(&tok->text2id, "<|endoftext|>", 13);
+    /* Chat models stop on <|im_end|>, not <|endoftext|> (which is
+     * often the padding / unknown token); plain GPT-2-style
+     * tokenizers have no <|im_end|>, so they fall back to
+     * <|endoftext|> as before. */
+    int eos = str_map_get(&tok->text2id, "<|im_end|>", 10);
+    if (eos < 0) eos = str_map_get(&tok->text2id, "<|endoftext|>", 13);
     tok->eos_token_id = eos;
     return tok;
 }
+
+/* --- GPT-2 pre-tokenizer segmentation --- */
 
 static size_t utf8_len_of(unsigned char c) {
     if (c < 0x80) return 1;
@@ -386,62 +484,77 @@ static size_t utf8_len_of(unsigned char c) {
     return 1;
 }
 
+static int is_ascii_letter(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+/* Length of the pre-tokenizer segment starting at p. */
 static size_t segment_len_at(const char *p) {
     unsigned char c = (unsigned char)*p;
     size_t n = 0;
+
     if (c == '\'') {
-        /* GPT-2 pre-tokenizer contractions, longest first ('tis -> 't + is,
-           matching the reference regex, which has no word boundary). */
-        static const char *suf[] = {"'re", "'ve", "'ll", "'s", "'t", "'m", "'d"};
+        /* GPT-2 pre-tokenizer contractions, longest first ('tis ->
+         * 't + is, matching the reference regex, which has no word
+         * boundary). */
+        static const char *suf[] = { "'re", "'ve", "'ll", "'s", "'t", "'m", "'d" };
         for (size_t i = 0; i < sizeof(suf) / sizeof(suf[0]); i++) {
             size_t l = strlen(suf[i]);
             if (strncmp(p, suf[i], l) == 0) return l;
         }
     }
-    if (c == ' ' && p[1] != '\0' && p[1] != ' ' && p[1] != '\t' && p[1] != '\r' && p[1] != '\n') {
-        /* The GPT-2 pre-tokenizer regex attaches one leading space to the
-           following run (" Hello" is one piece, "ĠHello"), so a lone space
-           belongs to the next segment, not its own. A run of 2+ spaces
-           stays a whitespace segment, as in the reference. */
+    if (c == ' ' && p[1] != '\0' && p[1] != ' ' && p[1] != '\t' &&
+        p[1] != '\r' && p[1] != '\n') {
+        /* The GPT-2 pre-tokenizer regex attaches one leading space
+         * to the following run (" Hello" is one piece, "ĠHello"),
+         * so a lone space belongs to the next segment, not its
+         * own. A run of 2+ spaces stays a whitespace segment, as
+         * in the reference. */
         return 1 + segment_len_at(p + 1);
     }
-    if (c == '\r' || c == '\n') { while (p[n] == '\r' || p[n] == '\n') n++; return n; }
-    if (c == ' ' || c == '\t' || c == '\v' || c == '\f') { while (p[n] == ' ' || p[n] == '\t' || p[n] == '\v' || p[n] == '\f') n++; return n; }
-    if (c >= '0' && c <= '9') { while (p[n] >= '0' && p[n] <= '9' && n < 3) n++; return n; }
-    /* The reference pre-tokenizer matches Unicode letters (\p{L}+), so a
-       word continues through multi-byte characters ("naïve" is one piece,
-       not "na" + "ï" + "ve"). Treating every multi-byte sequence as a
-       letter is a safe approximation here: BPE can only merge pairs that
-       exist in the merge table, so a stray punctuation mark inside a
-       segment still tokenizes on its own. */
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+    if (c == '\r' || c == '\n') {
+        while (p[n] == '\r' || p[n] == '\n') n++;
+        return n;
+    }
+    if (c == ' ' || c == '\t' || c == '\v' || c == '\f') {
+        while (p[n] == ' ' || p[n] == '\t' || p[n] == '\v' || p[n] == '\f') n++;
+        return n;
+    }
+    if (c >= '0' && c <= '9') {
+        while (p[n] >= '0' && p[n] <= '9' && n < 3) n++;
+        return n;
+    }
+    /* The reference pre-tokenizer matches Unicode letters
+     * (\p{L}+), so a word continues through multi-byte characters
+     * ("naïve" is one piece, not "na" + "ï" + "ve"). Treating
+     * every multi-byte sequence as a letter is a safe
+     * approximation here: BPE can only merge pairs that exist in
+     * the merge table, so a stray punctuation mark inside a
+     * segment still tokenizes on its own. */
+    if (is_ascii_letter(c) || c >= 0x80) {
         while (1) {
             unsigned char d = (unsigned char)p[n];
-            if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) n++;
+            if (is_ascii_letter(d)) n++;
             else if (d >= 0x80) n += utf8_len_of(d);
             else break;
         }
         return n;
     }
-    if (c >= 0x80) {
-        while (1) {
-            unsigned char d = (unsigned char)p[n];
-            if (d >= 0x80) n += utf8_len_of(d);
-            else if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')) n++;
-            else break;
-        }
-        return n;
-    }
-    while (p[n] >= 0x21 && p[n] <= 0x7E && !((p[n] >= 'a' && p[n] <= 'z') || (p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= '0' && p[n] <= '9'))) {
-        /* Stop before a "<|" so the special-token scan in the encoder sees
-           it at a segment boundary ("?<|im_end|>" must not glue "?<" to
-           the special token). */
+    /* Punctuation run. */
+    while (p[n] >= 0x21 && p[n] <= 0x7E && !is_ascii_letter((unsigned char)p[n]) &&
+           !(p[n] >= '0' && p[n] <= '9')) {
+        /* Stop before a "<|" so the special-token scan in the
+         * encoder sees it at a segment boundary ("?<|im_end|>"
+         * must not glue "?<" to the special token). */
         if (p[n] == '<' && p[n + 1] == '|') break;
         n++;
     }
     return n > 0 ? n : 1;
 }
 
+/* Apply BPE merges to a token sequence in place: repeatedly find
+ * the lowest-rank adjacent pair and merge every occurrence of it
+ * (left to right, non-overlapping) until no pair merges. */
 static void bpe_apply(const tokenizer_t *tok, uint32_t *t, int *n_inout) {
     int n = *n_inout;
     while (n >= 2) {
@@ -449,16 +562,24 @@ static void bpe_apply(const tokenizer_t *tok, uint32_t *t, int *n_inout) {
         uint32_t ba = 0, bb = 0, bm = 0;
         for (int i = 0; i < n - 1; i++) {
             uint32_t merged;
-            int rank = mergemap_get(&tok->merges, t[i], t[i + 1], &merged);
+            int rank = merge_map_get(&tok->merges, t[i], t[i + 1], &merged);
             if (rank >= 0 && rank < best_rank) {
-                best_rank = rank; best = i; ba = t[i]; bb = t[i + 1]; bm = merged;
+                best_rank = rank;
+                best = i;
+                ba = t[i];
+                bb = t[i + 1];
+                bm = merged;
             }
         }
         if (best < 0) break;
         int w = 0;
         for (int i = 0; i < n; i++) {
-            if (i < n - 1 && t[i] == ba && t[i + 1] == bb) { t[w++] = bm; i++; }
-            else { t[w++] = t[i]; }
+            if (i < n - 1 && t[i] == ba && t[i + 1] == bb) {
+                t[w++] = bm;
+                i++;
+            } else {
+                t[w++] = t[i];
+            }
         }
         n = w;
     }
@@ -470,15 +591,15 @@ size_t tokenizer_encode(tokenizer_t *tok, const char *text, uint32_t *out_tokens
     size_t written = 0;
     const char *p = text;
     while (*p && written < max_tokens) {
-        /* Added special tokens (<|im_start|>, <|im_end|>, ...) are single
-           vocab entries, unreachable through BPE merges; match them
-           literally before segmenting. An unmatched "<|...|>" falls
-           through to normal segmentation. */
+        /* Added special tokens (<|im_start|>, <|im_end|>, ...) are
+         * single vocab entries, unreachable through BPE merges;
+         * match them literally before segmenting. An unmatched
+         * "<|...|>" falls through to normal segmentation. */
         if (p[0] == '<' && p[1] == '|') {
             const char *end = strstr(p, "|>");
             if (end) {
                 size_t slen = (size_t)(end - p) + 2;
-                int sid = strmap_get(&tok->text2id, p, slen);
+                int sid = str_map_get(&tok->text2id, p, slen);
                 if (sid >= 0) {
                     out_tokens[written++] = (uint32_t)sid;
                     p += slen;
@@ -503,21 +624,21 @@ size_t tokenizer_encode(tokenizer_t *tok, const char *text, uint32_t *out_tokens
     return written;
 }
 
-/* Inverse of the GPT-2 byte-level encoder used in tokenizer_load: every
- * code point in a vocab string stands for one original byte (U+0120 "Ġ"
- * is a space, U+010A "Ċ" is a newline, ...). Decoding must run the whole
- * piece through this map, not just single-byte tokens, or multi-character
- * pieces come out with literal "Ġ" characters instead of spaces. */
+/* Inverse of the GPT-2 byte-level encoder used in
+ * tokenizer_load: every code point in a vocab string stands for
+ * one original byte (U+0120 "Ġ" is a space, U+010A "Ċ" is a
+ * newline, ...). Decoding must run the whole piece through this
+ * map, not just single-byte tokens, or multi-character pieces
+ * come out with literal "Ġ" characters instead of spaces. */
 static int cp_to_byte(uint32_t cp) {
     if (cp < 256) {
-        int printable = (cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255);
-        return printable ? (int)cp : -1;
+        return byte_is_printable((int)cp) ? (int)cp : -1;
     }
-    /* Non-printable bytes were assigned 256.. in byte order; invert that. */
+    /* Non-printable bytes were assigned 256.. in byte order;
+     * invert that. */
     int n = 0;
     for (int b = 0; b < 256; b++) {
-        int printable = (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255);
-        if (!printable) {
+        if (!byte_is_printable(b)) {
             if (cp == (uint32_t)(256 + n)) return b;
             n++;
         }
@@ -527,22 +648,40 @@ static int cp_to_byte(uint32_t cp) {
 
 static uint32_t utf8_decode_cp(const unsigned char *s, size_t len, size_t *used) {
     unsigned char c = s[0];
-    if (c < 0x80) { *used = 1; return c; }
-    if ((c & 0xE0) == 0xC0 && len >= 2) { *used = 2; return ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F); }
-    if ((c & 0xF0) == 0xE0 && len >= 3) { *used = 3; return ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) | (uint32_t)(s[2] & 0x3F); }
-    if ((c & 0xF8) == 0xF0 && len >= 4) { *used = 4; return ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) | ((uint32_t)(s[2] & 0x3F) << 6) | (uint32_t)(s[3] & 0x3F); }
+    if (c < 0x80) {
+        *used = 1;
+        return c;
+    }
+    if ((c & 0xE0) == 0xC0 && len >= 2) {
+        *used = 2;
+        return ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0 && len >= 3) {
+        *used = 3;
+        return ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(s[1] & 0x3F) << 6) |
+               (uint32_t)(s[2] & 0x3F);
+    }
+    if ((c & 0xF8) == 0xF0 && len >= 4) {
+        *used = 4;
+        return ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
+               ((uint32_t)(s[2] & 0x3F) << 6) | (uint32_t)(s[3] & 0x3F);
+    }
     *used = 1;
     return c;
 }
 
 char *tokenizer_decode(tokenizer_t *tok, const uint32_t *tokens, size_t n_tokens) {
-    if (!tok) { char *e = (char *)malloc(1); if (e) e[0] = 0; return e; }
+    if (!tok) {
+        char *e = (char *)malloc(1);
+        if (e) e[0] = 0;
+        return e;
+    }
     size_t total = 0;
     for (size_t i = 0; i < n_tokens; i++) {
         uint32_t id = tokens[i];
         if (id < (uint32_t)tok->vocab_size && tok->vocab[id].text) {
-            /* Decoded output is never longer than the vocab text: every
-               code point maps to at most one byte. */
+            /* Decoded output is never longer than the vocab text:
+             * every code point maps to at most one byte. */
             total += tok->vocab[id].len;
         }
     }
@@ -572,7 +711,9 @@ char *tokenizer_decode(tokenizer_t *tok, const uint32_t *tokens, size_t n_tokens
     return r;
 }
 
-int tokenizer_eos_id(const tokenizer_t *tok) { return tok ? tok->eos_token_id : -1; }
+int tokenizer_eos_id(const tokenizer_t *tok) {
+    return tok ? tok->eos_token_id : -1;
+}
 
 void tokenizer_free(tokenizer_t *tok) {
     if (!tok) return;

@@ -19,7 +19,7 @@
 - Windows x86-64, MinGW-w64: `make mingw` cross-compiles verum-slice.exe
   from Linux and runs under Wine (`--help`, `--backends`, `--dequant`,
   `--sample`, `--autonomous-c`, `--train-tiny`, `--autotune`, `--learn`
-  all verified; GGUF open/parse error paths verified with fixture files).
+  all verified; model open/parse error paths verified with fixture files).
   Natively on Windows: build under MSYS2/MinGW with `make mingw`, or
   `cmake -S . -B build && cmake --build build`.
 - Windows x86-64, MSVC: CMake build documented (Visual Studio 2019+,
@@ -37,7 +37,7 @@
   CreateFileMapping, GPU libraries load with LoadLibraryA
   (nvcuda.dll / amdhip64.dll), timers use QueryPerformanceCounter.
 - Temp files go to %TEMP% (GetTempPathA); override with VBS_CACHE_DIR
-  and VBS_SWAP_PATH as on Linux. GGUF parsing requires a little-endian
+  and VBS_SWAP_PATH as on Linux. Model-file parsing requires a little-endian
   host (all x86-64/ARM Windows machines are).
 - The JIT specializer compiles its generated C to a .dll with MinGW gcc
   (or a MinGW-targeting clang) found on PATH, linked against the exe's

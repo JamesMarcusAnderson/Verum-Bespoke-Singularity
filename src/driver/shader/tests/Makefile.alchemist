@@ -1,0 +1,49 @@
+# Verum Alchemist (Intel Xe-HPG) shader path — standalone build.
+#
+# Builds the EU assembler + vector-add kernel and runs the unit
+# tests. Standalone: it does not touch the top-level Verum
+# Makefile/CMakeLists or the driver Makefile (integration is a
+# separate step — see the Intel shader report).
+#
+#   make -f Makefile.alchemist          build tests + list tool
+#   make -f Makefile.alchemist test     build, run all tests,
+#                                       regenerate the listing
+#   make -f Makefile.alchemist clean    remove build outputs
+#
+# Pure C11, -Wall -Wextra -Werror: zero warnings is the bar.
+# No GPU is needed: every test passes on a machine with no /dev/dri.
+
+CC ?= cc
+CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -I..
+
+SHADER_SRC := ../vbs_alchemist_eu.c ../vbs_alchemist_vecadd.c
+
+TESTS := test_alchemist_eu test_alchemist_vecadd
+LIST_TOOL := alchemist_list
+LISTING := ../vbs_alchemist_vecadd.list
+
+.PHONY: all test clean listing
+
+all: $(TESTS) $(LIST_TOOL)
+
+test_alchemist_eu: test_alchemist_eu.c $(SHADER_SRC)
+	$(CC) $(CFLAGS) test_alchemist_eu.c $(SHADER_SRC) -o $@
+
+test_alchemist_vecadd: test_alchemist_vecadd.c $(SHADER_SRC)
+	$(CC) $(CFLAGS) test_alchemist_vecadd.c $(SHADER_SRC) -o $@
+
+$(LIST_TOOL): alchemist_list.c $(SHADER_SRC)
+	$(CC) $(CFLAGS) alchemist_list.c $(SHADER_SRC) -o $@
+
+$(LISTING): $(LIST_TOOL)
+	./$(LIST_TOOL) $@
+
+listing: $(LISTING)
+
+test: $(TESTS) $(LISTING)
+	./test_alchemist_eu
+	./test_alchemist_vecadd
+	@echo "alchemist shader tests: ALL PASS"
+
+clean:
+	rm -f $(TESTS) $(LIST_TOOL)

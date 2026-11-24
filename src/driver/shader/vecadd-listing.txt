@@ -1,0 +1,53 @@
+Verum vecadd — Turing (sm_75) vector-add kernel
+c[i] = a[i] + b[i], one float per thread, bounds-checked
+18 instructions, 288 bytes, 14 registers (R0-R13)
+No shader program header: first instruction at offset 0
+  (digest §5.5; all published cuobjdump samples start at /*0000*/)
+Params in c[0]: a @0x00 (u64), b @0x08 (u64), c @0x10 (u64),
+  n @0x18 (u32), ntid.x @0x1c (u32). CB0 binding: 256 bytes.
+
+addr  encoding (hi word, then lo word)              instruction
+----  ------------------------------------------  -----------
+/*0000*/  0x00000000ff007b82 0x000e220000000a00  LDC.64 R0, c[0x0][0x00]
+         ; opcode 0xb82 [X2] S11+S5 sm_100; .64 type 5<<9; 0xFF<<88 rule (digest §5.3)
+/*0010*/  0x00000200ff027b82 0x000e220000000a00  LDC.64 R2, c[0x0][0x08]
+         ; opcode 0xb82 [X2] S11+S5 sm_100; .64 type 5<<9; 0xFF<<88 rule (digest §5.3)
+/*0020*/  0x00000400ff047b82 0x000e220000000a00  LDC.64 R4, c[0x0][0x10]
+         ; opcode 0xb82 [X2] S11+S5 sm_100; .64 type 5<<9; 0xFF<<88 rule (digest §5.3)
+/*0030*/  0x00000700ff087b82 0x000e220000000800  LDC R8, c[0x0][0x1c]
+         ; opcode 0xb82 [X2] S11+S5 sm_100; .32 type 4<<9 (digest §10 item 1, resolved)
+/*0040*/  0x00000600ff0a7b82 0x000e220000000800  LDC R10, c[0x0][0x18]
+         ; opcode 0xb82 [X2] S11+S5 sm_100; .32 type 4<<9 (digest §10 item 1, resolved)
+/*0050*/  0x0000000000067919 0x000e620000002100  S2R R6, SR_TID.X
+         ; opcode 0x919 [X2] S11+S5 sm_100; sr SR_TID.X = 33<<8 (S11 flag table, S5-confirmed)
+/*0060*/  0x0000000000077919 0x000e620000002500  S2R R7, SR_CTAID.X
+         ; opcode 0x919 [X2] S11+S5 sm_100; sr SR_CTAID.X = 37<<8 (S11 flag table, S5-confirmed via S2UR)
+/*0070*/  0x0000000807097224 0x003ea200078e0206  IMAD R9, R7, R8, R6
+         ; opcode 0x224 [X2] S11+S5 sm_70/sm_100; .S32 default 1<<9; nopd0/nops0 fillers
+/*0080*/  0x0000000a0900720c 0x005ee20003f06070  ISETP.GE.U32.AND P0, PT, R9, R10, PT
+         ; opcode 0x20c [T1] S11 only; .GE 6<<12; 0x7<<4 rule; no nvdisasm hex found — validate on hardware
+/*0090*/  0x000000000000094d 0x008fea0003800000  @P0 EXIT
+         ; opcode 0x94d [X2] S11+S5 sm_70/sm_100; pred P0 at bits 76-79; cp PT at bits 23-25
+/*00a0*/  0x0000000409007825 0x005f2200078e0200  IMAD.WIDE R0, R9, 0x4, R0
+         ; opcode 0x225 + ICR 0x8 -> 0x825 [X2] S11+S5 sm_100; .S32 default; nopd0/nops0 fillers
+/*00b0*/  0x0000000409027825 0x005f2200078e0202  IMAD.WIDE R2, R9, 0x4, R2
+         ; opcode 0x225 + ICR 0x8 -> 0x825 [X2] S11+S5 sm_100; .S32 default; nopd0/nops0 fillers
+/*00c0*/  0x0000000409047825 0x005f2200078e0204  IMAD.WIDE R4, R9, 0x4, R4
+         ; opcode 0x225 + ICR 0x8 -> 0x825 [X2] S11+S5 sm_100; .S32 default; nopd0/nops0 fillers
+/*00d0*/  0x00000000000b7381 0x010e2200001ee900  LDG.E R11, [R0]
+         ; opcode 0x381 [X2] digest §5.3 + S5 sm_70; .E 1<<8, .32 4<<9, .SYS 3<<13, strong 1, cache 1, ldgp PT
+/*00e0*/  0x00000000020c7381 0x010e2200001ee900  LDG.E R12, [R2]
+         ; opcode 0x381 [X2] digest §5.3 + S5 sm_70; .E 1<<8, .32 4<<9, .SYS 3<<13, strong 1, cache 1, ldgp PT
+/*00f0*/  0x0000000c0b0d7221 0x001fca0000000000  FADD R13, R11, R12
+         ; opcode 0x221 [X2] S11+S5 sm_100 (digest §10 item 1, resolved)
+/*0100*/  0x0000000d04007386 0x000fe4000010e900  STG.E [R4], R13
+         ; opcode 0x386 [X2] S11+S5 sm_70/sm_100; .E 1<<8, .32 4<<9, .SYS 3<<13, strong 1, cache 1
+/*0110*/  0x000000000000794d 0x000fea0003800000  EXIT
+         ; opcode 0x94d [X2] S11+S5 sm_70/sm_100; cp PT at bits 23-25 (lo bits 0-40 = 0x03800000)
+
+Control-code key: stall:yield:wrtdb:readb:wait-mask live in
+lo-word bits 41-63. Barrier plan: 0=LDC results (reused by
+LDG), 1=S2R results, 2=idx, 3=P0, 4=addresses. Only
+barriers 0-4 are waited on (digest §5.2 wait mask = bits
+52-56), so the kernel is correct whether the mask is 5 or
+6 bits wide.

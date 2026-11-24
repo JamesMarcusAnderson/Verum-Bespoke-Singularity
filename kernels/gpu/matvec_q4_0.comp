@@ -1,0 +1,25 @@
+// matvec_q4_0.comp — y[row] = dot(w[row, :], x[...]) with Q4_0
+// weights, unpacked on the fly. Block (18 bytes): half scale,
+// 16 nibble bytes. Each lane takes one element per block.
+// Bindings: 0=w (u32 words over packed bytes), 1=x (f32), 2=y (f32).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(set = 0, binding = 0) readonly buffer W { uint w_words[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+#include "common.glsl"
+#include "matvec_common.glsl"
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint block_count = pc.cols / 32u;
+    uint row_bytes = block_count * 18u;
+    uint weight_row = (pc.row_base + row) * row_bytes;
+    float sum = 0.0;
+    for (uint b = 0u; b < block_count; b++) {
+        uint block = weight_row + b * 18u;
+        sum += unpack_q4_0(block, lane) * x[pc.col_off + b * 32u + lane];
+    }
+    matvec_store(sum, row);
+}

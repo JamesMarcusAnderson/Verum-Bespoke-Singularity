@@ -1,3 +1,6 @@
+/* vbs_profiler.c — system and model profiling: CPU/RAM/GPU/
+ * storage detection, measured copy bandwidth, tensor hot/warm/
+ * cold classification, and the strict model-shape refusal. */
 #include "vbs_profiler.h"
 #include "vbs_backend.h"
 #include "vbs_port.h"
@@ -6,7 +9,7 @@
 #include <string.h>
 
 #if defined(__APPLE__)
-#include <sys/sysctl.h>
+/* sysctl.h comes from vbs_port.h on Apple platforms. */
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
 #include <mach/mach_types.h>
@@ -85,17 +88,21 @@ static void detect_cpu(vbs_cpu_profile_t *c) {
 #endif
 }
 
-// Measured host<->device copy bandwidth (James): times real transfers of a
-// 32 MiB buffer through the backend instead of trusting a table constant.
-// This is the copy path bandwidth; no device-local kernel benchmark exists
-// in the ops table yet, so both bandwidth fields take this measured value.
+/* Measured host<->device copy bandwidth (James): times real
+ * transfers of a 32 MiB buffer through the backend instead of
+ * trusting a table constant. This is the copy path bandwidth; no
+ * device-local kernel benchmark exists in the ops table yet, so
+ * both bandwidth fields take this measured value. */
 static double measure_device_bandwidth_gbps(vbs_device_t *dev, const vbs_backend_ops_t *backend) {
     size_t test_bytes = 32 * 1024 * 1024;
     void *host_src = malloc(test_bytes);
     if (!host_src) return 0.0;
     memset(host_src, 0x5A, test_bytes);
     vbs_buffer_t *d_buf = backend->alloc_buffer(dev, test_bytes, false);
-    if (!d_buf) { free(host_src); return 0.0; }
+    if (!d_buf) {
+        free(host_src);
+        return 0.0;
+    }
     double t0 = vbs_now_sec();
     for (int i = 0; i < 4; i++) backend->copy_to_device(d_buf, host_src, test_bytes);
     backend->synchronize_device(dev);
@@ -110,7 +117,11 @@ static double measure_device_bandwidth_gbps(vbs_device_t *dev, const vbs_backend
 static double benchmark_memcpy_bandwidth(size_t bytes) {
     void *src = malloc(bytes);
     void *dst = malloc(bytes);
-    if (!src || !dst) { free(src); free(dst); return 0.0; }
+    if (!src || !dst) {
+        free(src);
+        free(dst);
+        return 0.0;
+    }
     memset(src, 0xAB, bytes);
 
     double t0 = vbs_now_sec();
@@ -120,92 +131,57 @@ static double benchmark_memcpy_bandwidth(size_t bytes) {
     double elapsed = t1 - t0;
     double gb = (double)(bytes * 4) / 1e9;
 
-    free(src); free(dst);
+    free(src);
+    free(dst);
     return (elapsed > 0.0) ? (gb / elapsed) : 0.0;
 }
 
+/* Per-backend GPU profile constants. The probe order is
+ * Vulkan, CUDA, Metal, HIP. Note the HIP quirk: its block never
+ * set max_alloc_bytes, so it stays 0 -- preserved here via
+ * report_max_alloc. */
+typedef struct {
+    const vbs_backend_ops_t *ops;
+    vbs_backend_type_t type;
+    int free_pct;
+    uint32_t sm_count;
+    uint32_t warp_size;
+    bool tensor_cores;
+    bool report_max_alloc;
+} gpu_backend_desc_t;
+
+static const gpu_backend_desc_t k_gpu_backends[] = {
+    { &g_vbs_vulkan_backend, VBS_BACKEND_VULKAN, 90, 0, 32, false, true },
+    { &g_vbs_cuda_backend,   VBS_BACKEND_CUDA,   90, 80, 32, true,  true },
+#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
+    { &g_vbs_metal_backend,  VBS_BACKEND_METAL,  85, 40, 32, false, true },
+#endif
+    { &g_vbs_hip_backend,    VBS_BACKEND_HIP,    85, 60, 64, false, false },
+};
+
 static void detect_gpus(vbs_system_profile_t *sys) {
     sys->n_gpus = 0;
-
-    if (g_vbs_vulkan_backend.init()) {
-        size_t n = g_vbs_vulkan_backend.get_device_count();
+    for (size_t b = 0; b < sizeof(k_gpu_backends) / sizeof(k_gpu_backends[0]); b++) {
+        const gpu_backend_desc_t *desc = &k_gpu_backends[b];
+        if (!desc->ops->init()) continue;
+        size_t n = desc->ops->get_device_count();
         for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
-            vbs_device_t *d = g_vbs_vulkan_backend.get_device(i);
+            vbs_device_t *d = desc->ops->get_device(i);
             vbs_gpu_profile_t *g = &sys->gpus[sys->n_gpus++];
             snprintf(g->name, sizeof(g->name), "%s", d->name);
-            g->type = VBS_BACKEND_VULKAN;
+            g->type = desc->type;
             g->device = d;
             g->total_vram_bytes = d->max_working_set_bytes;
-            g->free_vram_bytes = d->max_working_set_bytes * 90 / 100;
-            g->max_alloc_bytes = d->max_buffer_bytes;
-            double bw = measure_device_bandwidth_gbps(d, &g_vbs_vulkan_backend);
+            g->free_vram_bytes = d->max_working_set_bytes * (uint64_t)desc->free_pct / 100;
+            if (desc->report_max_alloc) g->max_alloc_bytes = d->max_buffer_bytes;
+            double bw = measure_device_bandwidth_gbps(d, desc->ops);
             g->mem_bandwidth_gbps = bw;
             g->pcie_bandwidth_gbps = bw;
             /* Vulkan 1.0 properties expose no CU count; the shader
              * workgroup size (32) is the scheduling unit. */
-            g->sm_count = 0;
-            g->warp_size = 32;
-            g->supports_tensor_cores = false;
-        }
-    }
-
-    if (g_vbs_cuda_backend.init()) {
-        size_t n = g_vbs_cuda_backend.get_device_count();
-        for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
-            vbs_device_t *d = g_vbs_cuda_backend.get_device(i);
-            vbs_gpu_profile_t *g = &sys->gpus[sys->n_gpus++];
-            snprintf(g->name, sizeof(g->name), "%s", d->name);
-            g->type = VBS_BACKEND_CUDA;
-            g->device = d;
-            g->total_vram_bytes = d->max_working_set_bytes;
-            g->free_vram_bytes = d->max_working_set_bytes * 90 / 100;
-            g->max_alloc_bytes = d->max_buffer_bytes;
-            double bw = measure_device_bandwidth_gbps(d, &g_vbs_cuda_backend);
-            g->mem_bandwidth_gbps = bw;
-            g->pcie_bandwidth_gbps = bw;
-            g->sm_count = 80;
-            g->warp_size = 32;
-            g->supports_tensor_cores = true;
-        }
-    }
-
-#if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-    if (g_vbs_metal_backend.init()) {
-        size_t n = g_vbs_metal_backend.get_device_count();
-        for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
-            vbs_device_t *d = g_vbs_metal_backend.get_device(i);
-            vbs_gpu_profile_t *g = &sys->gpus[sys->n_gpus++];
-            snprintf(g->name, sizeof(g->name), "%s", d->name);
-            g->type = VBS_BACKEND_METAL;
-            g->device = d;
-            g->total_vram_bytes = d->max_working_set_bytes;
-            g->free_vram_bytes = d->max_working_set_bytes * 85 / 100;
-            g->max_alloc_bytes = d->max_buffer_bytes;
-            double bw = measure_device_bandwidth_gbps(d, &g_vbs_metal_backend);
-            g->mem_bandwidth_gbps = bw;
-            g->pcie_bandwidth_gbps = bw;
-            g->sm_count = 40;
-            g->warp_size = 32;
-            g->supports_tensor_cores = false;
-        }
-    }
-#endif
-
-    if (g_vbs_hip_backend.init()) {
-        size_t n = g_vbs_hip_backend.get_device_count();
-        for (size_t i = 0; i < n && sys->n_gpus < 8; i++) {
-            vbs_device_t *d = g_vbs_hip_backend.get_device(i);
-            vbs_gpu_profile_t *g = &sys->gpus[sys->n_gpus++];
-            snprintf(g->name, sizeof(g->name), "%s", d->name);
-            g->type = VBS_BACKEND_HIP;
-            g->device = d;
-            g->total_vram_bytes = d->max_working_set_bytes;
-            g->free_vram_bytes = d->max_working_set_bytes * 85 / 100;
-            double bw = measure_device_bandwidth_gbps(d, &g_vbs_hip_backend);
-            g->mem_bandwidth_gbps = bw;
-            g->pcie_bandwidth_gbps = bw;
-            g->sm_count = 60;
-            g->warp_size = 64;
+            g->sm_count = desc->sm_count;
+            g->warp_size = desc->warp_size;
+            g->supports_tensor_cores = desc->tensor_cores;
         }
     }
 }
@@ -234,6 +210,7 @@ static void detect_storage(vbs_system_profile_t *sys) {
 
 vbs_system_profile_t *vbs_profiler_scan_system(void) {
     vbs_system_profile_t *sys = (vbs_system_profile_t *)calloc(1, sizeof(vbs_system_profile_t));
+    if (!sys) return NULL;
     detect_cpu(&sys->cpu);
     detect_gpus(sys);
     detect_storage(sys);
@@ -287,8 +264,9 @@ void vbs_profiler_print_system(const vbs_system_profile_t *p) {
     printf("============================\n\n");
 }
 
-vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
+vbs_model_profile_t *vbs_profiler_scan_model(const vbs_model_t *model) {
     vbs_model_profile_t *mp = (vbs_model_profile_t *)calloc(1, sizeof(vbs_model_profile_t));
+    if (!mp) return NULL;
     mp->model = model;
     mp->n_tensor_profiles = model->n_tensors;
     mp->tensor_profiles = (vbs_tensor_profile_t *)calloc(
@@ -324,23 +302,32 @@ vbs_model_profile_t *vbs_profiler_scan_model(const vbs_gguf_model_t *model) {
     mp->warm_working_set_bytes = warm;
     mp->cold_working_set_bytes = cold;
 
-    uint32_t v;
-    if (vbs_gguf_get_uint32_metadata(model, "llama.block_count", &v)) mp->n_layers = v;
-    if (vbs_gguf_get_uint32_metadata(model, "llama.attention.head_count", &v)) mp->n_heads = v;
-    if (vbs_gguf_get_uint32_metadata(model, "llama.attention.head_count_kv", &v)) mp->n_kv_heads = v;
-    if (vbs_gguf_get_uint32_metadata(model, "llama.embedding_length", &v)) mp->embedding_dim = v;
-    if (vbs_gguf_get_uint32_metadata(model, "llama.context_length", &v)) mp->context_length = v;
+    struct {
+        const char *key;
+        uint32_t *field;
+    } dims[] = {
+        { "llama.block_count",               &mp->n_layers      },
+        { "llama.attention.head_count",      &mp->n_heads       },
+        { "llama.attention.head_count_kv",   &mp->n_kv_heads    },
+        { "llama.embedding_length",          &mp->embedding_dim },
+        { "llama.context_length",            &mp->context_length },
+    };
+    for (size_t i = 0; i < sizeof(dims) / sizeof(dims[0]); i++) {
+        uint32_t v;
+        if (vbs_model_get_uint32_metadata(model, dims[i].key, &v)) *dims[i].field = v;
+    }
     if (mp->n_heads && mp->embedding_dim) mp->head_dim = mp->embedding_dim / mp->n_heads;
 
     mp->rope_theta = 10000.0f;
     mp->rms_eps = 1e-5f;
     float fv;
-    if (vbs_gguf_get_float32_metadata(model, "llama.rope.freq_base", &fv)) mp->rope_theta = fv;
-    if (vbs_gguf_get_float32_metadata(model, "llama.attention.layer_norm_rms_epsilon", &fv)) mp->rms_eps = fv;
+    if (vbs_model_get_float32_metadata(model, "llama.rope.freq_base", &fv)) mp->rope_theta = fv;
+    if (vbs_model_get_float32_metadata(model, "llama.attention.layer_norm_rms_epsilon", &fv)) mp->rms_eps = fv;
 
-    // Strict refusal: no invented model shapes. If the essential dimensions
-    // cannot be proven from the GGUF metadata and tensor shapes, fail here
-    // instead of letting downstream code guess (James, deliberate refusal).
+    /* Strict refusal: no invented model shapes. If the essential
+     * dimensions cannot be proven from the model metadata and
+     * tensor shapes, fail here instead of letting downstream code
+     * guess (James, deliberate refusal). */
     if (mp->n_layers == 0 || mp->n_heads == 0 || mp->n_kv_heads == 0 ||
         mp->embedding_dim == 0 || mp->vocab_size == 0 || mp->head_dim == 0 ||
         mp->context_length == 0) {

@@ -2,14 +2,15 @@
  *
  * Verifies the backends through the ops table ONLY (no backend
  * internals): alloc/copy, every primitive, linear tiles in both
- * calling conventions (slice-executor staging tile and bridge resident
- * tensor), quantized weight types, selection + CPU fallback, and the
- * SPIR-V path. Reference values are computed HERE with small
- * independent implementations (plain loops, direct formulas, and a
- * from-spec dequantizer) — never by calling the code under test, so a
- * shared bug cannot pass silently. The CPU backend, the Vulkan
- * kernels, and these references are three independent implementations
- * of the same math; agreement across all three is the evidence.
+ * calling conventions (slice-executor staging tile and bridge
+ * resident tensor), quantized weight types, selection + CPU
+ * fallback, and the kernel-IR path. Reference values are computed
+ * HERE with small independent implementations (plain loops, direct
+ * formulas, and a from-spec dequantizer) — never by calling the
+ * code under test, so a shared bug cannot pass silently. The CPU
+ * backend, the GPU kernels, and these references are three
+ * independent implementations of the same math; agreement across
+ * all three is the evidence.
  *
  * Backends exercised: CPU (always), Vulkan (when a device is
  * present), HIP (when ROCm is present). CUDA and Metal get a smoke
@@ -22,7 +23,7 @@
 #include "vbs_backend_test.h"
 #include "vbs_backend.h"
 #include "vbs_backend_select.h"
-#include "vbs_vulkan.h"
+#include "vbs_gpu.h"
 #include "vbs_compiler.h"
 #include "vbs_dequant.h"
 #include "vbs_port.h"
@@ -34,7 +35,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "../kernels/vulkan_kernels.spv.h"
+#include "../kernels/gpu_kernels.spv.h"
 
 static int g_checks = 0;
 static int g_fails = 0;
@@ -57,10 +58,6 @@ static float rndf(void) {
     g_rng ^= g_rng >> 17;
     g_rng ^= g_rng << 5;
     return ((float)(g_rng & 0xFFFFFF) / (float)0xFFFFFF) * 2.0f - 1.0f;
-}
-
-static double now_sec(void) {
-    return vbs_now_sec();
 }
 
 static bool close_enough(const float *got, const float *want, size_t n,
@@ -109,22 +106,24 @@ static void ref_silu_mul(const float *g, const float *u, float *o, size_t n) {
         o[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
 }
 
-/* From-spec dequantizers (independent re-implementations of the GGUF
- * block layouts; the CPU backend uses vbs_dequant_block, the Vulkan
- * kernels use GLSL — three implementations must agree). */
+/* From-spec dequantizers (independent re-implementations of the
+ * model file block layouts; the CPU backend uses vbs_dequant_block,
+ * the GPU kernels use GLSL — three implementations must agree). */
 static float ref_f16(uint16_t h) { return vbs_f16_to_f32(h); }
 
-static void ref_deq_q8_0(const uint8_t *b, float *y) {
+static float ref_block_scale(const uint8_t *b, size_t off) {
     uint16_t hb;
-    memcpy(&hb, b, 2);
-    float d = ref_f16(hb);
+    memcpy(&hb, b + off, 2);
+    return ref_f16(hb);
+}
+
+static void ref_deq_q8_0(const uint8_t *b, float *y) {
+    float d = ref_block_scale(b, 0);
     for (int i = 0; i < 32; i++) y[i] = d * (float)(int8_t)b[2 + i];
 }
 
 static void ref_deq_q4_0(const uint8_t *b, float *y) {
-    uint16_t hb;
-    memcpy(&hb, b, 2);
-    float d = ref_f16(hb);
+    float d = ref_block_scale(b, 0);
     for (int i = 0; i < 16; i++) {
         y[i] = d * (float)((b[2 + i] & 15) - 8);
         y[i + 16] = d * (float)((b[2 + i] >> 4) - 8);
@@ -132,34 +131,38 @@ static void ref_deq_q4_0(const uint8_t *b, float *y) {
 }
 
 static void ref_deq_q4_1(const uint8_t *b, float *y) {
-    uint16_t hb, hm;
-    memcpy(&hb, b, 2);
-    memcpy(&hm, b + 2, 2);
-    float d = ref_f16(hb), m = ref_f16(hm);
+    float d = ref_block_scale(b, 0), m = ref_block_scale(b, 2);
     for (int i = 0; i < 16; i++) {
         y[i] = d * (float)(b[4 + i] & 15) + m;
         y[i + 16] = d * (float)(b[4 + i] >> 4) + m;
     }
 }
 
+/* Q4_K sub-block scales for element group j (0..7): the first four
+ * groups read their 6-bit scale/min straight from the scale bytes;
+ * the last four combine low nibbles from bytes 8..11 with the top
+ * two bits stored in bytes 0..7. */
+static void ref_q4k_scales(const uint8_t *sc, int j, int *s, int *mn) {
+    if (j < 4) {
+        *s = sc[j] & 63;
+        *mn = sc[j + 4] & 63;
+    } else {
+        *s = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
+        *mn = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+    }
+}
+
 static void ref_deq_q4_k(const uint8_t *b, float *y) {
-    /* ggml block_q4_K: { f16 d; f16 dmin; u8 scales[12]; u8 qs[128] } —
+    /* Q4_K block: { f16 d; f16 dmin; u8 scales[12]; u8 qs[128] } —
      * d/dmin come FIRST (unlike Q2_K/Q3_K/Q6_K, where they come last). */
     const uint8_t *qs = b + 16, *sc = b + 4;
-    uint16_t hd, hm;
-    memcpy(&hd, b + 0, 2);
-    memcpy(&hm, b + 2, 2);
-    float d = ref_f16(hd), dmn = ref_f16(hm);
+    float d = ref_block_scale(b, 0), dmn = ref_block_scale(b, 2);
     for (int e = 0; e < 256; e++) {
         int g = e >> 6, w = e & 63;
         uint8_t byte = qs[g * 32 + (w & 31)];
         int nib = (w < 32) ? (byte & 0x0F) : (byte >> 4);
-        int j = e >> 5, s, mn;
-        if (j < 4) { s = sc[j] & 63; mn = sc[j + 4] & 63; }
-        else {
-            s = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
-            mn = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
-        }
+        int s, mn;
+        ref_q4k_scales(sc, e >> 5, &s, &mn);
         y[e] = d * (float)s * (float)nib - dmn * (float)mn;
     }
 }
@@ -167,12 +170,10 @@ static void ref_deq_q4_k(const uint8_t *b, float *y) {
 static void ref_deq_q6_k(const uint8_t *b, float *y) {
     const uint8_t *ql = b, *qh = b + 128;
     const int8_t *sc = (const int8_t *)(b + 192);
-    uint16_t hd;
-    memcpy(&hd, b + 208, 2);
-    float d = ref_f16(hd);
+    float d = ref_block_scale(b, 208);
     for (int e = 0; e < 256; e++) {
         int h = e >> 7, q = (e & 127) >> 5, l = e & 31;
-        int qi = (q < 2) ? (h * 64 + q * 32 + l) : (h * 64 + (q - 2) * 32 + l);
+        int qi = h * 64 + (q & 1) * 32 + l;
         int shift = (q < 2) ? 0 : 4;
         int lo = (ql[qi] >> shift) & 0x0F;
         int hi = (qh[h * 32 + l] >> (q * 2)) & 3;
@@ -188,15 +189,15 @@ static void ref_deq_lns8(const uint8_t *b, float *y) {
 }
 
 /* Dequantize one packed row (test-local). */
-static void ref_deq_row(const uint8_t *packed, vbs_ggml_type_t type,
+static void ref_deq_row(const uint8_t *packed, vbs_model_type_t type,
                         uint32_t cols, float *out) {
     vbs_block_geometry_t g;
     vbs_get_geometry(type, &g);
-    if (type == VBS_GGML_TYPE_F32) {
+    if (type == VBS_MODEL_TYPE_F32) {
         memcpy(out, packed, (size_t)cols * 4);
         return;
     }
-    if (type == VBS_GGML_TYPE_F16) {
+    if (type == VBS_MODEL_TYPE_F16) {
         for (uint32_t i = 0; i < cols; i++) {
             uint16_t h;
             memcpy(&h, packed + (size_t)i * 2, 2);
@@ -208,18 +209,24 @@ static void ref_deq_row(const uint8_t *packed, vbs_ggml_type_t type,
         const uint8_t *blk = packed + (size_t)b * g.bytes_per_block;
         float *dst = out + (size_t)b * g.elements_per_block;
         switch (type) {
-            case VBS_GGML_TYPE_Q8_0: ref_deq_q8_0(blk, dst); break;
-            case VBS_GGML_TYPE_Q4_0: ref_deq_q4_0(blk, dst); break;
-            case VBS_GGML_TYPE_Q4_1: ref_deq_q4_1(blk, dst); break;
-            case VBS_GGML_TYPE_Q4_K: ref_deq_q4_k(blk, dst); break;
-            case VBS_GGML_TYPE_Q6_K: ref_deq_q6_k(blk, dst); break;
-            case VBS_GGML_TYPE_LNS8: ref_deq_lns8(blk, dst); break;
+            case VBS_MODEL_TYPE_Q8_0: ref_deq_q8_0(blk, dst); break;
+            case VBS_MODEL_TYPE_Q4_0: ref_deq_q4_0(blk, dst); break;
+            case VBS_MODEL_TYPE_Q4_1: ref_deq_q4_1(blk, dst); break;
+            case VBS_MODEL_TYPE_Q4_K: ref_deq_q4_k(blk, dst); break;
+            case VBS_MODEL_TYPE_Q6_K: ref_deq_q6_k(blk, dst); break;
+            case VBS_MODEL_TYPE_LNS8: ref_deq_lns8(blk, dst); break;
             default: memset(dst, 0, (size_t)g.elements_per_block * 4); break;
         }
     }
 }
 
 /* Tiny quantizers (test-local) to build packed blocks from floats. */
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 static void ref_quant_q8_0(const float *v, uint8_t *blk) {
     float amax = 0.0f;
     for (int i = 0; i < 32; i++) if (fabsf(v[i]) > amax) amax = fabsf(v[i]);
@@ -229,9 +236,7 @@ static void ref_quant_q8_0(const float *v, uint8_t *blk) {
     /* NOTE: the dequant uses the f16-rounded d, so the reference
      * dequantizer (which also reads the f16 d) matches exactly. */
     for (int i = 0; i < 32; i++) {
-        int q = (int)roundf(v[i] / (d ? d : 1.0f));
-        if (q < -127) q = -127;
-        if (q > 127) q = 127;
+        int q = clamp_int((int)roundf(v[i] / (d ? d : 1.0f)), -127, 127);
         blk[2 + i] = (uint8_t)(int8_t)q;
     }
 }
@@ -243,12 +248,8 @@ static void ref_quant_q4_0(const float *v, uint8_t *blk) {
     uint16_t hb = vbs_f32_to_f16(d);
     memcpy(blk, &hb, 2);
     for (int i = 0; i < 16; i++) {
-        int lo = (int)roundf(v[i] / (d ? d : 1.0f)) + 8;
-        int hi = (int)roundf(v[i + 16] / (d ? d : 1.0f)) + 8;
-        if (lo < 0) lo = 0;
-        if (lo > 15) lo = 15;
-        if (hi < 0) hi = 0;
-        if (hi > 15) hi = 15;
+        int lo = clamp_int((int)roundf(v[i] / (d ? d : 1.0f)) + 8, 0, 15);
+        int hi = clamp_int((int)roundf(v[i + 16] / (d ? d : 1.0f)) + 8, 0, 15);
         blk[2 + i] = (uint8_t)(lo | (hi << 4));
     }
 }
@@ -264,12 +265,8 @@ static void ref_quant_q4_1(const float *v, uint8_t *blk) {
     memcpy(blk, &hb, 2);
     memcpy(blk + 2, &hm, 2);
     for (int i = 0; i < 16; i++) {
-        int lo = (int)roundf((v[i] - mn) / (d ? d : 1.0f));
-        int hi = (int)roundf((v[i + 16] - mn) / (d ? d : 1.0f));
-        if (lo < 0) lo = 0;
-        if (lo > 15) lo = 15;
-        if (hi < 0) hi = 0;
-        if (hi > 15) hi = 15;
+        int lo = clamp_int((int)roundf((v[i] - mn) / (d ? d : 1.0f)), 0, 15);
+        int hi = clamp_int((int)roundf((v[i + 16] - mn) / (d ? d : 1.0f)), 0, 15);
         blk[4 + i] = (uint8_t)(lo | (hi << 4));
     }
 }
@@ -279,7 +276,7 @@ static void ref_quant_q4_1(const float *v, uint8_t *blk) {
  * 0..15. */
 static void ref_quant_q4_k_unit(const float *v, uint8_t *blk) {
     memset(blk, 0, 144);
-    /* ggml block_q4_K layout: d/dmin first, then scales, then quants. */
+    /* Q4_K block layout: d/dmin first, then scales, then quants. */
     uint8_t *qs = blk + 16, *sc = blk + 4;
     sc[0] = 1; sc[1] = 1; sc[2] = 1; sc[3] = 1;
     sc[8] = 1; sc[9] = 1; sc[10] = 1; sc[11] = 1;
@@ -288,9 +285,7 @@ static void ref_quant_q4_k_unit(const float *v, uint8_t *blk) {
     memcpy(blk + 2, &zero, 2);
     for (int e = 0; e < 256; e++) {
         int g = e >> 6, w = e & 63;
-        int q = (int)roundf(v[e]);
-        if (q < 0) q = 0;
-        if (q > 15) q = 15;
+        int q = clamp_int((int)roundf(v[e]), 0, 15);
         uint8_t *byte = &qs[g * 32 + (w & 31)];
         if (w < 32) *byte = (uint8_t)((*byte & 0xF0) | q);
         else *byte = (uint8_t)((*byte & 0x0F) | (q << 4));
@@ -307,12 +302,9 @@ static void ref_quant_q6_k_unit(const float *v, uint8_t *blk) {
     memcpy(blk + 208, &one, 2);
     uint8_t *ql = blk, *qh = blk + 128;
     for (int e = 0; e < 256; e++) {
-        int q = (int)roundf(v[e]);
-        if (q < 0) q = 0;
-        if (q > 63) q = 63;
+        int q = clamp_int((int)roundf(v[e]), 0, 63);
         int h = e >> 7, qq = (e & 127) >> 5, l = e & 31;
-        int qi = (qq < 2) ? (h * 64 + qq * 32 + l)
-                          : (h * 64 + (qq - 2) * 32 + l);
+        int qi = h * 64 + (qq & 1) * 32 + l;
         int shift = (qq < 2) ? 0 : 4;
         ql[qi] = (uint8_t)((ql[qi] & (uint8_t)~(0x0F << shift)) |
                            ((q & 0x0F) << shift));
@@ -329,9 +321,7 @@ static void ref_quant_lns8(const float *v, uint8_t *blk) {
     memcpy(blk + 32, &s, 4);
     for (int i = 0; i < 32; i++) {
         float t = v[i] * 256.0f;
-        int q = (int)roundf(log2f(t > 0.0f ? t : 1.0f));
-        if (q < 0) q = 0;
-        if (q > 255) q = 255;
+        int q = clamp_int((int)roundf(log2f(t > 0.0f ? t : 1.0f)), 0, 255);
         blk[i] = (uint8_t)q;
     }
 }
@@ -339,7 +329,7 @@ static void ref_quant_lns8(const float *v, uint8_t *blk) {
 /* Pack a float matrix (rows x cols) into a packed tensor of `type`.
  * Returns malloc'd bytes (caller frees). */
 static uint8_t *ref_pack_matrix(const float *m, uint32_t rows, uint32_t cols,
-                                vbs_ggml_type_t type, size_t *out_bytes) {
+                                vbs_model_type_t type, size_t *out_bytes) {
     vbs_block_geometry_t g;
     vbs_get_geometry(type, &g);
     size_t row_bytes = (size_t)(cols / g.elements_per_block) * g.bytes_per_block;
@@ -348,9 +338,9 @@ static uint8_t *ref_pack_matrix(const float *m, uint32_t rows, uint32_t cols,
     for (uint32_t r = 0; r < rows; r++) {
         const float *row = m + (size_t)r * cols;
         uint8_t *dst = packed + (size_t)r * row_bytes;
-        if (type == VBS_GGML_TYPE_F32) {
+        if (type == VBS_MODEL_TYPE_F32) {
             memcpy(dst, row, (size_t)cols * 4);
-        } else if (type == VBS_GGML_TYPE_F16) {
+        } else if (type == VBS_MODEL_TYPE_F16) {
             for (uint32_t i = 0; i < cols; i++) {
                 uint16_t h = vbs_f32_to_f16(row[i]);
                 memcpy(dst + (size_t)i * 2, &h, 2);
@@ -360,12 +350,12 @@ static uint8_t *ref_pack_matrix(const float *m, uint32_t rows, uint32_t cols,
                 uint8_t *blk = dst + (size_t)b * g.bytes_per_block;
                 const float *vals = row + (size_t)b * g.elements_per_block;
                 switch (type) {
-                    case VBS_GGML_TYPE_Q8_0: ref_quant_q8_0(vals, blk); break;
-                    case VBS_GGML_TYPE_Q4_0: ref_quant_q4_0(vals, blk); break;
-                    case VBS_GGML_TYPE_Q4_1: ref_quant_q4_1(vals, blk); break;
-                    case VBS_GGML_TYPE_Q4_K: ref_quant_q4_k_unit(vals, blk); break;
-                    case VBS_GGML_TYPE_Q6_K: ref_quant_q6_k_unit(vals, blk); break;
-                    case VBS_GGML_TYPE_LNS8: ref_quant_lns8(vals, blk); break;
+                    case VBS_MODEL_TYPE_Q8_0: ref_quant_q8_0(vals, blk); break;
+                    case VBS_MODEL_TYPE_Q4_0: ref_quant_q4_0(vals, blk); break;
+                    case VBS_MODEL_TYPE_Q4_1: ref_quant_q4_1(vals, blk); break;
+                    case VBS_MODEL_TYPE_Q4_K: ref_quant_q4_k_unit(vals, blk); break;
+                    case VBS_MODEL_TYPE_Q6_K: ref_quant_q6_k_unit(vals, blk); break;
+                    case VBS_MODEL_TYPE_LNS8: ref_quant_lns8(vals, blk); break;
                     default: memset(blk, 0, g.bytes_per_block); break;
                 }
             }
@@ -375,9 +365,9 @@ static uint8_t *ref_pack_matrix(const float *m, uint32_t rows, uint32_t cols,
     return packed;
 }
 
-/* Reference matvec: dequantize the packed matrix with the test-local
- * dequantizer, then dot in double. */
-static void ref_matvec(const uint8_t *packed, vbs_ggml_type_t type,
+/* Reference matvec: dequantize the packed matrix with the
+ * test-local dequantizer, then dot in double. */
+static void ref_matvec(const uint8_t *packed, vbs_model_type_t type,
                        const float *x, float *y,
                        uint32_t cols, uint32_t rows,
                        uint32_t col_off, uint32_t row_off,
@@ -432,25 +422,54 @@ static void ref_attention(const float *q, const uint16_t *kc,
 /* Per-backend op suite                                                */
 /* ------------------------------------------------------------------ */
 
-static vbs_arg_t arg_buf(const void *h) {
-    vbs_arg_t a = { VBS_ARG_BUFFER, h, 0 };
-    return a;
-}
-static vbs_arg_t arg_u32(uint32_t *v) {
-    vbs_arg_t a = { VBS_ARG_SCALAR, v, sizeof(uint32_t) };
-    return a;
-}
-static vbs_arg_t arg_f32(float *v) {
-    vbs_arg_t a = { VBS_ARG_SCALAR, v, sizeof(float) };
-    return a;
-}
-
 static vbs_buffer_t *alloc_or_fail(const vbs_backend_ops_t *ops,
                                    vbs_device_t *dev, size_t bytes,
                                    const char *what) {
     vbs_buffer_t *b = ops->alloc_buffer(dev, bytes, false);
     if (!b) check(false, "alloc %s (%zu B)", what, bytes);
     return b;
+}
+
+/* Dispatch one primitive and read the output back. Returns false on
+ * any failure (dispatch or readback). */
+static bool run_prim(const vbs_backend_ops_t *ops, vbs_device_t *dev,
+                     void *pipe, const vbs_arg_t *args, size_t n_args,
+                     size_t grid_x, size_t block_x,
+                     vbs_buffer_t *out_buf, void *out_host, size_t out_bytes) {
+    bool ok = ops->dispatch_primitive(dev, pipe, args, n_args, grid_x, block_x);
+    ops->synchronize_device(dev);
+    if (!ok) return false;
+    return ops->copy_to_host(out_host, out_buf, out_bytes);
+}
+
+/* Copy host data into a device buffer (no-op when the buffer is
+ * NULL, so the caller can fold the check into one `ok` flag). */
+static void upload(const vbs_backend_ops_t *ops, vbs_buffer_t *b,
+                   const void *host, size_t bytes) {
+    if (b) ops->copy_to_device(b, host, bytes);
+}
+
+/* Store one (k, v) pair into the KV cache at (layer, pos) through
+ * the backend's CACHE pipeline. bk/bv must already hold the data
+ * (uploaded by the caller); bkc/bvc are the cache buffers. */
+static bool store_cache(const vbs_backend_ops_t *ops, vbs_device_t *dev,
+                        void *pipe, vbs_buffer_t *bk, vbs_buffer_t *bv,
+                        vbs_buffer_t *bkc, vbs_buffer_t *bvc,
+                        uint32_t pos, uint32_t layer, uint32_t max_ctx,
+                        uint32_t kv_dim) {
+    uint32_t p = pos, l = layer, mc = max_ctx, d = kv_dim;
+    vbs_arg_t args[] = { vbs_arg_buf(bk->internal_handle),
+                         vbs_arg_buf(bv->internal_handle),
+                         vbs_arg_buf(bkc->internal_handle),
+                         vbs_arg_buf(bvc->internal_handle),
+                         vbs_arg_u32(&p), vbs_arg_u32(&l), vbs_arg_u32(&mc), vbs_arg_u32(&d) };
+    return ops->dispatch_primitive(dev, pipe, args, 8, (kv_dim + 255) / 256, 256);
+}
+
+/* Free several heap pointers at once; NULL entries are fine
+ * (free(NULL) is a no-op). */
+static void free_all(void **ptrs, size_t n) {
+    for (size_t i = 0; i < n; i++) free(ptrs[i]);
 }
 
 static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
@@ -497,15 +516,13 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
         void *pipe = ops->compile_primitive_pipeline(dev, VBS_OP_ELEMENTWISE, err, sizeof(err));
         bool ok = ba && bb && bo && pipe;
         if (ok) {
-            ops->copy_to_device(ba, a, n * 4);
-            ops->copy_to_device(bb, b, n * 4);
+            upload(ops, ba, a, n * 4);
+            upload(ops, bb, b, n * 4);
             uint32_t nn = n;
-            vbs_arg_t args[] = { arg_buf(ba->internal_handle),
-                                 arg_buf(bb->internal_handle),
-                                 arg_buf(bo->internal_handle), arg_u32(&nn) };
-            ok = ops->dispatch_primitive(dev, pipe, args, 4, (n + 255) / 256, 256);
-            ops->synchronize_device(dev);
-            if (ok) ok = ops->copy_to_host(got, bo, n * 4);
+            vbs_arg_t args[] = { vbs_arg_buf(ba->internal_handle),
+                                 vbs_arg_buf(bb->internal_handle),
+                                 vbs_arg_buf(bo->internal_handle), vbs_arg_u32(&nn) };
+            ok = run_prim(ops, dev, pipe, args, 4, (n + 255) / 256, 256, bo, got, n * 4);
         }
         float merr = 0;
         if (ok) ok = close_enough(got, want, n, 1e-6f, 1e-6f, &merr);
@@ -529,15 +546,13 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
         void *pipe = ops->compile_primitive_pipeline(dev, VBS_OP_ACTIVATION, err, sizeof(err));
         bool ok = bg && bu && bo && pipe;
         if (ok) {
-            ops->copy_to_device(bg, g, n * 4);
-            ops->copy_to_device(bu, u, n * 4);
+            upload(ops, bg, g, n * 4);
+            upload(ops, bu, u, n * 4);
             uint32_t nn = n;
-            vbs_arg_t args[] = { arg_buf(bg->internal_handle),
-                                 arg_buf(bu->internal_handle),
-                                 arg_buf(bo->internal_handle), arg_u32(&nn) };
-            ok = ops->dispatch_primitive(dev, pipe, args, 4, (n + 255) / 256, 256);
-            ops->synchronize_device(dev);
-            if (ok) ok = ops->copy_to_host(got, bo, n * 4);
+            vbs_arg_t args[] = { vbs_arg_buf(bg->internal_handle),
+                                 vbs_arg_buf(bu->internal_handle),
+                                 vbs_arg_buf(bo->internal_handle), vbs_arg_u32(&nn) };
+            ok = run_prim(ops, dev, pipe, args, 4, (n + 255) / 256, 256, bo, got, n * 4);
         }
         float merr = 0;
         if (ok) ok = close_enough(got, want, n, 1e-5f, 1e-5f, &merr);
@@ -562,17 +577,15 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
         void *pipe = ops->compile_primitive_pipeline(dev, VBS_OP_NORMALIZE, err, sizeof(err));
         bool ok = bi && bw && bo && pipe;
         if (ok) {
-            ops->copy_to_device(bi, in, dim * 4);
-            ops->copy_to_device(bw, w, dim * 4);
+            upload(ops, bi, in, dim * 4);
+            upload(ops, bw, w, dim * 4);
             uint32_t d = dim;
             float e = eps;
-            vbs_arg_t args[] = { arg_buf(bi->internal_handle),
-                                 arg_buf(bw->internal_handle),
-                                 arg_buf(bo->internal_handle),
-                                 arg_u32(&d), arg_f32(&e) };
-            ok = ops->dispatch_primitive(dev, pipe, args, 5, (dim + 255) / 256, 256);
-            ops->synchronize_device(dev);
-            if (ok) ok = ops->copy_to_host(got, bo, dim * 4);
+            vbs_arg_t args[] = { vbs_arg_buf(bi->internal_handle),
+                                 vbs_arg_buf(bw->internal_handle),
+                                 vbs_arg_buf(bo->internal_handle),
+                                 vbs_arg_u32(&d), vbs_arg_f32(&e) };
+            ok = run_prim(ops, dev, pipe, args, 5, (dim + 255) / 256, 256, bo, got, dim * 4);
         }
         float merr = 0;
         if (ok) ok = close_enough(got, want, dim, 1e-5f, 1e-5f, &merr);
@@ -596,14 +609,12 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
         void *pipe = ops->compile_primitive_pipeline(dev, VBS_OP_ROTARY, err, sizeof(err));
         bool ok = bx && pipe;
         if (ok) {
-            ops->copy_to_device(bx, x, n * 4);
+            upload(ops, bx, x, n * 4);
             uint32_t p = pos, h = hd, nheads = nh;
             float th = theta;
-            vbs_arg_t args[] = { arg_buf(bx->internal_handle), arg_u32(&p),
-                                 arg_u32(&h), arg_u32(&nheads), arg_f32(&th) };
-            ok = ops->dispatch_primitive(dev, pipe, args, 5, ((hd / 2) * nh + 255) / 256, 256);
-            ops->synchronize_device(dev);
-            if (ok) ok = ops->copy_to_host(got, bx, n * 4);
+            vbs_arg_t args[] = { vbs_arg_buf(bx->internal_handle), vbs_arg_u32(&p),
+                                 vbs_arg_u32(&h), vbs_arg_u32(&nheads), vbs_arg_f32(&th) };
+            ok = run_prim(ops, dev, pipe, args, 5, ((hd / 2) * nh + 255) / 256, 256, bx, got, n * 4);
         }
         float merr = 0;
         if (ok) ok = close_enough(got, want, n, 1e-5f, 1e-5f, &merr);
@@ -614,24 +625,24 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
 
     /* --- embedding, all supported types --- */
     {
-        struct { vbs_ggml_type_t type; const char *name; float tol; } ets[] = {
-            { VBS_GGML_TYPE_F32, "F32", 1e-6f },
-            { VBS_GGML_TYPE_F16, "F16", 1e-3f },
-            { VBS_GGML_TYPE_Q8_0, "Q8_0", 1e-4f },
-            { VBS_GGML_TYPE_Q4_0, "Q4_0", 1e-4f },
-            { VBS_GGML_TYPE_Q4_1, "Q4_1", 1e-4f },
-            { VBS_GGML_TYPE_Q4_K, "Q4_K", 1e-4f },
-            { VBS_GGML_TYPE_Q6_K, "Q6_K", 1e-4f },
+        struct { vbs_model_type_t type; const char *name; float tol; } ets[] = {
+            { VBS_MODEL_TYPE_F32, "F32", 1e-6f },
+            { VBS_MODEL_TYPE_F16, "F16", 1e-3f },
+            { VBS_MODEL_TYPE_Q8_0, "Q8_0", 1e-4f },
+            { VBS_MODEL_TYPE_Q4_0, "Q4_0", 1e-4f },
+            { VBS_MODEL_TYPE_Q4_1, "Q4_1", 1e-4f },
+            { VBS_MODEL_TYPE_Q4_K, "Q4_K", 1e-4f },
+            { VBS_MODEL_TYPE_Q6_K, "Q6_K", 1e-4f },
         };
         uint32_t dim = 256, vocab = 8, token = 3;
         for (size_t ti = 0; ti < sizeof(ets) / sizeof(ets[0]); ti++) {
             float *table = malloc((size_t)vocab * dim * 4);
             /* Q4_K/Q6_K unit-scale blocks only represent 0..15 / 0..63
              * integers; keep test values in range for those types. */
-            float vmax = (ets[ti].type == VBS_GGML_TYPE_Q4_K) ? 15.0f
-                       : (ets[ti].type == VBS_GGML_TYPE_Q6_K) ? 63.0f : 1.0f;
-            float vmin = (ets[ti].type == VBS_GGML_TYPE_Q4_K ||
-                          ets[ti].type == VBS_GGML_TYPE_Q6_K) ? 0.0f : -1.0f;
+            float vmax = (ets[ti].type == VBS_MODEL_TYPE_Q4_K) ? 15.0f
+                       : (ets[ti].type == VBS_MODEL_TYPE_Q6_K) ? 63.0f : 1.0f;
+            float vmin = (ets[ti].type == VBS_MODEL_TYPE_Q4_K ||
+                          ets[ti].type == VBS_MODEL_TYPE_Q6_K) ? 0.0f : -1.0f;
             for (size_t i = 0; i < (size_t)vocab * dim; i++)
                 table[i] = vmin + (rndf() * 0.5f + 0.5f) * (vmax - vmin);
             size_t packed_bytes = 0;
@@ -652,13 +663,11 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                 ok = false;
             }
             if (ok) {
-                ops->copy_to_device(bw, packed, packed_bytes);
+                upload(ops, bw, packed, packed_bytes);
                 uint32_t tok = token, d = dim;
-                vbs_arg_t args[] = { arg_buf(bw->internal_handle), arg_u32(&tok),
-                                     arg_buf(bo->internal_handle), arg_u32(&d) };
-                ok = ops->dispatch_primitive(dev, pipe, args, 4, (dim + 255) / 256, 256);
-                ops->synchronize_device(dev);
-                if (ok) ok = ops->copy_to_host(got, bo, dim * 4);
+                vbs_arg_t args[] = { vbs_arg_buf(bw->internal_handle), vbs_arg_u32(&tok),
+                                     vbs_arg_buf(bo->internal_handle), vbs_arg_u32(&d) };
+                ok = run_prim(ops, dev, pipe, args, 4, (dim + 255) / 256, 256, bo, got, dim * 4);
             }
             float merr = 0;
             if (ok) ok = close_enough(got, want, dim, ets[ti].tol, ets[ti].tol, &merr);
@@ -666,10 +675,7 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                   ets[ti].name, merr);
             if (bw) ops->free_buffer(bw);
             if (bo) ops->free_buffer(bo);
-            free(table);
-            free(packed);
-            free(want);
-            free(got);
+            free_all((void *[]){ table, packed, want, got }, 4);
         }
     }
 
@@ -690,15 +696,10 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
         uint16_t *kc_got = malloc(cache_elems * 2);
         uint16_t *vc_got = malloc(cache_elems * 2);
         if (ok) {
-            ops->copy_to_device(bk, k, kv_dim * 4);
-            ops->copy_to_device(bv, v, kv_dim * 4);
-            uint32_t p = pos, l = layer, mc = max_ctx, d = kv_dim;
-            vbs_arg_t args[] = { arg_buf(bk->internal_handle),
-                                 arg_buf(bv->internal_handle),
-                                 arg_buf(bkc->internal_handle),
-                                 arg_buf(bvc->internal_handle),
-                                 arg_u32(&p), arg_u32(&l), arg_u32(&mc), arg_u32(&d) };
-            ok = ops->dispatch_primitive(dev, pipe, args, 8, (kv_dim + 255) / 256, 256);
+            upload(ops, bk, k, kv_dim * 4);
+            upload(ops, bv, v, kv_dim * 4);
+            ok = store_cache(ops, dev, pipe, bk, bv, bkc, bvc,
+                             pos, layer, max_ctx, kv_dim);
             ops->synchronize_device(dev);
             if (ok) ok = ops->copy_to_host(kc_got, bkc, cache_elems * 2);
             if (ok) ok = ops->copy_to_host(vc_got, bvc, cache_elems * 2);
@@ -727,15 +728,10 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
             for (uint32_t pp = 0; pp < 5 && ok; pp++) {
                 float *kk = malloc(kv_dim * 4), *vv = malloc(kv_dim * 4);
                 for (uint32_t i = 0; i < kv_dim; i++) { kk[i] = rndf(); vv[i] = rndf(); }
-                ops->copy_to_device(bk, kk, kv_dim * 4);
-                ops->copy_to_device(bv, vv, kv_dim * 4);
-                uint32_t p = pp, l = layer, mc = max_ctx, d = kv_dim;
-                vbs_arg_t args[] = { arg_buf(bk->internal_handle),
-                                     arg_buf(bv->internal_handle),
-                                     arg_buf(bkc->internal_handle),
-                                     arg_buf(bvc->internal_handle),
-                                     arg_u32(&p), arg_u32(&l), arg_u32(&mc), arg_u32(&d) };
-                ok = ops->dispatch_primitive(dev, pipe, args, 8, (kv_dim + 255) / 256, 256);
+                upload(ops, bk, kk, kv_dim * 4);
+                upload(ops, bv, vv, kv_dim * 4);
+                ok = store_cache(ops, dev, pipe, bk, bv, bkc, bvc,
+                                 pp, layer, max_ctx, kv_dim);
                 free(kk);
                 free(vv);
             }
@@ -755,20 +751,19 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                 ok = bq && bo && apipe;
             }
             if (ok) {
-                ops->copy_to_device(bq, q, (size_t)nqh * hd * 4);
+                upload(ops, bq, q, (size_t)nqh * hd * 4);
                 uint32_t sl = 6, l = layer, mc = max_ctx;
                 uint32_t qh = nqh, kh = nkh, hdim = hd;
                 float scale = 1.0f / sqrtf((float)hd);
-                vbs_arg_t args[] = { arg_buf(bq->internal_handle),
-                                     arg_buf(bkc->internal_handle),
-                                     arg_buf(bvc->internal_handle),
-                                     arg_buf(bo->internal_handle),
-                                     arg_u32(&sl), arg_u32(&l), arg_u32(&mc),
-                                     arg_u32(&qh), arg_u32(&kh), arg_u32(&hdim),
-                                     arg_f32(&scale) };
-                ok = ops->dispatch_primitive(dev, apipe, args, 11, nqh, hd > 32 ? hd : 32);
-                ops->synchronize_device(dev);
-                if (ok) ok = ops->copy_to_host(got, bo, (size_t)nqh * hd * 4);
+                vbs_arg_t args[] = { vbs_arg_buf(bq->internal_handle),
+                                     vbs_arg_buf(bkc->internal_handle),
+                                     vbs_arg_buf(bvc->internal_handle),
+                                     vbs_arg_buf(bo->internal_handle),
+                                     vbs_arg_u32(&sl), vbs_arg_u32(&l), vbs_arg_u32(&mc),
+                                     vbs_arg_u32(&qh), vbs_arg_u32(&kh), vbs_arg_u32(&hdim),
+                                     vbs_arg_f32(&scale) };
+                ok = run_prim(ops, dev, apipe, args, 11, nqh, hd > 32 ? hd : 32,
+                              bo, got, (size_t)nqh * hd * 4);
             }
             float merr = 0;
             if (ok) ok = close_enough(got, want, (size_t)nqh * hd, 1e-4f, 1e-4f, &merr);
@@ -792,24 +787,24 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
 
     /* --- linear tiles, all supported types, both conventions --- */
     {
-        struct { vbs_ggml_type_t type; const char *name; float tol; } lts[] = {
-            { VBS_GGML_TYPE_F32, "F32", 1e-4f },
-            { VBS_GGML_TYPE_F16, "F16", 2e-3f },
-            { VBS_GGML_TYPE_Q8_0, "Q8_0", 2e-3f },
-            { VBS_GGML_TYPE_Q4_0, "Q4_0", 2e-3f },
-            { VBS_GGML_TYPE_Q4_1, "Q4_1", 2e-3f },
-            { VBS_GGML_TYPE_Q4_K, "Q4_K", 2e-3f },
-            { VBS_GGML_TYPE_Q6_K, "Q6_K", 2e-3f },
-            { VBS_GGML_TYPE_LNS8, "LNS8", 2e-3f },
+        struct { vbs_model_type_t type; const char *name; float tol; } lts[] = {
+            { VBS_MODEL_TYPE_F32, "F32", 1e-4f },
+            { VBS_MODEL_TYPE_F16, "F16", 2e-3f },
+            { VBS_MODEL_TYPE_Q8_0, "Q8_0", 2e-3f },
+            { VBS_MODEL_TYPE_Q4_0, "Q4_0", 2e-3f },
+            { VBS_MODEL_TYPE_Q4_1, "Q4_1", 2e-3f },
+            { VBS_MODEL_TYPE_Q4_K, "Q4_K", 2e-3f },
+            { VBS_MODEL_TYPE_Q6_K, "Q6_K", 2e-3f },
+            { VBS_MODEL_TYPE_LNS8, "LNS8", 2e-3f },
         };
         uint32_t rows = 8, cols = 256;
         for (size_t ti = 0; ti < sizeof(lts) / sizeof(lts[0]); ti++) {
-            float vmax = (lts[ti].type == VBS_GGML_TYPE_Q4_K) ? 15.0f
-                       : (lts[ti].type == VBS_GGML_TYPE_Q6_K) ? 63.0f
-                       : (lts[ti].type == VBS_GGML_TYPE_LNS8) ? 1.0f : 1.0f;
-            float vmin = (lts[ti].type == VBS_GGML_TYPE_Q4_K ||
-                          lts[ti].type == VBS_GGML_TYPE_Q6_K ||
-                          lts[ti].type == VBS_GGML_TYPE_LNS8) ? 0.01f : -1.0f;
+            float vmax = (lts[ti].type == VBS_MODEL_TYPE_Q4_K) ? 15.0f
+                       : (lts[ti].type == VBS_MODEL_TYPE_Q6_K) ? 63.0f
+                       : (lts[ti].type == VBS_MODEL_TYPE_LNS8) ? 1.0f : 1.0f;
+            float vmin = (lts[ti].type == VBS_MODEL_TYPE_Q4_K ||
+                          lts[ti].type == VBS_MODEL_TYPE_Q6_K ||
+                          lts[ti].type == VBS_MODEL_TYPE_LNS8) ? 0.01f : -1.0f;
             float *mat = malloc((size_t)rows * cols * 4);
             float *x = malloc(cols * 4);
             for (size_t i = 0; i < (size_t)rows * cols; i++)
@@ -832,8 +827,8 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                 ok = bw && bx && by;
             }
             if (ok) {
-                ops->copy_to_device(bw, packed, packed_bytes);
-                ops->copy_to_device(bx, x, cols * 4);
+                upload(ops, bw, packed, packed_bytes);
+                upload(ops, bx, x, cols * 4);
                 ok = ops->dispatch_linear_tile(dev, pipe, bw, NULL, 0, bx, by,
                                                cols, rows, 0, 0, false);
                 ops->synchronize_device(dev);
@@ -861,7 +856,7 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                     /* The slice executor writes the tile into the
                      * stage buffer's host_ptr. */
                     memcpy(stage->host_ptr, packed, packed_bytes);
-                    ops->copy_to_device(bx, x, cols * 4);
+                    upload(ops, bx, x, cols * 4);
                     ok_b = ops->dispatch_linear_tile(dev, pipe, priv, stage,
                                                      packed_bytes, bx, by,
                                                      cols, rows, 0, 0, false);
@@ -877,11 +872,7 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                 if (bx) ops->free_buffer(bx);
                 if (by) ops->free_buffer(by);
             }
-            free(mat);
-            free(x);
-            free(packed);
-            free(want);
-            free(got);
+            free_all((void *[]){ mat, x, packed, want, got }, 5);
         }
     }
 
@@ -903,7 +894,7 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
                 s += (double)mat[(size_t)r * cols + c] * x[c];
             want[r] = (float)s;
         }
-        void *pipe = ops->compile_linear_pipeline(dev, VBS_GGML_TYPE_F32, err, sizeof(err));
+        void *pipe = ops->compile_linear_pipeline(dev, VBS_MODEL_TYPE_F32, err, sizeof(err));
         bool ok = pipe != NULL;
         vbs_buffer_t *bx = NULL, *by = NULL;
         if (ok) {
@@ -911,7 +902,7 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
             by = alloc_or_fail(ops, dev, rows * 4, "acc y");
             ok = bx && by;
         }
-        if (ok) ops->copy_to_device(bx, x, cols * 4);
+        if (ok) upload(ops, bx, x, cols * 4);
         for (int tile = 0; tile < 2 && ok; tile++) {
             /* Build the packed column tile (rows x half). */
             float *tilemat = malloc((size_t)rows * half * 4);
@@ -949,15 +940,15 @@ static void test_one_backend(const char *label, const vbs_backend_ops_t *ops) {
 
     /* --- refusal checks: unsupported types must fail loudly --- */
     {
-        void *p = ops->compile_linear_pipeline(dev, VBS_GGML_TYPE_Q8_K, err, sizeof(err));
+        void *p = ops->compile_linear_pipeline(dev, VBS_MODEL_TYPE_Q8_K, err, sizeof(err));
         /* Q8_K has no dequant path in the repo at all (vbs_dequant_block
          * returns 0), so every honest backend refuses it. */
         check(p == NULL, "%s: linear Q8_K refused (no dequant path)", label);
         if (strcmp(label, "Vulkan") == 0) {
-            p = ops->compile_linear_pipeline(dev, VBS_GGML_TYPE_Q5_K, err, sizeof(err));
-            check(p == NULL, "%s: linear Q5_K refused (no SPIR-V kernel)", label);
-            p = ops->compile_embed_pipeline(dev, VBS_GGML_TYPE_LNS8, err, sizeof(err));
-            check(p == NULL, "%s: embed LNS8 refused (no SPIR-V kernel)", label);
+            p = ops->compile_linear_pipeline(dev, VBS_MODEL_TYPE_Q5_K, err, sizeof(err));
+            check(p == NULL, "%s: linear Q5_K refused (no GPU kernel)", label);
+            p = ops->compile_embed_pipeline(dev, VBS_MODEL_TYPE_LNS8, err, sizeof(err));
+            check(p == NULL, "%s: embed LNS8 refused (no GPU kernel)", label);
         }
     }
 }
@@ -976,9 +967,9 @@ static void time_linear(const char *label, const vbs_backend_ops_t *ops) {
     for (size_t i = 0; i < (size_t)rows * cols; i++) mat[i] = rndf() * 0.1f;
     for (uint32_t i = 0; i < cols; i++) x[i] = rndf();
     size_t packed_bytes = 0;
-    uint8_t *packed = ref_pack_matrix(mat, rows, cols, VBS_GGML_TYPE_F32, &packed_bytes);
+    uint8_t *packed = ref_pack_matrix(mat, rows, cols, VBS_MODEL_TYPE_F32, &packed_bytes);
     char err[256];
-    void *pipe = ops->compile_linear_pipeline(dev, VBS_GGML_TYPE_F32, err, sizeof(err));
+    void *pipe = ops->compile_linear_pipeline(dev, VBS_MODEL_TYPE_F32, err, sizeof(err));
     vbs_buffer_t *bw = ops->alloc_buffer(dev, packed_bytes, false);
     vbs_buffer_t *bx = ops->alloc_buffer(dev, cols * 4, false);
     vbs_buffer_t *by = ops->alloc_buffer(dev, rows * 4, false);
@@ -986,17 +977,17 @@ static void time_linear(const char *label, const vbs_backend_ops_t *ops) {
         printf("  (timing skipped for %s: setup failed)\n", label);
         goto out;
     }
-    ops->copy_to_device(bw, packed, packed_bytes);
-    ops->copy_to_device(bx, x, cols * 4);
+    upload(ops, bw, packed, packed_bytes);
+    upload(ops, bx, x, cols * 4);
     /* Warmup + 20 timed dispatches. */
     ops->dispatch_linear_tile(dev, pipe, bw, NULL, 0, bx, by, cols, rows, 0, 0, false);
     ops->synchronize_device(dev);
-    double t0 = now_sec();
+    double t0 = vbs_now_sec();
     int reps = 20;
     for (int i = 0; i < reps; i++)
         ops->dispatch_linear_tile(dev, pipe, bw, NULL, 0, bx, by, cols, rows, 0, 0, false);
     ops->synchronize_device(dev);
-    double dt = (now_sec() - t0) / reps;
+    double dt = (vbs_now_sec() - t0) / reps;
     double flops = 2.0 * (double)rows * cols;
     printf("  timing: %s linear F32 1024x1024: %.3f ms/dispatch (%.2f GFLOP/s)\n",
            label, dt * 1000.0, flops / dt / 1e9);
@@ -1010,18 +1001,18 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* SPIR-V checks                                                       */
+/* Kernel-IR checks                                                    */
 /* ------------------------------------------------------------------ */
 
-static void test_spirv(void) {
-    printf("== SPIR-V checks ==\n");
-    /* Emitter path: source -> SPIR-V -> structural validation. */
+static void test_emit_validate(void) {
+    printf("== Emitter checks ==\n");
+    /* Emitter path: source -> kernel IR -> structural validation. */
     {
         const char *src = "float add_one(float x) { return x + 1.0; }";
         uint32_t words[512];
         size_t n_words = sizeof(words) / sizeof(words[0]);
         char err[256];
-        int rc = vbs_vulkan_compile_kernel_source(src, strlen(src),
+        int rc = vbs_gpu_compile_kernel_source(src, strlen(src),
                                                   words, &n_words,
                                                   err, sizeof(err));
         bool ok = rc == 0 && n_words > 5 && words[0] == 0x07230203u;
@@ -1031,37 +1022,37 @@ static void test_spirv(void) {
     /* Every precompiled kernel blob validates structurally. */
     {
         struct { const char *name; const uint32_t *w; size_t n; } blobs[] = {
-            { "add", vbs_spv_add, vbs_spv_add_words },
-            { "silu_mul", vbs_spv_silu_mul, vbs_spv_silu_mul_words },
-            { "rope", vbs_spv_rope, vbs_spv_rope_words },
-            { "rms_norm", vbs_spv_rms_norm, vbs_spv_rms_norm_words },
-            { "embed_f32", vbs_spv_embed_f32, vbs_spv_embed_f32_words },
-            { "embed_f16", vbs_spv_embed_f16, vbs_spv_embed_f16_words },
-            { "embed_q8_0", vbs_spv_embed_q8_0, vbs_spv_embed_q8_0_words },
-            { "embed_q4_0", vbs_spv_embed_q4_0, vbs_spv_embed_q4_0_words },
-            { "embed_q4_1", vbs_spv_embed_q4_1, vbs_spv_embed_q4_1_words },
-            { "embed_q4_k", vbs_spv_embed_q4_k, vbs_spv_embed_q4_k_words },
-            { "embed_q6_k", vbs_spv_embed_q6_k, vbs_spv_embed_q6_k_words },
-            { "kv_cache_store", vbs_spv_kv_cache_store, vbs_spv_kv_cache_store_words },
-            { "attention_gqa", vbs_spv_attention_gqa, vbs_spv_attention_gqa_words },
-            { "matvec_f32", vbs_spv_matvec_f32, vbs_spv_matvec_f32_words },
-            { "matvec_f16", vbs_spv_matvec_f16, vbs_spv_matvec_f16_words },
-            { "matvec_q8_0", vbs_spv_matvec_q8_0, vbs_spv_matvec_q8_0_words },
-            { "matvec_q4_0", vbs_spv_matvec_q4_0, vbs_spv_matvec_q4_0_words },
-            { "matvec_q4_1", vbs_spv_matvec_q4_1, vbs_spv_matvec_q4_1_words },
-            { "matvec_q4_k", vbs_spv_matvec_q4_k, vbs_spv_matvec_q4_k_words },
-            { "matvec_q6_k", vbs_spv_matvec_q6_k, vbs_spv_matvec_q6_k_words },
-            { "matvec_lns8", vbs_spv_matvec_lns8, vbs_spv_matvec_lns8_words },
+            { "add", vbs_kernel_add, vbs_kernel_add_words },
+            { "silu_mul", vbs_kernel_silu_mul, vbs_kernel_silu_mul_words },
+            { "rope", vbs_kernel_rope, vbs_kernel_rope_words },
+            { "rms_norm", vbs_kernel_rms_norm, vbs_kernel_rms_norm_words },
+            { "embed_f32", vbs_kernel_embed_f32, vbs_kernel_embed_f32_words },
+            { "embed_f16", vbs_kernel_embed_f16, vbs_kernel_embed_f16_words },
+            { "embed_q8_0", vbs_kernel_embed_q8_0, vbs_kernel_embed_q8_0_words },
+            { "embed_q4_0", vbs_kernel_embed_q4_0, vbs_kernel_embed_q4_0_words },
+            { "embed_q4_1", vbs_kernel_embed_q4_1, vbs_kernel_embed_q4_1_words },
+            { "embed_q4_k", vbs_kernel_embed_q4_k, vbs_kernel_embed_q4_k_words },
+            { "embed_q6_k", vbs_kernel_embed_q6_k, vbs_kernel_embed_q6_k_words },
+            { "kv_cache_store", vbs_kernel_kv_cache_store, vbs_kernel_kv_cache_store_words },
+            { "attention_gqa", vbs_kernel_attention_gqa, vbs_kernel_attention_gqa_words },
+            { "matvec_f32", vbs_kernel_matvec_f32, vbs_kernel_matvec_f32_words },
+            { "matvec_f16", vbs_kernel_matvec_f16, vbs_kernel_matvec_f16_words },
+            { "matvec_q8_0", vbs_kernel_matvec_q8_0, vbs_kernel_matvec_q8_0_words },
+            { "matvec_q4_0", vbs_kernel_matvec_q4_0, vbs_kernel_matvec_q4_0_words },
+            { "matvec_q4_1", vbs_kernel_matvec_q4_1, vbs_kernel_matvec_q4_1_words },
+            { "matvec_q4_k", vbs_kernel_matvec_q4_k, vbs_kernel_matvec_q4_k_words },
+            { "matvec_q6_k", vbs_kernel_matvec_q6_k, vbs_kernel_matvec_q6_k_words },
+            { "matvec_lns8", vbs_kernel_matvec_lns8, vbs_kernel_matvec_lns8_words },
         };
         int bad = 0;
         for (size_t i = 0; i < sizeof(blobs) / sizeof(blobs[0]); i++) {
             char err[256];
-            if (spirv_validate(blobs[i].w, blobs[i].n, err, sizeof(err)) != 0) {
+            if (vbs_kernel_validate(blobs[i].w, blobs[i].n, err, sizeof(err)) != 0) {
                 printf("      blob %s INVALID: %s\n", blobs[i].name, err);
                 bad++;
             }
         }
-        check(bad == 0, "spirv_validate: all %zu precompiled blobs valid",
+        check(bad == 0, "vbs_kernel_validate: all %zu precompiled blobs valid",
               sizeof(blobs) / sizeof(blobs[0]));
     }
     /* Other emitters: compile smoke test (wired, not half-wired). */
@@ -1081,13 +1072,13 @@ static void test_spirv(void) {
                       gcn_validate(words, n_words, err, sizeof(err)) == 0;
         check(gcn_ok, "gcn_emit: source->GCN validates");
         /* Native compile: reports availability, never fails the suite
-         * either way (the weak stub returns -1 until real native
-         * emitters land). */
+         * either way (vbs_compile returns -1 until the native
+         * emitters are written). */
         void *fn = NULL;
         size_t sz = 0;
         int rc_nat = vbs_compile(src, strlen(src), &fn, &sz, err, sizeof(err));
         printf("  [info] vbs_compile (native): %s\n",
-               rc_nat == 0 ? "available" : "unavailable (stub, native emitters pending)");
+               rc_nat == 0 ? "available" : "unavailable (native emitters pending)");
         (void)rc_nat;
     }
 }
@@ -1098,14 +1089,15 @@ static void test_spirv(void) {
 
 static void test_selection(void) {
     printf("== selection / fallback checks ==\n");
-    bool vk = g_vbs_vulkan_backend.init();
-    bool cu = g_vbs_cuda_backend.init();
-    bool hip = g_vbs_hip_backend.init();
-    bool metal = false;
+    /* Probe every backend's init: the init call is the left operand
+     * so it always runs (no short-circuit — each init loads its
+     * driver and enumerates devices). */
+    bool any_gpu = g_vbs_vulkan_backend.init();
+    any_gpu = g_vbs_cuda_backend.init() || any_gpu;
+    any_gpu = g_vbs_hip_backend.init() || any_gpu;
 #if defined(VBS_ENABLE_METAL) && VBS_ENABLE_METAL
-    metal = g_vbs_metal_backend.init();
+    any_gpu = g_vbs_metal_backend.init() || any_gpu;
 #endif
-    bool any_gpu = vk || cu || hip || metal;
     const vbs_backend_ops_t *sel = vbs_backend_select();
     check(sel != NULL, "selection returns a backend (never NULL)");
     if (!any_gpu) {
@@ -1153,7 +1145,7 @@ int vbs_backend_selftest(void) {
         printf("  [info] Metal unavailable, smoke skipped\n");
     }
 #endif
-    test_spirv();
+    test_emit_validate();
     printf("== timings ==\n");
     time_linear("CPU", &g_vbs_cpu_backend);
     time_linear("Vulkan", &g_vbs_vulkan_backend);

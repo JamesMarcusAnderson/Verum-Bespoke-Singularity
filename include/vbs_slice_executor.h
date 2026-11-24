@@ -1,7 +1,7 @@
 #ifndef VBS_SLICE_EXECUTOR_H
 #define VBS_SLICE_EXECUTOR_H
 
-#include "vbs_gguf.h"
+#include "vbs_model.h"
 #include "vbs_backend.h"
 #include <stdbool.h>
 
@@ -9,25 +9,29 @@
 extern "C" {
 #endif
 
+/* Runs one linear layer in bounded slices, so a model bigger than
+ * the memory window can still execute: weights move from the
+ * model file into a staging window a tile at a time and are dispatched
+ * tile by tile, accumulating partial results into the output.
+ * Two staging/private window pairs alternate (double buffering)
+ * between tiles. */
 typedef struct {
-    const vbs_gguf_model_t *model;
+    const vbs_model_t *model;
     const vbs_backend_ops_t *backend;
     vbs_device_t *device;
     size_t window_bytes;
 
-    // Double buffered staging and private windows
     vbs_buffer_t *stage[2];
     vbs_buffer_t *priv[2];
     size_t turn;
 } vbs_slice_executor_t;
 
 vbs_slice_executor_t *vbs_slice_executor_create(
-    const vbs_gguf_model_t *model,
+    const vbs_model_t *model,
     const vbs_backend_ops_t *backend,
     vbs_device_t *device,
     size_t window_bytes,
-    char *err_buf, size_t err_cap
-);
+    char *err_buf, size_t err_cap);
 
 void vbs_slice_executor_free(vbs_slice_executor_t *exec);
 
@@ -36,11 +40,10 @@ bool vbs_slice_executor_run_linear(
     const vbs_tensor_t *tensor,
     vbs_buffer_t *input,
     vbs_buffer_t *output,
-    char *err_buf, size_t err_cap
-);
+    char *err_buf, size_t err_cap);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // VBS_SLICE_EXECUTOR_H
+#endif /* VBS_SLICE_EXECUTOR_H */

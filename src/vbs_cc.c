@@ -1,4 +1,12 @@
-/* vbs_cc.c — system-compiler invocation (fork/exec, no shell). */
+/* vbs_cc.c — system-compiler invocation (fork/exec, no shell).
+ *
+ * Compiles one C source file into a shared object by spawning the
+ * system compiler directly (fork/execvp, argv array — no shell, so
+ * no quoting or injection surface). The compiler's stderr is piped
+ * back to the caller; stdout goes to /dev/null. The parent drains
+ * the pipe fully so a chatty compiler can never block on a full
+ * pipe, then waits for the child and reports its exit status. */
+
 #include "vbs_cc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,13 +29,25 @@ const char *vbs_cc_default(void) {
 int vbs_cc_compile_so(const char *cc, const char *src, const char *so,
                       const char *const *extra_argv, size_t n_extra,
                       char *err_out, size_t err_cap) {
-    (void)cc; (void)src; (void)so; (void)extra_argv; (void)n_extra;
+    (void)cc;
+    (void)src;
+    (void)so;
+    (void)extra_argv;
+    (void)n_extra;
     if (err_out && err_cap)
         snprintf(err_out, err_cap,
                  "system-compiler invocation is POSIX-only in this build");
     return -1;
 }
 #else
+
+/* Drain a pipe into nowhere (used after the error buffer is full, so
+ * the child never blocks on a full pipe). */
+static void drain_pipe(int fd) {
+    char scratch[4096];
+    while (read(fd, scratch, sizeof(scratch)) > 0) { }
+}
+
 int vbs_cc_compile_so(const char *cc, const char *src, const char *so,
                       const char *const *extra_argv, size_t n_extra,
                       char *err_out, size_t err_cap) {
@@ -80,13 +100,10 @@ int vbs_cc_compile_so(const char *cc, const char *src, const char *so,
                (r = read(pipefd[0], err_out + n, err_cap - 1 - n)) > 0) {
             n += (size_t)r;
         }
-        /* Drain the rest so the child never blocks on a full pipe. */
-        char drain[4096];
-        while (read(pipefd[0], drain, sizeof(drain)) > 0) { }
+        drain_pipe(pipefd[0]);
         err_out[n] = '\0';
     } else {
-        char drain[4096];
-        while (read(pipefd[0], drain, sizeof(drain)) > 0) { }
+        drain_pipe(pipefd[0]);
     }
     close(pipefd[0]);
     int status = 0;
@@ -98,7 +115,8 @@ int vbs_cc_compile_so(const char *cc, const char *src, const char *so,
         }
         return rc;
     }
-    if (err_out && err_cap) snprintf(err_out, err_cap, "compiler killed by signal %d", WTERMSIG(status));
+    if (err_out && err_cap)
+        snprintf(err_out, err_cap, "compiler killed by signal %d", WTERMSIG(status));
     return -1;
 }
 #endif /* _WIN32 */

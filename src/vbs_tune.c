@@ -17,12 +17,34 @@ void vbs_tune_profile_init(vbs_tune_profile_t *p) {
     p->generated_unix = (uint64_t)time(NULL);
 }
 
+/* Append a field to a trait string; a field that does not fit
+ * whole is dropped, never truncated. */
 static void append_field(char *buf, size_t cap, size_t *len, const char *s) {
     size_t n = strlen(s);
     if (*len + n + 1 >= cap) return;
     memcpy(buf + *len, s, n);
     *len += n;
     buf[*len] = '\0';
+}
+
+/* Trim trailing newlines and spaces from a length. */
+static size_t trim_right_len(const char *s, size_t n) {
+    while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) n--;
+    return n;
+}
+
+/* Read the first line of a small sysfs/proc file, trailing-trimmed. */
+static bool read_trimmed_line(const char *path, char *out, size_t cap) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    bool ok = false;
+    if (fgets(out, (int)cap, f)) {
+        size_t n = trim_right_len(out, strlen(out));
+        out[n] = '\0';
+        ok = true;
+    }
+    fclose(f);
+    return ok;
 }
 
 /* Read the first "model name" line and the flags line from /proc/cpuinfo. */
@@ -33,19 +55,19 @@ static void cpuinfo_fields(char *model, size_t model_cap, char *flags, size_t fl
     if (!f) return;
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
+        const char *v;
         if (strncmp(line, "model name", 10) == 0 && !model[0]) {
-            const char *v = strchr(line, ':');
+            v = strchr(line, ':');
             if (v) {
                 v++;
                 while (*v == ' ' || *v == '\t') v++;
-                size_t n = strlen(v);
-                while (n && (v[n - 1] == '\n' || v[n - 1] == ' ')) n--;
+                size_t n = trim_right_len(v, strlen(v));
                 if (n >= model_cap) n = model_cap - 1;
                 memcpy(model, v, n);
                 model[n] = '\0';
             }
         } else if (strncmp(line, "flags", 5) == 0 && !flags[0]) {
-            const char *v = strchr(line, ':');
+            v = strchr(line, ':');
             if (v) {
                 v++;
                 size_t n = strlen(v);
@@ -59,6 +81,8 @@ static void cpuinfo_fields(char *model, size_t model_cap, char *flags, size_t fl
     fclose(f);
 }
 
+/* Whole-word flag search: the name must be bounded by spaces (or
+ * the string ends) on both sides. */
 static bool has_flag(const char *flags, const char *name) {
     size_t n = strlen(name);
     const char *p = flags;
@@ -82,39 +106,30 @@ bool vbs_tune_fingerprint(char *out, size_t cap) {
     traits[0] = '\0';
     append_field(traits, sizeof(traits), &len, model);
     append_field(traits, sizeof(traits), &len, "|");
-    if (has_flag(flags, "avx512f")) append_field(traits, sizeof(traits), &len, "avx512f,");
-    if (has_flag(flags, "avx2")) append_field(traits, sizeof(traits), &len, "avx2,");
-    if (has_flag(flags, "sse4_2")) append_field(traits, sizeof(traits), &len, "sse4_2,");
-    if (has_flag(flags, "fma")) append_field(traits, sizeof(traits), &len, "fma,");
+    static const char *k_rank_flags[] = { "avx512f", "avx2", "sse4_2", "fma" };
+    for (size_t i = 0; i < sizeof(k_rank_flags) / sizeof(k_rank_flags[0]); i++) {
+        if (has_flag(flags, k_rank_flags[i])) {
+            char tagged[32];
+            snprintf(tagged, sizeof(tagged), "%s,", k_rank_flags[i]);
+            append_field(traits, sizeof(traits), &len, tagged);
+        }
+    }
     char tmp[64];
     long cores = (long)vbs_cpu_count();
     snprintf(tmp, sizeof(tmp), "|cores=%ld", cores > 0 ? cores : 1);
     append_field(traits, sizeof(traits), &len, tmp);
-    FILE *cf = fopen("/sys/devices/system/cpu/cpu0/cache/index3/size", "r");
-    if (cf) {
-        char sz[32] = "";
-        if (fgets(sz, sizeof(sz), cf)) {
-            size_t n = strlen(sz);
-            while (n && (sz[n - 1] == '\n' || sz[n - 1] == ' ')) sz[--n] = '\0';
-            snprintf(tmp, sizeof(tmp), "|l3=%s", sz);
-            append_field(traits, sizeof(traits), &len, tmp);
-        }
-        fclose(cf);
+    char sz[32] = "";
+    if (read_trimmed_line("/sys/devices/system/cpu/cpu0/cache/index3/size", sz, sizeof(sz))) {
+        snprintf(tmp, sizeof(tmp), "|l3=%s", sz);
+        append_field(traits, sizeof(traits), &len, tmp);
     }
-    FILE *mf = fopen("/etc/machine-id", "r");
-    if (mf) {
-        char mid[64] = "";
-        if (fgets(mid, sizeof(mid), mf)) {
-            size_t n = strlen(mid);
-            while (n && (mid[n - 1] == '\n' || mid[n - 1] == ' ')) mid[--n] = '\0';
-            snprintf(tmp, sizeof(tmp), "|m=%.12s", mid);
-            append_field(traits, sizeof(traits), &len, tmp);
-        }
-        fclose(mf);
+    char mid[64] = "";
+    if (read_trimmed_line("/etc/machine-id", mid, sizeof(mid))) {
+        snprintf(tmp, sizeof(tmp), "|m=%.12s", mid);
+        append_field(traits, sizeof(traits), &len, tmp);
     }
 
-    /* Fingerprint = sha256 of the trait string, first 16 hex chars, plus
-     * the human-readable trait string itself for debugging. */
+    /* Fingerprint = sha256 of the trait string, first 16 hex chars. */
     vbs_sha256_ctx_t ctx;
     vbs_sha256_init(&ctx);
     vbs_sha256_update(&ctx, traits, strlen(traits));
@@ -229,6 +244,12 @@ bool vbs_tune_load_embedded(vbs_tune_profile_t *p, char *err, size_t err_cap) {
         snprintf(err, err_cap, "cannot open /proc/self/exe");
         return false;
     }
+    Elf64_Shdr *sh = NULL;
+    char *strtab = NULL;
+    char *json = NULL;
+    size_t json_len = 0;
+    bool ok = false;
+
     Elf64_Ehdr eh;
     if (fread(&eh, 1, sizeof(eh), f) != sizeof(eh) ||
         memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
@@ -236,46 +257,34 @@ bool vbs_tune_load_embedded(vbs_tune_profile_t *p, char *err, size_t err_cap) {
         eh.e_shoff == 0 || eh.e_shentsize != sizeof(Elf64_Shdr) ||
         eh.e_shnum == 0 || eh.e_shstrndx >= eh.e_shnum) {
         snprintf(err, err_cap, "not a readable ELF64 binary");
-        fclose(f);
-        return false;
+        goto done;
     }
-    Elf64_Shdr *sh = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
+    sh = (Elf64_Shdr *)calloc(eh.e_shnum, sizeof(Elf64_Shdr));
     if (!sh) {
         snprintf(err, err_cap, "out of memory");
-        fclose(f);
-        return false;
+        goto done;
     }
     fseek(f, (long)eh.e_shoff, SEEK_SET);
     if (fread(sh, sizeof(Elf64_Shdr), eh.e_shnum, f) != eh.e_shnum) {
         snprintf(err, err_cap, "cannot read section headers");
-        free(sh);
-        fclose(f);
-        return false;
+        goto done;
     }
     /* Section-name string table. */
-    Elf64_Shdr *strsh = &sh[eh.e_shstrndx];
-    char *strtab = (char *)malloc(strsh->sh_size ? (size_t)strsh->sh_size : 1);
-    if (!strtab) {
-        snprintf(err, err_cap, "out of memory");
-        free(sh);
-        fclose(f);
-        return false;
-    }
-    fseek(f, (long)strsh->sh_offset, SEEK_SET);
-    if (fread(strtab, 1, (size_t)strsh->sh_size, f) != (size_t)strsh->sh_size) {
-        snprintf(err, err_cap, "cannot read section names");
-        free(strtab);
-        free(sh);
-        fclose(f);
-        return false;
-    }
-    bool found = false;
-    char *json = NULL;
-    size_t json_len = 0;
-    for (size_t i = 0; i < eh.e_shnum; i++) {
-        if (sh[i].sh_name >= strsh->sh_size) continue;
-        const char *name = strtab + sh[i].sh_name;
-        if (strcmp(name, ".vbs_tune") == 0) {
+    {
+        Elf64_Shdr *strsh = &sh[eh.e_shstrndx];
+        strtab = (char *)malloc(strsh->sh_size ? (size_t)strsh->sh_size : 1);
+        if (!strtab) {
+            snprintf(err, err_cap, "out of memory");
+            goto done;
+        }
+        fseek(f, (long)strsh->sh_offset, SEEK_SET);
+        if (fread(strtab, 1, (size_t)strsh->sh_size, f) != (size_t)strsh->sh_size) {
+            snprintf(err, err_cap, "cannot read section names");
+            goto done;
+        }
+        for (size_t i = 0; i < eh.e_shnum; i++) {
+            if (sh[i].sh_name >= strsh->sh_size) continue;
+            if (strcmp(strtab + sh[i].sh_name, ".vbs_tune") != 0) continue;
             json_len = (size_t)sh[i].sh_size;
             json = (char *)malloc(json_len + 1);
             if (!json) break;
@@ -286,25 +295,26 @@ bool vbs_tune_load_embedded(vbs_tune_profile_t *p, char *err, size_t err_cap) {
                 break;
             }
             json[json_len] = '\0';
-            found = true;
+            ok = true;
             break;
         }
     }
+    if (!ok || !json) {
+        snprintf(err, err_cap, "no embedded .vbs_tune section in this binary");
+        goto done;
+    }
+    if (!vbs_tune_parse_json(p, json, json_len)) {
+        snprintf(err, err_cap, "embedded .vbs_tune section is not a valid profile");
+        ok = false;
+        goto done;
+    }
+    ok = true;
+done:
+    free(json);
     free(strtab);
     free(sh);
     fclose(f);
-    if (!found || !json) {
-        snprintf(err, err_cap, "no embedded .vbs_tune section in this binary");
-        free(json);
-        return false;
-    }
-    bool ok = vbs_tune_parse_json(p, json, json_len);
-    free(json);
-    if (!ok) {
-        snprintf(err, err_cap, "embedded .vbs_tune section is not a valid profile");
-        return false;
-    }
-    return true;
+    return ok;
 #endif
 }
 

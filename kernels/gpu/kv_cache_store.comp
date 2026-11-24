@@ -1,0 +1,36 @@
+// kv_cache_store.comp — store f32 K/V into the f16 KV caches at
+// (layer, pos). Element index: (layer * max_ctx + pos) * kv_dim + i,
+// stored as half floats.
+//
+// One invocation per f16 PAIR: it packs two halves into one 32-bit
+// word, so no 16-bit storage feature is needed and no two
+// invocations ever write the same word. Requires an even kv_dim
+// (true for every real model: head_dim is even); the backend refuses
+// odd kv_dim at dispatch. Bindings: 0=k (f32), 1=v (f32),
+// 2=kc (u32 packed f16), 3=vc (u32 packed f16).
+// Push: pos, layer, max_ctx, kv_dim.
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer K { float k[]; };
+layout(set = 0, binding = 1) readonly buffer V { float v[]; };
+layout(set = 0, binding = 2) buffer KC { uint kc[]; };
+layout(set = 0, binding = 3) buffer VC { uint vc[]; };
+layout(push_constant) uniform PC {
+    uint pos; uint layer; uint max_ctx; uint kv_dim;
+} pc;
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint pair_count = (pc.kv_dim + 1u) / 2u;
+    if (pair >= pair_count) return;
+    uint even = 2u * pair;
+    uint odd = even + 1u;
+    bool has_odd = odd < pc.kv_dim;
+    float k_even = k[even];
+    float k_odd = has_odd ? k[odd] : k_even;
+    float v_even = v[even];
+    float v_odd = has_odd ? v[odd] : v_even;
+    uint slot = (pc.layer * pc.max_ctx + pc.pos) * pc.kv_dim + even;
+    uint word_index = slot >> 1;
+    kc[word_index] = packHalf2x16(vec2(k_even, k_odd));
+    vc[word_index] = packHalf2x16(vec2(v_even, v_odd));
+}

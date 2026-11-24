@@ -1,3 +1,14 @@
+/* vbs_engine.c — engine lifecycle: create (model + profiles +
+ * fabric + runtime buffers), JIT compile, forward, the PGAE
+ * generation loop, prompt NLL evaluation, and the
+ * evolutionary-mutation (Hydra) support.
+ *
+ * Backend selection lives in vbs_backend_select.c: Vulkan -> CUDA
+ * -> HIP -> Metal -> CPU fallback, with a log line for every
+ * attempt. vbs_backend_select() never returns NULL (CPU always
+ * works), so engine creation no longer fails fatally when no GPU
+ * is present.
+ */
 #include "vbs_engine.h"
 #include "vbs_specializer.h"
 #include "vbs_specializer_bridge.h"
@@ -8,13 +19,45 @@
 #include <string.h>
 #include <math.h>
 
-/* Backend selection lives in vbs_backend_select.c: Vulkan -> CUDA ->
- * HIP -> Metal -> CPU fallback, with a log line for every attempt.
- * vbs_backend_select() never returns NULL (CPU always works), so
- * engine creation no longer fails fatally when no GPU is present. */
+/* Resolve the specialization cache directory: VBS_CACHE_DIR, or
+ * the platform default. The directory is created. */
+static const char *cache_dir_for(char *scratch, size_t cap) {
+    const char *dir = getenv("VBS_CACHE_DIR");
+    if (!dir) {
+        vbs_default_cache_dir(scratch, cap);
+        dir = scratch;
+    }
+    vbs_mkdir(dir);
+    return dir;
+}
+
+/* Argmax over logits, first maximum wins. The -1e9 floor means a
+ * (pathological) all-below-floor vector yields token 0. */
+static uint32_t argmax_logits(const float *logits, size_t vocab_size) {
+    float best = -1e9f;
+    uint32_t token = 0;
+    for (size_t i = 0; i < vocab_size; i++) {
+        if (logits[i] > best) {
+            best = logits[i];
+            token = (uint32_t)i;
+        }
+    }
+    return token;
+}
+
+static void free_autonomy_buffers(vbs_engine_t *e) {
+    if (e->autonomy_control_buffer) {
+        e->backend->free_buffer(e->autonomy_control_buffer);
+        e->autonomy_control_buffer = NULL;
+    }
+    if (e->autonomy_tokens_buffer) {
+        e->backend->free_buffer(e->autonomy_tokens_buffer);
+        e->autonomy_tokens_buffer = NULL;
+    }
+}
 
 vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, size_t err_cap) {
-    vbs_gguf_model_t *model = vbs_gguf_open(path, err, err_cap);
+    vbs_model_t *model = vbs_model_open(path, err, err_cap);
     if (!model) return NULL;
 
     vbs_system_profile_t *sys = vbs_profiler_scan_system();
@@ -23,13 +66,16 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     const vbs_backend_ops_t *backend = vbs_backend_select();
 
     vbs_engine_t *e = (vbs_engine_t *)calloc(1, sizeof(vbs_engine_t));
+    if (!e) {
+        vbs_model_close(model);
+        return NULL;
+    }
     e->model = model;
     e->sys_profile = sys;
     e->model_profile = vbs_profiler_scan_model(model);
     if (!e->model_profile) {
         snprintf(err, err_cap, "Model profile refused (see profiler message above)");
-        free(e);
-        vbs_gguf_close(model);
+        vbs_engine_destroy(e);
         return NULL;
     }
     e->backend = backend;
@@ -48,7 +94,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         swap_path ? swap_path : swap_default
     );
 
-    // Register all tensors into the fabric
+    /* Register all tensors into the fabric. */
     vbs_device_t *primary_dev = e->backend->get_device(0);
     for (size_t i = 0; i < model->n_tensors; i++) {
         const vbs_tensor_t *t = &model->tensors[i];
@@ -57,11 +103,12 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     }
 
     e->window_bytes = (window_mib ? window_mib : 256) * 1024 * 1024;
-    /* Device count comes from the SELECTED backend, not the profiler:
-     * the profiler counts GPUs across all backends, but only the
-     * selected backend's devices are usable. (The old code used
-     * sys->n_gpus, which over-counted when two backends both saw a
-     * GPU — the second "device" was an uninitialized struct.) */
+    /* Device count comes from the SELECTED backend, not the
+     * profiler: the profiler counts GPUs across all backends, but
+     * only the selected backend's devices are usable. (The old
+     * code used sys->n_gpus, which over-counted when two backends
+     * both saw a GPU -- the second "device" was an uninitialized
+     * struct.) */
     e->n_devices = backend->get_device_count();
     if (e->n_devices == 0) e->n_devices = 1;
     e->devices = (vbs_device_t **)calloc(e->n_devices, sizeof(vbs_device_t *));
@@ -77,9 +124,9 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         }
     }
 
-    // Allocate runtime activation and KV-cache buffers
-    // The profiler refuses incomplete models, so these are all proven
-    // nonzero here -- no fallback shapes.
+    /* Runtime activation and KV-cache buffers. The profiler
+     * refuses incomplete models, so these are all proven nonzero
+     * here -- no fallback shapes. */
     size_t embed_dim = e->model_profile->embedding_dim;
     size_t vocab_size = e->model_profile->vocab_size;
     size_t max_ctx = e->model_profile->context_length;
@@ -87,8 +134,9 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     size_t n_kv_h = e->model_profile->n_kv_heads;
     size_t head_d = e->model_profile->head_dim;
 
-    // Scratch sizes first: the KV budget below must account for them.
-    // (Q/K/V, attention out, FFN gate/up/hidden, normed activation.)
+    /* Scratch sizes first: the KV budget below must account for
+     * them. (Q/K/V, attention out, FFN gate/up/hidden, normed
+     * activation.) */
     size_t q_dim = (e->model_profile->n_heads && head_d) ? (size_t)e->model_profile->n_heads * head_d : embed_dim;
     size_t kv_dim = n_kv_h * head_d;
     size_t ffn_dim = embed_dim;
@@ -103,20 +151,22 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
     size_t scratch_bytes = 0;
     for (size_t i = 0; i < VBS_SCRATCH_COUNT; i++) scratch_bytes += scratch_sizes[i] * sizeof(float);
 
-    // KV cache capacity, computed from the two profiles -- no fixed caps.
-    // Ceiling: the model's own context length. Budget: the GPU's measured
-    // free VRAM (profiled before the weights are resident, so the model
-    // bytes are subtracted; falls back to total VRAM) minus the other
-    // runtime buffers this function allocates, all sized from the model's
-    // dimensions. Positions = budget / bytes per position across both
-    // caches. Kernels must use e->kv_ctx_capacity as the cache stride.
-    size_t kv_pos_bytes = n_layers * n_kv_h * head_d * sizeof(uint16_t); // per position, per cache
+    /* KV cache capacity, computed from the two profiles -- no
+     * fixed caps. Ceiling: the model's own context length.
+     * Budget: the GPU's measured free VRAM (profiled before the
+     * weights are resident, so the model bytes are subtracted;
+     * falls back to total VRAM) minus the other runtime buffers
+     * this function allocates, all sized from the model's
+     * dimensions. Positions = budget / bytes per position across
+     * both caches. Kernels must use e->kv_ctx_capacity as the
+     * cache stride. */
+    size_t kv_pos_bytes = n_layers * n_kv_h * head_d * sizeof(uint16_t); /* per position, per cache */
     uint64_t total_vram = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].total_vram_bytes : 0;
     uint64_t free_vram  = (e->sys_profile && e->sys_profile->n_gpus > 0) ? e->sys_profile->gpus[0].free_vram_bytes : 0;
     uint64_t base_vram  = free_vram ? free_vram : total_vram;
     if (vbs_backend_is_cpu(backend)) {
-        /* CPU fallback: the KV cache lives in RAM, not VRAM. Use free
-         * RAM (falling back to total RAM) as the budget. */
+        /* CPU fallback: the KV cache lives in RAM, not VRAM. Use
+         * free RAM (falling back to total RAM) as the budget. */
         uint64_t free_ram = e->sys_profile ? e->sys_profile->cpu.free_ram_bytes : 0;
         uint64_t total_ram = e->sys_profile ? e->sys_profile->cpu.total_ram_bytes : 0;
         base_vram = free_ram ? free_ram : total_ram;
@@ -163,7 +213,7 @@ vbs_engine_t *vbs_engine_create(const char *path, size_t window_mib, char *err, 
         }
     }
 
-    // Bind bridge pointers
+    /* Bind bridge pointers. */
     vbs_bridge_bind_runtime(primary_dev, e->backend, e->fabric);
     vbs_bridge_set_activations(e->act_a, e->act_b, e->kv_cache_k, e->kv_cache_v, e->logits);
     vbs_bridge_set_scratch(e->scratch, VBS_SCRATCH_COUNT);
@@ -185,9 +235,7 @@ bool vbs_engine_compile(vbs_engine_t *e, char *err, size_t err_cap) {
     vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
 
     char cache_default[512];
-    const char *cache_dir = getenv("VBS_CACHE_DIR");
-    if (!cache_dir) { vbs_default_cache_dir(cache_default, sizeof cache_default); cache_dir = cache_default; }
-    vbs_mkdir(cache_dir);
+    const char *cache_dir = cache_dir_for(cache_default, sizeof cache_default);
 
     e->specialized = vbs_specializer_load_cached(hash, cache_dir);
     if (!e->specialized) {
@@ -229,14 +277,15 @@ bool vbs_engine_forward(vbs_engine_t *e, const uint32_t *tokens, size_t n_tokens
 }
 
 /* PGAE Phase 1: engine-owned generation loop.
- * Boot phase (host): allocate control + token buffers on the device,
- * write the control block, prefill the prompt through the existing
- * JIT forward path. Generation phase (engine loop): argmax the
- * logits readback, write the token to the generated array, feed it
- * back as the next input, advance position, stop on EOS or max.
- * This is NOT a persistent device kernel yet -- see the header
- * comment. The loop lives in the engine, not in main, so main does
- * not decode, re-feed, or decide when to stop. */
+ * Boot phase (host): allocate control + token buffers on the
+ * device, write the control block, prefill the prompt through
+ * the existing JIT forward path. Generation phase (engine loop):
+ * argmax the logits readback, write the token to the generated
+ * array, feed it back as the next input, advance position, stop
+ * on EOS or max. This is NOT a persistent device kernel yet --
+ * see the header comment. The loop lives in the engine, not in
+ * main, so main does not decode, re-feed, or decide when to
+ * stop. */
 bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens, size_t n_prompt, size_t max_gen, uint32_t eos_token_id, uint32_t **out_tokens, size_t *out_n, bool *stopped_on_eos) {
     if (!e || !prompt_tokens || n_prompt == 0 || max_gen == 0 || !out_tokens || !out_n) return false;
     if (!e->specialized || !e->specialized->forward_fn) return false;
@@ -245,25 +294,26 @@ bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens,
     if (vocab_size == 0) return false;
 
     /* Free any previous autonomy buffers before allocating new ones. */
-    if (e->autonomy_control_buffer) { e->backend->free_buffer(e->autonomy_control_buffer); e->autonomy_control_buffer = NULL; }
-    if (e->autonomy_tokens_buffer) { e->backend->free_buffer(e->autonomy_tokens_buffer); e->autonomy_tokens_buffer = NULL; }
+    free_autonomy_buffers(e);
 
     e->autonomy_control_buffer = e->backend->alloc_buffer(e->devices[0], sizeof(vbs_gpu_control_t), false);
     e->autonomy_tokens_buffer = e->backend->alloc_buffer(e->devices[0], max_gen * sizeof(uint32_t), false);
     if (!e->autonomy_control_buffer || !e->autonomy_tokens_buffer) {
-        if (e->autonomy_control_buffer) { e->backend->free_buffer(e->autonomy_control_buffer); e->autonomy_control_buffer = NULL; }
-        if (e->autonomy_tokens_buffer) { e->backend->free_buffer(e->autonomy_tokens_buffer); e->autonomy_tokens_buffer = NULL; }
+        free_autonomy_buffers(e);
         return false;
     }
 
     uint32_t *generated = (uint32_t *)calloc(max_gen, sizeof(uint32_t));
     if (!generated) return false;
     float *logits = (float *)calloc(vocab_size, sizeof(float));
-    if (!logits) { free(generated); return false; }
+    if (!logits) {
+        free(generated);
+        return false;
+    }
 
-    /* Control block, boot state. generated_tokens_dev / logits_dev
-     * are device addresses (buffer internal handles), never host
-     * pointers copied into device memory. */
+    /* Control block, boot state. generated_tokens_dev /
+     * logits_dev are device addresses (buffer internal handles),
+     * never host pointers copied into device memory. */
     memset(&e->autonomy_control, 0, sizeof(e->autonomy_control));
     e->autonomy_control.state = VBS_PGAE_PREFILL;
     e->autonomy_control.current_token = prompt_tokens[n_prompt - 1];
@@ -278,7 +328,8 @@ bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens,
     /* Prefill: prompt tokens, one forward each, as in --generate. */
     for (size_t i = 0; i < n_prompt; i++) {
         if (!vbs_engine_forward(e, &prompt_tokens[i], 1, logits)) {
-            free(generated); free(logits);
+            free(generated);
+            free(logits);
             return false;
         }
     }
@@ -287,32 +338,27 @@ bool vbs_engine_forward_autonomy(vbs_engine_t *e, const uint32_t *prompt_tokens,
     e->autonomy_control.state = VBS_PGAE_GENERATE;
     bool eos_hit = false;
     size_t n_generated = 0;
-    uint32_t cur_token = 0;
-    {
-        float max_logit = -1e9f;
-        for (size_t i = 0; i < vocab_size; i++) {
-            if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
-        }
-    }
+    uint32_t cur_token = argmax_logits(logits, vocab_size);
     while (n_generated < max_gen) {
-        if (eos_token_id != VBS_PGAE_EOS_NONE && cur_token == eos_token_id) { eos_hit = true; break; }
+        if (eos_token_id != VBS_PGAE_EOS_NONE && cur_token == eos_token_id) {
+            eos_hit = true;
+            break;
+        }
         generated[n_generated] = cur_token;
         n_generated++;
         e->autonomy_control.current_token = cur_token;
         e->autonomy_control.position = (uint32_t)n_generated;
-        /* Mirror the generated token array to the device token buffer
-         * as generation proceeds, so the device buffer is not stale. */
+        /* Mirror the generated token array to the device token
+         * buffer as generation proceeds, so the device buffer is
+         * not stale. */
         e->backend->copy_to_device(e->autonomy_tokens_buffer, generated, n_generated * sizeof(uint32_t));
         if (n_generated >= max_gen) break;
         if (!vbs_engine_forward(e, &cur_token, 1, logits)) {
-            free(generated); free(logits);
+            free(generated);
+            free(logits);
             return false;
         }
-        float max_logit = -1e9f;
-        cur_token = 0;
-        for (size_t i = 0; i < vocab_size; i++) {
-            if (logits[i] > max_logit) { max_logit = logits[i]; cur_token = (uint32_t)i; }
-        }
+        cur_token = argmax_logits(logits, vocab_size);
     }
 
     e->autonomy_control.state = VBS_PGAE_EXIT;
@@ -338,20 +384,32 @@ double vbs_engine_evaluate_prompt_nll(vbs_engine_t *e, const uint32_t *prompt_to
     size_t count = 0;
     size_t correct = 0;
     for (size_t i = 0; i + 1 < n_prompt; i++) {
-        if (!vbs_engine_forward(e, &prompt_tokens[i], 1, logits)) { free(logits); return -1.0; }
+        if (!vbs_engine_forward(e, &prompt_tokens[i], 1, logits)) {
+            free(logits);
+            return -1.0;
+        }
         uint32_t target = prompt_tokens[i + 1];
         if (target >= vocab_size) continue;
         float max_logit = logits[0];
-        for (size_t j = 1; j < vocab_size; j++) if (logits[j] > max_logit) max_logit = logits[j];
+        for (size_t j = 1; j < vocab_size; j++) {
+            if (logits[j] > max_logit) max_logit = logits[j];
+        }
         double sum_exp = 0.0;
-        for (size_t j = 0; j < vocab_size; j++) sum_exp += exp((double)logits[j] - (double)max_logit);
+        for (size_t j = 0; j < vocab_size; j++) {
+            sum_exp += exp((double)logits[j] - (double)max_logit);
+        }
         if (sum_exp <= 0.0) continue;
         double log_prob = (double)logits[target] - (double)max_logit - log(sum_exp);
         nll_sum += -log_prob;
         count++;
         uint32_t best = 0;
         float best_logit = logits[0];
-        for (size_t j = 1; j < vocab_size; j++) if (logits[j] > best_logit) { best_logit = logits[j]; best = (uint32_t)j; }
+        for (size_t j = 1; j < vocab_size; j++) {
+            if (logits[j] > best_logit) {
+                best_logit = logits[j];
+                best = (uint32_t)j;
+            }
+        }
         if (best == target) correct++;
     }
     free(logits);
@@ -364,8 +422,7 @@ void vbs_engine_destroy(vbs_engine_t *e) {
     if (!e) return;
     if (e->specialized) vbs_specializer_free(e->specialized);
     if (e->plan) vbs_planner_free(e->plan);
-    if (e->autonomy_control_buffer) e->backend->free_buffer(e->autonomy_control_buffer);
-    if (e->autonomy_tokens_buffer) e->backend->free_buffer(e->autonomy_tokens_buffer);
+    free_autonomy_buffers(e);
     if (e->act_a) e->backend->free_buffer(e->act_a);
     if (e->act_b) e->backend->free_buffer(e->act_b);
     if (e->logits) e->backend->free_buffer(e->logits);
@@ -384,7 +441,7 @@ void vbs_engine_destroy(vbs_engine_t *e) {
     if (e->model_profile) vbs_profiler_free_model(e->model_profile);
     if (e->sys_profile) vbs_profiler_free_system(e->sys_profile);
     if (e->tokenizer) tokenizer_free(e->tokenizer);
-    if (e->model) vbs_gguf_close(e->model);
+    if (e->model) vbs_model_close(e->model);
     free(e);
 }
 
@@ -398,20 +455,22 @@ void vbs_engine_print_inspection(const vbs_engine_t *e) {
 }
 
 /* --- Evolutionary / Hydra support ---------------------------------------
- * Mutation is FP32-only, by design. Quantized weights are packed bytes,
- * not floats, so reinterpreting them as float[] would corrupt the model.
- * The GGUF model file is also mmap'd PROT_READ, so the host tensor bytes
- * are not writable: mutation therefore works on a writable host mirror
- * (allocated on first mutation of a block) and pushes that mirror to VRAM
- * when the block is VRAM-resident. The mirror is reused on later mutations
- * of the same block; the original mmap pointer is the model map offset,
+ * Mutation is FP32-only, by design. Quantized weights are packed
+ * bytes, not floats, so reinterpreting them as float[] would
+ * corrupt the model. The model file is also mmap'd PROT_READ, so
+ * the host tensor bytes are not writable: mutation therefore
+ * works on a writable host mirror (allocated on first mutation
+ * of a block) and pushes that mirror to VRAM when the block is
+ * VRAM-resident. The mirror is reused on later mutations of the
+ * same block; the original mmap pointer is the model map offset,
  * so a mirror is recognised by not pointing at the model map.
  *
- * Energy: reset sets every layer to 1.0 (alive). No per-layer energy
- * measurement is wired into forward yet, so Hydra pruning is dormant
- * until a caller explicitly sets g_vbs_layer_energy[layer] < 0.0001f.
- * Resetting to 0 would prune every layer on the next recompile, which
- * would delete the whole forward pass, so 0 is not a safe reset value.
+ * Energy: reset sets every layer to 1.0 (alive). No per-layer
+ * energy measurement is wired into forward yet, so Hydra pruning
+ * is dormant until a caller explicitly sets
+ * g_vbs_layer_energy[layer] < 0.0001f. Resetting to 0 would prune
+ * every layer on the next recompile, which would delete the
+ * whole forward pass, so 0 is not a safe reset value.
  */
 float g_vbs_layer_energy[VBS_MAX_LAYERS];
 
@@ -423,7 +482,7 @@ void vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation
     if (!e || !e->plan || layer_index >= e->plan->n_plans) return;
     vbs_op_plan_t *plan = &e->plan->plans[layer_index];
     if (!plan->node || !plan->node->weight) return;
-    if (plan->node->weight->type != VBS_GGML_TYPE_F32) {
+    if (plan->node->weight->type != VBS_MODEL_TYPE_F32) {
         fprintf(stderr, "Mutate refused: tensor %s is type %d, not FP32; quantized bytes are not floats\n",
                 plan->node->weight->name, (int)plan->node->weight->type);
         return;
@@ -434,7 +493,8 @@ void vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation
 
     /* Writable mirror: first mutation copies the read-only mmap bytes. */
     const void *orig = NULL;
-    if (e->model && e->model->map) orig = (const uint8_t *)e->model->map + plan->node->weight->data_offset;
+    if (e->model && e->model->map)
+        orig = (const uint8_t *)e->model->map + plan->node->weight->data_offset;
     float *weights = NULL;
     if (block->data == orig) {
         weights = (float *)malloc(block->size);
@@ -459,12 +519,11 @@ void vbs_engine_mutate_layer(vbs_engine_t *e, size_t layer_index, float mutation
 void vbs_engine_recompile(vbs_engine_t *e, char *err_buf, size_t err_cap) {
     if (!e || !e->plan || !e->graph) return;
 
-    char src_path[640], bin_path[640], hash[65];
     char cache_default[512];
-    const char *cache_dir = getenv("VBS_CACHE_DIR");
-    if (!cache_dir) { vbs_default_cache_dir(cache_default, sizeof cache_default); cache_dir = cache_default; }
-    vbs_mkdir(cache_dir);
+    const char *cache_dir = cache_dir_for(cache_default, sizeof cache_default);
 
+    char hash[65];
+    char src_path[640], bin_path[640];
     vbs_specializer_compute_hash(e->graph, e->sys_profile, e->plan, hash, sizeof(hash));
     snprintf(src_path, sizeof(src_path), "%s/verum_%s.c", cache_dir, hash);
     snprintf(bin_path, sizeof(bin_path), "%s/verum_%s%s", cache_dir, hash, VBS_DYLIB_EXT);

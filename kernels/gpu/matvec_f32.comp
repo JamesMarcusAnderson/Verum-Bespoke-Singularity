@@ -1,0 +1,19 @@
+// matvec_f32.comp — y[row] = dot(w[row, :], x[col_off : col_off+cols]).
+// One workgroup of 32 lanes per row; each lane strides columns by 32.
+// Bindings: 0=w (f32), 1=x (f32), 2=y (f32).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(set = 0, binding = 0) readonly buffer W { float w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+#include "matvec_common.glsl"
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint weight_row = (pc.row_base + row) * pc.cols;
+    float sum = 0.0;
+    for (uint c = lane; c < pc.cols; c += 32u)
+        sum += w[weight_row + c] * x[pc.col_off + c];
+    matvec_store(sum, row);
+}

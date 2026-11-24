@@ -1,0 +1,24 @@
+// matvec_f16.comp — y[row] = dot(w[row, :], x[...]) with f16
+// weights, unpacked on the fly. The weight table is bound as a uint
+// array (two halves per word); no 16-bit storage feature is needed.
+// Bindings: 0=w (u32 packed f16), 1=x (f32), 2=y (f32).
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+#include "matvec_common.glsl"
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+    uint weight_row = (pc.row_base + row) * pc.cols;
+    float sum = 0.0;
+    for (uint c = lane; c < pc.cols; c += 32u) {
+        uint at = weight_row + c;
+        vec2 halves = unpackHalf2x16(w[at >> 1]);
+        float weight = (at & 1u) == 0u ? halves.x : halves.y;
+        sum += weight * x[pc.col_off + c];
+    }
+    matvec_store(sum, row);
+}

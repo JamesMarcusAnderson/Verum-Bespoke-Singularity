@@ -1,10 +1,10 @@
 # Verum-Bespoke-Singularity
 Pure-C GPU LLM inference engine.
-Verum builds one binary, verum-slice, that reads GGUF models and tokenizer.json. It has 21 modes — the usage lines printed by `./verum-slice --help`: --backends, --backend-test, --inspect, --compile, --benchmark, --generate, --cpu, --dequant, --sample, --learn, --train-adapter, --train-block, --train-tiny, --autonomous-c, --autotune, --train-text, --evolve, --autonomy, and --prune, plus two --generate variants that load an adapter file (--adapter) or learned memory (--memory). The full usage list is in the Run section below.
+Verum builds one binary, verum-slice, that reads model files (GGUF format) and tokenizer.json. It has 21 modes — the usage lines printed by `./verum-slice --help`: --backends, --backend-test, --inspect, --compile, --benchmark, --generate, --cpu, --dequant, --sample, --learn, --train-adapter, --train-block, --train-tiny, --autonomous-c, --autotune, --train-text, --evolve, --autonomy, and --prune, plus two --generate variants that load an adapter file (--adapter) or learned memory (--memory). The full usage list is in the Run section below.
 ## Backends
 Single backend abstraction (vbs_backend_ops_t) covering Vulkan, Metal, CUDA, HIP, and CPU. Vulkan (SPIR-V) is the universal GPU path — one backend for AMD, NVIDIA, and Intel GPUs (and Apple via MoltenVK) — with automatic CPU fallback when no GPU or Vulkan driver is present. The same C source is rebuilt per OS, with the GPU backend selected at runtime where a driver is present. Vulkan, CUDA, and HIP are loaded at runtime (dlopen), not link-time locked; the engine builds and runs with no GPU libraries installed.
 ## Backend status
-Vulkan is the universal path: 21 precompiled SPIR-V kernels (GLSL sources in kernels/vulkan/, regenerated with kernels/build-spirv.sh) cover linear matvec (F32/F16/Q8_0/Q4_0/Q4_1/Q4_K/Q6_K/LNS8), embedding (F32/F16/Q8_0/Q4_0/Q4_1/Q4_K/Q6_K), and all seven primitive ops. HIP embedding now computes (host-staged) instead of stubbing. Metal and CUDA are the fuller paths. Backend selection is explicit and logged (`--backends` prints the probe report; `VBS_BACKEND=<name>` forces one); `./verum-slice --backend-test` runs the per-backend correctness suite (78 checks on Vulkan, 44 on CPU-only) and is part of `make test`.
+Vulkan is the universal path: 21 precompiled SPIR-V kernels (GLSL sources in kernels/gpu/, regenerated with kernels/build-kernels.sh) cover linear matvec (F32/F16/Q8_0/Q4_0/Q4_1/Q4_K/Q6_K/LNS8), embedding (F32/F16/Q8_0/Q4_0/Q4_1/Q4_K/Q6_K), and all seven primitive ops. HIP embedding now computes (host-staged) instead of stubbing. Metal and CUDA are the fuller paths. Backend selection is explicit and logged (`--backends` prints the probe report; `VBS_BACKEND=<name>` forces one); `./verum-slice --backend-test` runs the per-backend correctness suite (78 checks on Vulkan, 44 on CPU-only) and is part of `make test`.
 ## Codebase
 8,620 lines across src/*.c and include/*.h, C11.
 
@@ -16,7 +16,7 @@ Build from the repository root with the Makefile:
 make
 ```
 
-This builds the `verum-slice` binary. The Makefile uses clang if available, otherwise gcc, otherwise cc, with C11, `-Wall -Wextra -O3`, `-Iinclude`, and `-D_GNU_SOURCE`, and links `-ldl -lm -lpthread`. CUDA and HIP are enabled with `-DVBS_ENABLE_CUDA=1` and `-DVBS_ENABLE_HIP=1`. Metal is added only on Darwin: the Makefile adds `-DVBS_ENABLE_METAL=1`, the Foundation, Metal, and CoreGraphics frameworks, `-lobjc`, and `src/vbs_backend_metal.c`. To remove build outputs, run:
+This builds the `verum-slice` binary. The Makefile uses clang if available, otherwise gcc, otherwise cc, with C11, `-Wall -Wextra -O3`, `-Iinclude`, and `-D_GNU_SOURCE`, and links `-ldl -lm -lpthread`. CUDA and HIP are enabled with `-DVBS_ENABLE_CUDA=1` and `-DVBS_ENABLE_HIP=1`. Metal is added only on Darwin: the Makefile adds `-DVBS_ENABLE_METAL=1`, the Foundation, Metal, and CoreGraphics frameworks, and `-lobjc`, which enables the Metal section of `src/vbs_gpu_vendors.c`. To remove build outputs, run:
 
 ```sh
 make clean
@@ -40,7 +40,7 @@ MSVC needs Visual Studio 2019+ (`/std:c11`); the MSVC path is documented but unt
 
 ## Run
 
-The model modes require a GGUF model file argument (running them bare prints the usage text and exits with status 64):
+The model modes require a model file argument (running them bare prints the usage text and exits with status 64):
 
 ```sh
 ./verum-slice --inspect model.gguf
@@ -107,16 +107,16 @@ Two more mechanisms ship with it:
   fingerprint matches. `--tune-show` reads it back.
 
 `make test-d` runs the whole Phase D demonstration end to end on a
-synthetic tiny model (`tools/make_tiny_gguf.py` generates it; no real
+synthetic tiny model (`tools/make_tiny_model.py` generates it; no real
 model file needed).
 
 ## Tests/CI
 
-The workflow in `.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `master`, on ubuntu-latest with gcc, ubuntu-latest with clang, and macos-latest with clang. It checks out the code, installs the compiler on Linux, runs `make clean` and `make CC=<compiler>`, runs `./verum-slice --help || ./verum-slice || true`, and runs a Python check that the `verum-slice` binary exists. The workflow file in this tree also defines a `make test` step and two Windows jobs (`windows-mingw` cross-compiles with MinGW on ubuntu-latest and runs the model-free self-checks under Wine; `windows-msvc` builds natively with MSVC via CMake on windows-latest and runs the same checks) — those take effect once the workflow file is updated on GitHub. Note: workflow files cannot be pushed via the GitHub App (403) — the ci.yml changes need James in the browser. `make test` is a local target: it builds the binary and runs the model-free self-checks: `./verum-slice --help` must exit 0, `--dequant` and `--sample` must each print ALL PASS, `--backend-test` must print ALL PASS (twice: once normally, once with no Vulkan ICD to prove the CPU fallback), and the `gguf_e2e_test` regression test (loader + dequantizer + CPU forward on a tiny synthetic GGUF built in memory, covering Q8_K/Q4_K/Q6_K/Q5_K/Q5_0 load-time conversion) must print ALL PASS. The workflow does not run a benchmark, and the self-checks need no model file.
+The workflow in `.github/workflows/ci.yml` runs on pushes and pull requests to `main` and `master`, on ubuntu-latest with gcc, ubuntu-latest with clang, and macos-latest with clang. It checks out the code, installs the compiler on Linux, runs `make clean` and `make CC=<compiler>`, runs `./verum-slice --help || ./verum-slice || true`, and runs a Python check that the `verum-slice` binary exists. The workflow file in this tree also defines a `make test` step and two Windows jobs (`windows-mingw` cross-compiles with MinGW on ubuntu-latest and runs the model-free self-checks under Wine; `windows-msvc` builds natively with MSVC via CMake on windows-latest and runs the same checks) — those take effect once the workflow file is updated on GitHub. Note: workflow files cannot be pushed via the GitHub App (403) — the ci.yml changes need James in the browser. `make test` is a local target: it builds the binary and runs the model-free self-checks: `./verum-slice --help` must exit 0, `--dequant` and `--sample` must each print ALL PASS, `--backend-test` must print ALL PASS (twice: once normally, once with no Vulkan ICD to prove the CPU fallback), and the `model_e2e_test` regression test (loader + dequantizer + CPU forward on a tiny synthetic model file built in memory, covering Q8_K/Q4_K/Q6_K/Q5_K/Q5_0 load-time conversion) must print ALL PASS. The workflow does not run a benchmark, and the self-checks need no model file.
 
 ## What works / What doesn't
 
-What works: the single `verum-slice` binary, GGUF model and `tokenizer.json` input, the shared Vulkan, Metal, CUDA, HIP, and CPU backend abstraction, the universal Vulkan/SPIR-V GPU path with automatic CPU fallback, and the fuller Metal and CUDA paths. The CPU reference path (`--cpu`, and the standalone `vbs-cpu` CLI built by `make`) runs real llama-arch GGUF models end to end on CPU: weights stored as Q5_0/Q5_1, Q2_K–Q8_K, Q8_1, or BF16 are dequantized to Q8_0 once at load (measured ~10x faster than an F16 target, at llama.cpp-level logit accuracy), while F32/F16/Q4_0/Q4_1/Q8_0 run natively. The tokenizer is a GPT-2-style byte-level BPE implementation verified token-for-token against the HuggingFace `tokenizers` reference, including chat special tokens (`<|im_start|>`, `<|im_end|>`).
+What works: the single `verum-slice` binary, model file and `tokenizer.json` input, the shared Vulkan, Metal, CUDA, HIP, and CPU backend abstraction, the universal Vulkan/SPIR-V GPU path with automatic CPU fallback, and the fuller Metal and CUDA paths. The CPU reference path (`--cpu`, and the standalone `vbs-cpu` CLI built by `make`) runs real llama-arch model files end to end on CPU: weights stored as Q5_0/Q5_1, Q2_K–Q8_K, Q8_1, or BF16 are dequantized to Q8_0 once at load (measured ~10x faster than an F16 target, at reference-level logit accuracy), while F32/F16/Q4_0/Q4_1/Q8_0 run natively. The tokenizer is a GPT-2-style byte-level BPE implementation verified token-for-token against the HuggingFace `tokenizers` reference, including chat special tokens (`<|im_start|>`, `<|im_end|>`).
 
 What doesn't yet work: real-GPU execution and GPU performance numbers are unverified (Vulkan execution was verified on Lavapipe, a software device, not on GPU hardware). The engine's own SPIR-V emitter produces a structural shell with no body codegen, so real dispatch uses precompiled SPIR-V kernels. The MSVC build path is documented but untested on a real Windows machine (CI's windows-msvc job is its first run). The JIT specializer's in-exe compile step on Windows needs a MinGW compiler on PATH (verified under Wine with a Windows MinGW toolchain installed). CI verifies the build and checks the existence of the binary; it does not run a benchmark. The `make test` self-checks run locally.
 

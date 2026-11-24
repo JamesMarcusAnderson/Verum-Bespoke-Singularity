@@ -1,0 +1,27 @@
+Verum Alchemist (Xe-HPG) vector-add kernel — c[i] = a[i] + b[i]
+21 instructions x 16 bytes = 336 bytes, 64-byte aligned, no header
+Payload: R0 = thread payload, R1 = local X IDs (U16/lane),
+         R2 = inline data (A/B/C 64-bit base addresses)
+addr    encoding (DW3 DW2 DW1 DW0)            instruction
+-------- ------------------------------------ ---------------------------
+0x0000  00000000 00580105 03050120 00040061  mov (16) r3.0<1>:ud r1.0<16;16,1>:uw ; Vol 2a p.1111 (mov); digest §6.4, §6.9 step 1
+0x0010  00000002 02460305 03058220 00040069  shl (16) r3.0<1>:ud r3.0<8;8,1>:ud 2:ud ; Vol 2a p.1275 (shl); digest §6.4, §6.9 step 1
+0x0020  00000000 00460305 05050230 00030061  mov (8)  r5.0<1>:uq r3.0<8;8,1>:ud ; Vol 2a p.1111 (mov); digest §6.9 step 1; Vol 9 p.387 (SIMD8 :uq)
+0x0030  00000000 00460405 07050230 00030061  mov (8)  r7.0<1>:uq r4.0<8;8,1>:ud ; Vol 2a p.1111 (mov); digest §6.9 step 1; Vol 9 p.387 (SIMD8 :uq)
+0x0040  00000000 00000204 09050330 00030061  mov (8)  r9.0<1>:uq r2.0<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x0050  00000000 00000204 0b050330 00030061  mov (8)  r11.0<1>:uq r2.0<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x0060  00340905 03340505 0d050330 00030040  add (8)  r13.0<1>:uq r5.0<4;4,1>:uq r9.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x0070  00340b05 03340705 0f050330 00030040  add (8)  r15.0<1>:uq r7.0<4;4,1>:uq r11.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x0080  00000000 00000244 09050330 00030061  mov (8)  r9.0<1>:uq r2.8<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x0090  00000000 00000244 0b050330 00030061  mov (8)  r11.0<1>:uq r2.8<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x00a0  00340905 03340505 11050330 00030040  add (8)  r17.0<1>:uq r5.0<4;4,1>:uq r9.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x00b0  00340b05 03340705 13050330 00030040  add (8)  r19.0<1>:uq r7.0<4;4,1>:uq r11.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x00c0  00000000 00000284 09050330 00030061  mov (8)  r9.0<1>:uq r2.16<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x00d0  00000000 00000284 0b050330 00030061  mov (8)  r11.0<1>:uq r2.16<0;1,0>:uq ; Vol 2a p.1111 (mov); Vol 9 p.339 (<0;1,0> broadcast); digest §6.9 step 1
+0x00e0  00340905 03340505 15050330 00030040  add (8)  r21.0<1>:uq r5.0<4;4,1>:uq r9.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x00f0  00340b05 03340705 17050330 00030040  add (8)  r23.0<1>:uq r7.0<4;4,1>:uq r11.0<4;4,1>:uq ; Vol 2a p.219 (add); digest §6.9 step 1; DERIVED :uq, see VBS_ALCHEMIST_ADD_UQ_NOTE
+0x0100  011a0000 cdfe0d24 19140000 00040031  send (16) r25:dc1 r13 null 0x0 0x08246EFF ; Vol 2a p.1253 (send), p.209 (MSD1R_A64_US); digest §6.5, §6.8, §6.9 step 2
+0x0110  011a0000 cdfe1124 1b140000 00040031  send (16) r27:dc1 r17 null 0x0 0x08246EFF ; Vol 2a p.1253 (send), p.209 (MSD1R_A64_US); digest §6.5, §6.8, §6.9 step 3
+0x0120  00461b05 0a461905 1d050aa0 00040040  add (16) r29.0<1>:f r25.0<8;8,1>:f r27.0<8;8,1>:f ; Vol 2a p.219 (add); Vol 9 p.339 (<8;8,1>); digest §6.9 step 4
+0x0130  019a1d14 cdfe1524 00000000 00040031  send (16) null:dc1 r21 r29 0x80 0x08066EFF ; Vol 2a p.1253 (send), p.211 (MSD1W_A64_US); digest §6.5, §6.8, §6.9 step 5
+0x0140  00000000 3000700c 00000004 00000031  send (1) null:gtwy r112 null 0x0 0x02000000 EOT ; Vol 2a p.1253 (send), pp.562-563 (MSD_EOT); digest §6.5, §6.7, §6.9 step 7

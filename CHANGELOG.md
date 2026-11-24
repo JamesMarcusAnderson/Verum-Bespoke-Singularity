@@ -40,7 +40,7 @@
   (1.53x on the FFN section, 1.15–1.18x end-to-end on the tiny model,
   bit-identical output) and per-machine autotune profiles embedded in
   the binary (`.vbs_tune` section, fingerprint-gated).
-- `make test` now also runs `gguf_e2e_test` + `--backend-test` (78/78
+- `make test` now also runs `model_e2e_test` + `--backend-test` (78/78
   with Vulkan, 44/44 with no ICD); `make test-d` runs the loop demo
   (6 sections).
 

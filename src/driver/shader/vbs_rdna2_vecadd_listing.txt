@@ -1,0 +1,50 @@
+Verum RDNA 2 (gfx1030) vector-add kernel — c[i] = a[i] + b[i]
+wave64, 64 threads/group, USER_SGPR = 6 (s0-s5 = A/B/C VAs)
+VGPRs v0-v2, no LDS, no scratch. 7 instructions, 40 bytes.
+
+addr  encoding             instruction
+----  -------------------  -----------
+0x00  DC588000 00000000  GLOBAL_LOAD_DWORD_ADDTID v0, s[0:1]
+      ; op 22, ENC 0x37, SEG=2 (digest §5.2 FLAT; [RDNA2-ISA] §12.8, §13.8; ISA-XML ENC_FLAT_GLBL op 22); ADDR=0 UNSOURCED
+0x08  DC588000 01020000  GLOBAL_LOAD_DWORD_ADDTID v1, s[2:3]
+      ; op 22, ENC 0x37, SEG=2 (digest §5.2 FLAT; [RDNA2-ISA] §12.8, §13.8; ISA-XML ENC_FLAT_GLBL op 22); ADDR=0 UNSOURCED
+0x10  BF8C0000           S_WAITCNT vmcnt(0) expcnt(0) lgkmcnt(0)
+      ; SOPP op 12, SIMM16=0 (digest §5.2 SOPP; [RDNA2-ISA] §13.1.5; ISA-XML ENC_SOPP op 12)
+0x14  4A040300           V_ADD_NC_U32 v2, v0, v1
+      ; VOP2 op 37 (digest §5.2 VOP2 + §5.3 oracle 0x4A040300; [RDNA2-ISA] §13.3.1; ISA-XML ENC_VOP2 op 37)
+0x18  DC5C8000 00040200  GLOBAL_STORE_DWORD_ADDTID v2, s[4:5]
+      ; op 23, ENC 0x37, SEG=2 (digest §5.2 FLAT; [RDNA2-ISA] §12.8, §13.8; ISA-XML ENC_FLAT_GLBL op 23); ADDR=0 UNSOURCED
+0x20  BF8C0000           S_WAITCNT vmcnt(0) expcnt(0) lgkmcnt(0)
+      ; SOPP op 12, SIMM16=0 (digest §5.2 SOPP; [RDNA2-ISA] §13.1.5; ISA-XML ENC_SOPP op 12)
+0x24  BF810000           S_ENDPGM
+      ; SOPP op 1 (digest §5.2 SOPP + §5.3 oracle 0xBF810000; [RDNA2-ISA] §13.1.5; ISA-XML ENC_SOPP op 1)
+
+raw code (40 bytes):
+  00 80 58 DC 00 00 00 00 00 80 58 DC 00 00 02 01
+  00 00 8C BF 00 03 04 4A 00 80 5C DC 00 02 04 00
+  00 00 8C BF 00 00 81 BF 
+
+kernel descriptor (64 bytes, [AMDGPUUsage] V3 layout):
+  GROUP_SEGMENT_FIXED_SIZE   = 0x00000000 (no LDS)
+  PRIVATE_SEGMENT_FIXED_SIZE = 0x00000000 (no scratch)
+  KERNARG_SIZE               = 0x00000000 (args via USER_DATA)
+  KERNEL_CODE_ENTRY_BYTE_OFFSET = 256
+  COMPUTE_PGM_RSRC3          = 0x00000000
+  COMPUTE_PGM_RSRC1          = 0x00000000 (VGPRS field 0: 3 VGPRs, wave64)
+  COMPUTE_PGM_RSRC2          = 0x0000000C (USER_SGPR 6)
+  KERNEL_CODE_PROPERTIES     = 0x00000000 (wave64, no descriptor SGPR setup)
+
+ELF code object (v5, ET_DYN, 1096 bytes):
+  .rodata @ 0x100: descriptor (64 bytes, 64-aligned)
+  .text   @ 0x200: code (40 bytes, 256-aligned entry)
+  symbols: vbs_rdna2_vecadd (STT_FUNC, .text), vbs_rdna2_vecadd.kd (STT_OBJECT, .rodata)
+  e_machine = EM_AMDGPU (224), e_flags = 0x036 (gfx1030)
+
+example dispatch (n = 1024, A=0x10000000 B=0x20000000 C=0x30000000):
+  NUM_THREAD_X/Y/Z = 64/1/1, DIM_X/Y/Z = 16/1/1, initiator = 0x1
+  USER_DATA_0..5 = 10000000 00000000 20000000 00000000 30000000 00000000
+  PGM_RSRC1/2/3 = 00000000 0000000C 00000000
+
+NOTE: no bounds check — buffers must hold ceil(n/64)*64 elements.
+NOTE: ADDTID ADDR field = 0 is UNSOURCED (digest §10 item 5);
+      the hardware run must confirm it (see amd-shader-REPORT.md).

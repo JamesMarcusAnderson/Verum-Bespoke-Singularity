@@ -1,3 +1,18 @@
+/* vbs_specializer.c — JIT specializer: hashes a (graph, system,
+ * plan) triple, emits a bespoke C forward module for one model,
+ * compiles it to a shared library, and loads it.
+ *
+ * The emitted module is a sequenced forward pass: instead of
+ * chaining every weight through two ping-pong buffers (which
+ * cannot express attention), the forward pass is generated as
+ * one token step with named buffers and the transformer block
+ * structure written out per layer: norm -> Q/K/V -> rope -> KV
+ * store -> attention -> output projection -> residual add ->
+ * norm -> gate/up -> SiLU*up -> down -> residual add. Tensor
+ * roles are read from model tensor names (blk.<L>.*); a weight
+ * the sequencer cannot place stops the compile loudly, like the
+ * graph compiler's refusal of unresolved matrices.
+ */
 #include "vbs_specializer.h"
 #include "vbs_sha256.h"
 #include "vbs_port.h"
@@ -42,47 +57,90 @@ vbs_specialized_binary_t *vbs_specializer_load_cached(const char *hash, const ch
     return vbs_specializer_load(bin_path, hash);
 }
 
-static const char *ggml_type_name(vbs_ggml_type_t t) {
-    switch (t) {
-        case VBS_GGML_TYPE_F32:   return "f32";
-        case VBS_GGML_TYPE_F16:   return "f16";
-        case VBS_GGML_TYPE_Q4_0:  return "q4_0";
-        case VBS_GGML_TYPE_Q4_1:  return "q4_1";
-        case VBS_GGML_TYPE_Q5_0:  return "q5_0";
-        case VBS_GGML_TYPE_Q5_1:  return "q5_1";
-        case VBS_GGML_TYPE_Q8_0:  return "q8_0";
-        case VBS_GGML_TYPE_Q8_1:  return "q8_1";
-        case VBS_GGML_TYPE_Q2_K:  return "q2_k";
-        case VBS_GGML_TYPE_Q3_K:  return "q3_k";
-        case VBS_GGML_TYPE_Q4_K:  return "q4_k";
-        case VBS_GGML_TYPE_Q5_K:  return "q5_k";
-        case VBS_GGML_TYPE_Q6_K:  return "q6_k";
-        case VBS_GGML_TYPE_Q8_K:  return "q8_k";
-        case VBS_GGML_TYPE_LNS8:  return "lns8";
-        default:                  return "unknown";
+/* Weight-type short names, used to pick the dispatch function
+ * suffix in the emitted source (vbs_gpu_dispatch_vram_q8_0, ...). */
+static const struct {
+    vbs_model_type_t type;
+    const char *name;
+} k_type_names[] = {
+    { VBS_MODEL_TYPE_F32,  "f32"  },
+    { VBS_MODEL_TYPE_F16,  "f16"  },
+    { VBS_MODEL_TYPE_Q4_0, "q4_0" },
+    { VBS_MODEL_TYPE_Q4_1, "q4_1" },
+    { VBS_MODEL_TYPE_Q5_0, "q5_0" },
+    { VBS_MODEL_TYPE_Q5_1, "q5_1" },
+    { VBS_MODEL_TYPE_Q8_0, "q8_0" },
+    { VBS_MODEL_TYPE_Q8_1, "q8_1" },
+    { VBS_MODEL_TYPE_Q2_K, "q2_k" },
+    { VBS_MODEL_TYPE_Q3_K, "q3_k" },
+    { VBS_MODEL_TYPE_Q4_K, "q4_k" },
+    { VBS_MODEL_TYPE_Q5_K, "q5_k" },
+    { VBS_MODEL_TYPE_Q6_K, "q6_k" },
+    { VBS_MODEL_TYPE_Q8_K, "q8_k" },
+    { VBS_MODEL_TYPE_LNS8, "lns8" },
+};
+
+static const char *type_name(vbs_model_type_t t) {
+    for (size_t i = 0; i < sizeof(k_type_names) / sizeof(k_type_names[0]); i++) {
+        if (k_type_names[i].type == t) return k_type_names[i].name;
     }
+    return "unknown";
 }
 
-// Only these weight types have a real vbs_gpu_dispatch_vram_* implementation
-// in the bridge. Anything else must refuse loudly instead of silently
-// running through the wrong kernel.
-static bool ggml_type_has_dispatch(vbs_ggml_type_t t) {
-    return t == VBS_GGML_TYPE_F32 || t == VBS_GGML_TYPE_F16 || t == VBS_GGML_TYPE_Q4_0 || t == VBS_GGML_TYPE_Q4_1 || t == VBS_GGML_TYPE_Q6_K || t == VBS_GGML_TYPE_Q8_0 || t == VBS_GGML_TYPE_LNS8;
+/* Only these weight types have a real vbs_gpu_dispatch_vram_*
+ * implementation in the bridge. Anything else must refuse loudly
+ * instead of silently running through the wrong kernel. */
+static const vbs_model_type_t k_dispatched_types[] = {
+    VBS_MODEL_TYPE_F32, VBS_MODEL_TYPE_F16, VBS_MODEL_TYPE_Q4_0,
+    VBS_MODEL_TYPE_Q4_1, VBS_MODEL_TYPE_Q6_K, VBS_MODEL_TYPE_Q8_0,
+    VBS_MODEL_TYPE_LNS8,
+};
+
+static bool type_has_dispatch(vbs_model_type_t t) {
+    for (size_t i = 0; i < sizeof(k_dispatched_types) / sizeof(k_dispatched_types[0]); i++) {
+        if (k_dispatched_types[i] == t) return true;
+    }
+    return false;
 }
 
-// Sequenced emitter: instead of chaining every weight through two ping-pong
-// buffers (which cannot express attention), the forward pass is generated as
-// one token step with named buffers and the transformer block structure
-// written out per layer: norm -> Q/K/V -> rope -> KV store -> attention ->
-// output projection -> residual add -> norm -> gate/up -> SiLU*up -> down ->
-// residual add. Tensor roles are read from GGUF names (blk.<L>.*); a weight
-// the sequencer cannot place stops the compile loudly, like the graph
-// compiler's refusal of unresolved matrices.
+/* --- Sequencer: classify planned nodes into block roles --- */
+
 typedef enum {
     SEQ_EMBED, SEQ_ATTN_NORM, SEQ_Q, SEQ_K, SEQ_V, SEQ_ATTN_OUT,
     SEQ_FFN_NORM, SEQ_GATE, SEQ_UP, SEQ_DOWN, SEQ_FINAL_NORM, SEQ_FINAL_LINEAR,
     SEQ_Q_NORM, SEQ_K_NORM
 } seq_role_t;
+
+/* Name fragments -> roles, in match order. The order matters:
+ * "attn_q_norm" must be tried before "attn_q" (which would also
+ * match it), "attn_output" before "attn_out", and "output_norm"
+ * before "output". */
+static const struct {
+    const char *fragment;
+    seq_role_t role;
+} k_block_roles[] = {
+    { "attn_norm",   SEQ_ATTN_NORM },
+    { "attn_q_norm", SEQ_Q_NORM    },
+    { "attn_k_norm", SEQ_K_NORM    },
+    { "attn_q",      SEQ_Q         },
+    { "attn_k",      SEQ_K         },
+    { "attn_v",      SEQ_V         },
+    { "attn_output", SEQ_ATTN_OUT  },
+    { "attn_out",    SEQ_ATTN_OUT  },
+    { "ffn_norm",    SEQ_FFN_NORM  },
+    { "ffn_gate",    SEQ_GATE      },
+    { "ffn_up",      SEQ_UP        },
+    { "ffn_down",    SEQ_DOWN      },
+};
+
+static const struct {
+    const char *fragment;
+    seq_role_t role;
+} k_global_roles[] = {
+    { "token_embd",  SEQ_EMBED        },
+    { "output_norm", SEQ_FINAL_NORM   },
+    { "output",      SEQ_FINAL_LINEAR },
+};
 
 static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
     const char *name = n->weight ? n->weight->name : "";
@@ -90,29 +148,95 @@ static bool seq_classify(const vbs_node_t *n, seq_role_t *role, int *layer) {
     const char *blk = strstr(name, "blk.");
     if (blk) {
         *layer = atoi(blk + 4);
-        if (strstr(name, "attn_norm"))   { *role = SEQ_ATTN_NORM; return true; }
-        if (strstr(name, "attn_q_norm")) { *role = SEQ_Q_NORM; return true; }
-        if (strstr(name, "attn_k_norm")) { *role = SEQ_K_NORM; return true; }
-        if (strstr(name, "attn_q"))      { *role = SEQ_Q; return true; }
-        if (strstr(name, "attn_k"))      { *role = SEQ_K; return true; }
-        if (strstr(name, "attn_v"))      { *role = SEQ_V; return true; }
-        if (strstr(name, "attn_output")) { *role = SEQ_ATTN_OUT; return true; }
-        if (strstr(name, "attn_out"))    { *role = SEQ_ATTN_OUT; return true; }
-        if (strstr(name, "ffn_norm"))    { *role = SEQ_FFN_NORM; return true; }
-        if (strstr(name, "ffn_gate"))    { *role = SEQ_GATE; return true; }
-        if (strstr(name, "ffn_up"))      { *role = SEQ_UP; return true; }
-        if (strstr(name, "ffn_down"))    { *role = SEQ_DOWN; return true; }
+        for (size_t i = 0; i < sizeof(k_block_roles) / sizeof(k_block_roles[0]); i++) {
+            if (strstr(name, k_block_roles[i].fragment)) {
+                *role = k_block_roles[i].role;
+                return true;
+            }
+        }
         return false;
     }
-    if (strstr(name, "token_embd")) { *role = SEQ_EMBED; return true; }
-    if (strstr(name, "output_norm")) { *role = SEQ_FINAL_NORM; return true; }
-    if (strstr(name, "output"))     { *role = SEQ_FINAL_LINEAR; return true; }
+    for (size_t i = 0; i < sizeof(k_global_roles) / sizeof(k_global_roles[0]); i++) {
+        if (strstr(name, k_global_roles[i].fragment)) {
+            *role = k_global_roles[i].role;
+            return true;
+        }
+    }
     return false;
 }
 
 #ifndef VBS_MAX_LAYERS
 #define VBS_MAX_LAYERS 512
 #endif
+
+/* Emit one linear dispatch line: vram_<type>(block, in, out, rows, cols). */
+static void emit_linear(FILE *f, const vbs_node_t *n, size_t slot,
+                        const char *in, const char *out) {
+    fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, %s, %s, %llu, %llu);\n",
+            type_name(n->weight->type), slot, in, out,
+            (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
+}
+
+/* Emit the forward lines for one classified plan node. `has_q_norm`
+ * / `has_k_norm` are the per-layer pre-scan results: RoPE must come
+ * AFTER Q/K norm, not before, so when a layer has a norm the rope
+ * is deferred to the norm step and the V step reads the normed
+ * buffers instead. */
+static void emit_node(FILE *f, const vbs_node_t *n, size_t slot, seq_role_t role,
+                      int layer, const int *has_q_norm, const int *has_k_norm,
+                      uint64_t gate_rows) {
+    bool q_normed = layer >= 0 && has_q_norm[layer];
+    bool k_normed = layer >= 0 && has_k_norm[layer];
+    switch (role) {
+        case SEQ_EMBED:
+            fprintf(f, "    vbs_gpu_dispatch_embed_%s(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n",
+                    type_name(n->weight->type), slot);
+            break;
+        case SEQ_ATTN_NORM:
+        case SEQ_FFN_NORM:
+            fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, STREAM, NORMED, EMBED_DIM, RMS_EPS);\n", slot);
+            break;
+        case SEQ_Q:
+            emit_linear(f, n, slot, "NORMED", "QB");
+            if (!q_normed) fprintf(f, "    vbs_gpu_dispatch_rope(QB, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
+            break;
+        case SEQ_K:
+            emit_linear(f, n, slot, "NORMED", "KB");
+            if (!k_normed) fprintf(f, "    vbs_gpu_dispatch_rope(KB, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
+            break;
+        case SEQ_V:
+            emit_linear(f, n, slot, "NORMED", "VB");
+            fprintf(f, "    vbs_gpu_dispatch_cache(%s, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", k_normed ? "KN" : "KB", layer);
+            fprintf(f, "    vbs_gpu_dispatch_attn(%s, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", q_normed ? "QN" : "QB", layer);
+            break;
+        case SEQ_Q_NORM:
+            fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, QB, QN, N_HEADS*HEAD_DIM, RMS_EPS);\n", slot);
+            fprintf(f, "    vbs_gpu_dispatch_rope(QN, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
+            break;
+        case SEQ_K_NORM:
+            fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, KB, KN, N_KV_HEADS*HEAD_DIM, RMS_EPS);\n", slot);
+            fprintf(f, "    vbs_gpu_dispatch_rope(KN, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
+            break;
+        case SEQ_ATTN_OUT:
+            emit_linear(f, n, slot, "AB", "TMP");
+            fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
+            break;
+        case SEQ_GATE:
+            emit_linear(f, n, slot, "NORMED", "GATE");
+            break;
+        case SEQ_UP:
+            emit_linear(f, n, slot, "NORMED", "UP");
+            fprintf(f, "    vbs_gpu_dispatch_silu(GATE, UP, HIDDEN, %llu);\n", (unsigned long long)gate_rows);
+            break;
+        case SEQ_DOWN:
+            emit_linear(f, n, slot, "HIDDEN", "TMP");
+            fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
+            break;
+        case SEQ_FINAL_NORM:
+        case SEQ_FINAL_LINEAR:
+            break; /* emitted at the tail below */
+    }
+}
 
 bool vbs_specializer_emit_source(
     const vbs_graph_t *graph,
@@ -124,8 +248,9 @@ bool vbs_specializer_emit_source(
     (void)sys;
     (void)graph;
 
-    // Classify every planned node up front; refuse what cannot be placed or
-    // has no real kernel, rather than emitting a wrong forward pass.
+    /* Classify every planned node up front; refuse what cannot be
+     * placed or has no real kernel, rather than emitting a wrong
+     * forward pass. */
     seq_role_t *roles = (seq_role_t *)calloc(plan->n_plans, sizeof(seq_role_t));
     int *layers = (int *)calloc(plan->n_plans, sizeof(int));
     long embed_slot = -1, final_norm_slot = -1, final_linear_slot = -1;
@@ -137,9 +262,9 @@ bool vbs_specializer_emit_source(
             free(roles); free(layers);
             return false;
         }
-        if ((n->kind == VBS_OP_LINEAR || n->kind == VBS_OP_PROJECTION || n->kind == VBS_OP_EMBEDDING) && !ggml_type_has_dispatch(n->weight->type)) {
+        if ((n->kind == VBS_OP_LINEAR || n->kind == VBS_OP_PROJECTION || n->kind == VBS_OP_EMBEDDING) && !type_has_dispatch(n->weight->type)) {
             fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
-                    ggml_type_name(n->weight->type), n->weight->name);
+                    type_name(n->weight->type), n->weight->name);
             free(roles); free(layers);
             return false;
         }
@@ -158,12 +283,12 @@ bool vbs_specializer_emit_source(
         free(roles); free(layers);
         return false;
     }
-    if (final_linear_slot < 0) final_linear_slot = embed_slot; // tied embeddings
+    if (final_linear_slot < 0) final_linear_slot = embed_slot; /* tied embeddings */
     {
         const vbs_node_t *fn_ = plan->plans[final_linear_slot].node;
-        if (!ggml_type_has_dispatch(fn_->weight->type)) {
+        if (!type_has_dispatch(fn_->weight->type)) {
             fprintf(stderr, "Specializer refused: no GPU dispatch exists for weight type %s (tensor %s)\n",
-                    ggml_type_name(fn_->weight->type), fn_->weight->name);
+                    type_name(fn_->weight->type), fn_->weight->name);
             free(roles); free(layers);
             return false;
         }
@@ -247,24 +372,29 @@ bool vbs_specializer_emit_source(
         "    uint32_t pos = (uint32_t)g_current_pos;\n"
     );
 
-    /* HYDRA PROTOCOL: prune whole transformer layers, not single nodes.
-     * layers[i] is the blk.<L> layer number (-1 for embed/final, which are
-     * never pruned: deleting embed or the output projection would delete
-     * the forward pass itself). A layer is pruned only when its energy
-     * was explicitly set below threshold; reset sets all energies to 1.0,
-     * so a plain recompile prunes nothing. Skipping a whole blk layer
-     * leaves the residual stream untouched, which is the coherent
-     * pruning semantics; skipping one Q/K/V/down node alone would not be.
-     */
+    /* HYDRA PROTOCOL: prune whole transformer layers, not single
+     * nodes. layers[i] is the blk.<L> layer number (-1 for
+     * embed/final, which are never pruned: deleting embed or the
+     * output projection would delete the forward pass itself). A
+     * layer is pruned only when its energy was explicitly set
+     * below threshold; reset sets all energies to 1.0, so a plain
+     * recompile prunes nothing. Skipping a whole blk layer leaves
+     * the residual stream untouched, which is the coherent
+     * pruning semantics; skipping one Q/K/V/down node alone would
+     * not be. */
     extern float g_vbs_layer_energy[VBS_MAX_LAYERS];
-    /* Fix: RoPE must come AFTER Q/K norm, not before. Pre-scan which layers
-       have q_norm/k_norm, so RoPE can be deferred to the norm step. */
-    int has_q_norm[VBS_MAX_LAYERS]; int has_k_norm[VBS_MAX_LAYERS];
-    for (int li=0; li<VBS_MAX_LAYERS; li++) { has_q_norm[li]=0; has_k_norm[li]=0; }
+    /* Pre-scan which layers have q_norm/k_norm, so RoPE can be
+     * deferred to the norm step. */
+    int has_q_norm[VBS_MAX_LAYERS];
+    int has_k_norm[VBS_MAX_LAYERS];
+    for (int li = 0; li < VBS_MAX_LAYERS; li++) {
+        has_q_norm[li] = 0;
+        has_k_norm[li] = 0;
+    }
     for (size_t i = 0; i < plan->n_plans; i++) {
-        if (layers[i]>=0 && layers[i]<(int)VBS_MAX_LAYERS) {
-            if (roles[i]==SEQ_Q_NORM) has_q_norm[layers[i]]=1;
-            if (roles[i]==SEQ_K_NORM) has_k_norm[layers[i]]=1;
+        if (layers[i] >= 0 && layers[i] < (int)VBS_MAX_LAYERS) {
+            if (roles[i] == SEQ_Q_NORM) has_q_norm[layers[i]] = 1;
+            if (roles[i] == SEQ_K_NORM) has_k_norm[layers[i]] = 1;
         }
     }
     for (size_t i = 0; i < plan->n_plans; i++) {
@@ -274,69 +404,7 @@ bool vbs_specializer_emit_source(
             fprintf(f, "    // HYDRA PROTOCOL: transformer layer %d pruned (energy: %f)\n", L, g_vbs_layer_energy[L]);
             continue;
         }
-        switch (roles[i]) {
-            case SEQ_EMBED:
-                fprintf(f, "    vbs_gpu_dispatch_embed_%s(g_blocks[%zu].device_ptr, tok, STREAM, EMBED_DIM);\n",
-                        ggml_type_name(n->weight->type), i);
-                break;
-            case SEQ_ATTN_NORM:
-            case SEQ_FFN_NORM:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, STREAM, NORMED, EMBED_DIM, RMS_EPS);\n", i);
-                break;
-            case SEQ_Q:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, QB, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                if (L<0 || !has_q_norm[L]) fprintf(f, "    vbs_gpu_dispatch_rope(QB, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
-                break;
-            case SEQ_K:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, KB, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                if (L<0 || !has_k_norm[L]) fprintf(f, "    vbs_gpu_dispatch_rope(KB, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
-                break;
-            case SEQ_V:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, VB, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_cache(%s, VB, KC, VC, pos, %d, KV_CAPACITY, KV_DIM);\n", (L>=0 && has_k_norm[L]) ? "KN" : "KB", L);
-                fprintf(f, "    vbs_gpu_dispatch_attn(%s, KC, VC, AB, pos, %d, KV_CAPACITY, N_HEADS, N_KV_HEADS, HEAD_DIM);\n", (L>=0 && has_q_norm[L]) ? "QN" : "QB", L);
-                break;
-            case SEQ_Q_NORM:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, QB, QN, N_HEADS*HEAD_DIM, RMS_EPS);\n", i);
-                fprintf(f, "    vbs_gpu_dispatch_rope(QN, pos, HEAD_DIM, N_HEADS, ROPE_THETA);\n");
-                break;
-            case SEQ_K_NORM:
-                fprintf(f, "    vbs_gpu_dispatch_norm(g_blocks[%zu].device_ptr, KB, KN, N_KV_HEADS*HEAD_DIM, RMS_EPS);\n", i);
-                fprintf(f, "    vbs_gpu_dispatch_rope(KN, pos, HEAD_DIM, N_KV_HEADS, ROPE_THETA);\n");
-                break;
-            case SEQ_ATTN_OUT:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, AB, TMP, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
-                break;
-            case SEQ_GATE:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, GATE, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                break;
-            case SEQ_UP:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, NORMED, UP, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_silu(GATE, UP, HIDDEN, %llu);\n", (unsigned long long)gate_rows);
-                break;
-            case SEQ_DOWN:
-                fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%zu].device_ptr, HIDDEN, TMP, %llu, %llu);\n",
-                        ggml_type_name(n->weight->type), i,
-                        (unsigned long long)n->weight->rows, (unsigned long long)n->weight->columns);
-                fprintf(f, "    vbs_gpu_dispatch_add(STREAM, TMP, STREAM, EMBED_DIM);\n");
-                break;
-            case SEQ_FINAL_NORM:
-            case SEQ_FINAL_LINEAR:
-                break; // emitted at the tail below
-        }
+        emit_node(f, n, i, roles[i], L, has_q_norm, has_k_norm, gate_rows);
     }
 
     if (final_norm_slot >= 0) {
@@ -345,7 +413,7 @@ bool vbs_specializer_emit_source(
     {
         const vbs_node_t *n = plan->plans[final_linear_slot].node;
         fprintf(f, "    vbs_gpu_dispatch_vram_%s(g_blocks[%ld].device_ptr, NORMED, vbs_gpu_get_logits(), VOCAB_SIZE, EMBED_DIM);\n",
-                ggml_type_name(n->weight->type), final_linear_slot);
+                type_name(n->weight->type), final_linear_slot);
     }
 
     fprintf(f,
@@ -378,25 +446,26 @@ bool vbs_specializer_emit_source(
 }
 
 #if defined(_WIN32)
-/* Import library for the running exe: <dir>/foo.exe -> <dir>/libfoo.dll.a.
- * The exe is built with -Wl,--export-all-symbols -Wl,--out-implib (see the
- * Makefile `mingw` target), so the .dll.a sits next to it. Linking the DLL
- * against the import library — not the exe itself — is what works: ld
- * refuses to link a DLL against an exe's CRT startup objects. Returns 0 and
- * fills out on success, -1 if the path cannot be derived or the file is
- * absent (caller then compiles without it and the load will fail cleanly). */
+/* Import library for the running exe: <dir>/foo.exe ->
+ * <dir>/libfoo.dll.a. The exe is built with
+ * -Wl,--export-all-symbols -Wl,--out-implib (see the Makefile
+ * `mingw` target), so the .dll.a sits next to it. Linking the
+ * DLL against the import library -- not the exe itself -- is
+ * what works: ld refuses to link a DLL against an exe's CRT
+ * startup objects. Returns 0 and fills out on success, -1 if
+ * the path cannot be derived or the file is absent (caller
+ * then compiles without it and the load will fail cleanly). */
 static int exe_import_lib_path(char *out, size_t cap) {
     char exe[1024];
-    size_t len, base, end;
     if (vbs_exe_path(exe, sizeof exe) != 0) return -1;
-    len = strlen(exe);
-    base = len;
+    size_t len = strlen(exe);
+    size_t base = len;
     while (base > 0 && exe[base - 1] != '\\' && exe[base - 1] != '/') base--;
-    end = len;
+    size_t end = len;
     if (end - base > 4) {
         const char *ext = exe + end - 4;
-        if ((ext[0] == '.' && (ext[1] == 'e' || ext[1] == 'E') &&
-             (ext[2] == 'x' || ext[2] == 'X') && (ext[3] == 'e' || ext[3] == 'E')))
+        if (ext[0] == '.' && (ext[1] == 'e' || ext[1] == 'E') &&
+            (ext[2] == 'x' || ext[2] == 'X') && (ext[3] == 'e' || ext[3] == 'E'))
             end -= 4;
     }
     if (base + 3 + (end - base) + 6 + 1 > cap) return -1;
@@ -410,20 +479,25 @@ bool vbs_specializer_compile(const char *src_path, const char *bin_path, const v
     char cmd[2048];
     double t0 = vbs_now_sec();
 #if defined(_WIN32)
-    /* Windows: MinGW gcc (or a MinGW-targeting clang) builds a DLL, linked
-     * against the exe's import library so the bridge symbols the generated
-     * code calls (vbs_bridge_get_block_dptr, ...) resolve at load time.
-     * No MinGW compiler on PATH means no specialization. */
+    /* Windows: MinGW gcc (or a MinGW-targeting clang) builds a
+     * DLL, linked against the exe's import library so the bridge
+     * symbols the generated code calls
+     * (vbs_bridge_get_block_dptr, ...) resolve at load time. No
+     * MinGW compiler on PATH means no specialization. */
     const char *compiler = NULL;
     char implib[1200];
     if (system("where gcc >nul 2>&1") == 0) compiler = "gcc";
     else if (system("where clang >nul 2>&1") == 0) compiler = "clang";
-    if (!compiler) { *out_sec = vbs_now_sec() - t0; return false; }
-    /* NOTE: the compiler token is deliberately UNQUOTED. system() runs
-     * `cmd /c <string>`, and cmd.exe strips a leading quote plus the last
-     * quote on the line when the string starts with one — `"gcc" -O3 ...`
-     * becomes the bogus command `gcc" -O3 ...`. Bare `gcc`/`clang` (from
-     * PATH, never containing spaces) is safe; the paths stay quoted. */
+    if (!compiler) {
+        *out_sec = vbs_now_sec() - t0;
+        return false;
+    }
+    /* NOTE: the compiler token is deliberately UNQUOTED. system()
+     * runs `cmd /c <string>`, and cmd.exe strips a leading quote
+     * plus the last quote on the line when the string starts with
+     * one -- `"gcc" -O3 ...` becomes the bogus command `gcc" -O3
+     * ...`. Bare `gcc`/`clang` (from PATH, never containing
+     * spaces) is safe; the paths stay quoted. */
     if (exe_import_lib_path(implib, sizeof implib) == 0)
         snprintf(cmd, sizeof(cmd), "%s -O3 -shared -o \"%s\" \"%s\" \"%s\" 2>&1", compiler, bin_path, src_path, implib);
     else
@@ -443,6 +517,10 @@ vbs_specialized_binary_t *vbs_specializer_load(const char *bin_path, const char 
     if (!h) return NULL;
 
     vbs_specialized_binary_t *b = (vbs_specialized_binary_t *)calloc(1, sizeof(*b));
+    if (!b) {
+        vbs_dlclose(h);
+        return NULL;
+    }
     b->loaded_handle = h;
     snprintf(b->binary_path, sizeof(b->binary_path), "%s", bin_path);
     snprintf(b->specialization_hash, sizeof(b->specialization_hash), "%s", hash);
