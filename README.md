@@ -13,6 +13,72 @@ framework (`vbs_drv.c` / `vbs_drv.h`), with a native backend
 (`vbs_backend_native.c`) that plugs into the engine's backend interface.
 Vendor coverage: Turing (NVIDIA), RDNA2 (AMD), and Alchemist (Intel),
 each with its own encoder and shader assembler under `src/driver/shader/`.
+
+## Why from-scratch
+
+November 2026 made the from-scratch case in public, at scale — and
+gave Verum a standard to measure itself against.
+
+**Strata 0.2.16 (Nov 18, 2026) dropped llama.cpp for its own
+engine.** Strata, the open-source local AI app (about 45,700 GitHub
+stars), replaced llama.cpp/ggml matrix kernels with an inference
+engine it wrote from scratch, covering NVIDIA, AMD, Intel Arc and
+Apple Silicon. Its headline claim is token-for-token identical output
+to 0.2.15 across nine different GPUs, backed by published equivalence
+tables and long-run reliability data. The fear with any engine
+rewrite is silently different output; Strata claims to have avoided
+it, in public, at large scale. That equivalence-testing approach —
+same tokens out, across GPUs — is the standard Verum's own
+verification should meet or beat. Verum's differentiator against
+Strata stands: pure C11 (not C++/CUDA), its own GPU drivers, and a
+recursive self-optimization loop.
+
+**The same weeks produced a wave of independent from-scratch
+engines.** tinyinfer (about 2,200 lines of C++ and CUDA, no PyTorch,
+no cuBLAS) claims 235 tokens/s running TinyLlama-1.1B at 4-bit on a
+6 GB laptop RTX 3050. TinyCoder, a from-scratch C++ and CUDA engine
+reading GGUF directly, claims a 35B mixture-of-experts model running
+at 53.6 tokens/s on an 11 GB RTX 2080 Ti against 17.1 for llama.cpp.
+Garlic LLM runs Qwen3.5-9B entirely offline on a jailbroken PS4 —
+there is no compute API for PS4 homebrew, so the engine hand-builds
+about 400 PM4 GPU command packets per token; it is, in effect, the
+driver, at a claimed 31–39 tokens/s. All three sets of numbers are
+author-reported, with no independent verification found; they are
+claims, not benchmarks. But the pattern is the point: hand-written
+kernels matching or beating llama.cpp on consumer and legacy hardware
+is now a visible movement, not one project. Garlic LLM's
+command-packet approach is the closest cousin to Verum's own
+from-scratch drivers in `src/driver/` — GPU control at the packet
+level, because no driver was shipped for the hardware.
+
+**The ecosystem Verum builds on also steadied itself.** llama.cpp
+hit 1.0.0 on Nov 13, 2026 — its first versioned release, with
+semantic versioning for the public C API — and the GGUF format itself
+did not change (still version 3), which matters because Verum loads
+GGUF models. Then prerelease b12669 (Nov 24, 2026) added
+`--target-size` and `--target-bpw` to `llama-quantize`: instead of
+picking a fixed preset, you state a file-size or bits-per-weight
+budget and an optimizer picks the per-tensor quantization mix (238
+comparisons across 34 models reported: 195 wins, 26 ties, 16 losses
+against standard quantization on KL divergence). The budget-based
+quantizer is a feature idea for Verum's loader, not a shipped
+feature.
+
+**Honest limits stand.** None of the above changes what Verum has
+and has not proven: real-GPU execution is still unverified (Vulkan
+execution was verified on Lavapipe, a software device, not on GPU
+hardware), and LLM-authored candidates are still not done. See
+"What doesn't yet work" below. The November wave validates the
+from-scratch bet; it does not validate this engine's hardware
+results, which remain to be run on real GPUs.
+
+Sources: LinuxCompatible on Strata 0.2.16, Nov 19, 2026 — https://www.linuxcompatible.org/story/strata-0216-runs-its-own-engine-drops-llamacpp-claims-identical-output/ ;
+tinyinfer write-up, Nov 14, 2026 — https://medium.com/@klaadithya/how-i-built-an-llm-inference-engine-from-scratch-in-cuda-235-tokens-s-on-a-6-gb-laptop-gpu-f5ac062950a6 ;
+TinyCoder coverage, Nov 22, 2026 — https://news.hamidun.com/en/news/17866/yandex-grant-funds-an-llm-engine-35b-model-on-rtx-2080-ti-ru ;
+Garlic LLM coverage, Nov 16–19, 2026 — https://repo-explainer.com/spinzar/garlic-llm-ps4 and https://thatfeed.com/2026/11/19/2573/hacked-ps4-ran-a-9-billion-parameter-ai-model-at-up-to-43-tokens-per-second ;
+llama.cpp 1.0.0 — https://www.ozercemkelahmet.com/articles/llama-cpp-1-0-local-inference ;
+llama.cpp b12669 target-size quantization, Nov 24, 2026 — https://ingoampt.com/llama-cpp-b12669-custom-gguf-size-targets/ .
+
 ## Codebase
 18,126 lines across src/*.c and include/*.h, C11.
 
