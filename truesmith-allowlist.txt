@@ -1,6 +1,0 @@
-cmake - the build system requires this exact file name
-clang - build.sh must probe for the compiler binary by the name the system gives it
-gcc - build.sh must probe for the compiler binary by the name the system gives it
-win32 - the Windows SDK macro name the code must define before including windows.h
-windows - the Windows SDK header name the code must include to build on Windows
-spirv - build-kernels.sh must probe for the spirv-val binary by the name the system gives it
